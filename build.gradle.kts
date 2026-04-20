@@ -2,10 +2,11 @@ plugins {
     `java-library`
     id("jacoco")
     id("com.diffplug.spotless") version "8.4.0"
+    id("com.vanniktech.maven.publish") version "0.36.0"
 }
 
 group = "io.github.openlogiclab"
-version = "1.0-SNAPSHOT"
+version = System.getenv("GITHUB_REF_NAME")?.removePrefix("v") ?: "0.1.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -34,6 +35,16 @@ tasks.compileJava {
     }
 }
 
+tasks.javadoc {
+    doFirst {
+        val mp = classpath.asPath
+        (options as CoreJavadocOptions).apply {
+            addMultilineStringsOption("-module-path").value = listOf(mp)
+        }
+        classpath = files()
+    }
+}
+
 spotless {
     java {
         licenseHeaderFile("gradle/license-header.txt")
@@ -44,6 +55,35 @@ spotless {
     }
 }
 
+mavenPublishing {
+    publishToMavenCentral(automaticRelease = true)
+    signAllPublications()
+
+    pom {
+        name.set("kafka-pipeline")
+        description.set("Lightweight Kafka consumer pipeline with concurrent processing, backpressure, and sliding-window offset management")
+        inceptionYear.set("2026")
+        url.set("https://github.com/openlogiclab/kafka-pipeline")
+        licenses {
+            license {
+                name.set("Apache License 2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                distribution.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+            }
+        }
+        developers {
+            developer {
+                id.set("zachhuan")
+                url.set("https://github.com/zachhuan")
+            }
+        }
+        scm {
+            url.set("https://github.com/openlogiclab/kafka-pipeline")
+            connection.set("scm:git:git://github.com/openlogiclab/kafka-pipeline.git")
+            developerConnection.set("scm:git:ssh://git@github.com/openlogiclab/kafka-pipeline.git")
+        }
+    }
+}
 
 tasks.test {
     useJUnitPlatform()
