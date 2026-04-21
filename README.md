@@ -20,6 +20,27 @@ This library packages all of that into a clean pipeline that you configure once 
 >
 > **Blocking under pressure, not dropping.** When internal queues fill up (misconfigured backpressure, unexpected burst, slow downstream), the poll thread **blocks** until space is available rather than discarding records. This preserves data integrity at the cost of temporary latency. A `WARNING` log is emitted when blocking occurs — if you see it in production, tune your backpressure thresholds or concurrency. See [Tuning `dispatchQueueCapacity`](#tuning-dispatchqueuecapacity) for details.
 
+## Installation
+
+**Gradle (Kotlin DSL)**
+```kotlin
+implementation("io.github.openlogiclab:kafka-pipeline:0.1.0-beta.1")
+```
+
+**Gradle (Groovy)**
+```groovy
+implementation 'io.github.openlogiclab:kafka-pipeline:0.1.0-beta.1'
+```
+
+**Maven**
+```xml
+<dependency>
+    <groupId>io.github.openlogiclab</groupId>
+    <artifactId>kafka-pipeline</artifactId>
+    <version>0.1.0-beta.1</version>
+</dependency>
+```
+
 ## Requirements
 
 - **Java 21+** (virtual threads support)
