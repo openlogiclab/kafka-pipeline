@@ -39,6 +39,7 @@ jobs:
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v6
       with:
+        token: ${{ secrets.CODECOV_TOKEN }}
         files: build/reports/jacoco/test/jacocoTestReport.xml
 
     # NOTE: The Gradle Wrapper is the default and recommended way to run Gradle (https://docs.gradle.org/current/userguide/gradle_wrapper.html).
