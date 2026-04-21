@@ -1,6 +1,12 @@
 # kafka-pipeline
 
+[![Build](https://github.com/openlogiclab/kafka-pipeline/actions/workflows/gradle.yml/badge.svg)](https://github.com/openlogiclab/kafka-pipeline/actions/workflows/gradle.yml)
+[![codecov](https://codecov.io/gh/openlogiclab/kafka-pipeline/branch/main/graph/badge.svg)](https://codecov.io/gh/openlogiclab/kafka-pipeline)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 A lightweight Java library that wraps `KafkaConsumer` and handles the tedious parts — concurrent processing, backpressure, offset tracking, error handling — so you can focus on what matters: your record processing logic.
+
+Zero additional dependencies beyond `kafka-clients` itself.
 
 ## Why
 
