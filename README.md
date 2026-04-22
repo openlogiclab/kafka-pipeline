@@ -223,7 +223,7 @@ onPartitionsAssigned([partition-0, partition-5])
 Poll loop evaluates all sensors before each poll:
 
   BackpressureController.evaluate():
-    for each sensor in [record-count, byte-size, ...custom]:
+    for each sensor in [record-count, byte-size, heap, ...custom]:
       status = sensor.currentStatus()
       worst  = max(worst, status)
 
@@ -237,6 +237,11 @@ Poll loop evaluates all sensors before each poll:
     inFlightBytes >= highWatermarkBytes → THROTTLE
     inFlightBytes >= criticalBytes      → CRITICAL
 
+  Heap sensor (if enabled):
+    heapUsed/heapMax < throttleThreshold  → OK
+    heapUsed/heapMax >= throttleThreshold → THROTTLE
+    heapUsed/heapMax >= criticalThreshold → CRITICAL
+
   Action based on worst status:
     OK       → poll normally
     THROTTLE → consumer.pause(assignment)  → heartbeats only
@@ -245,7 +250,7 @@ Poll loop evaluates all sensors before each poll:
   Once paused, workers keep draining...
     
   When ALL sensors return OK           → consumer.resume(assignment)
-  (each sensor has its own low watermark hysteresis)
+  (each sensor has its own low/resume watermark hysteresis)
 ```
 
 The high/low watermark gap is the hysteresis band. Without it, the consumer would thrash between pause and resume on every single record completing near the threshold.
@@ -336,32 +341,54 @@ Protects against memory pressure when individual records are large (e.g. 10 MB f
     .build())
 ```
 
-Both sensors run in parallel. If record count is fine but byte usage crosses the threshold (or vice versa), the consumer pauses until both recover.
+#### Heap Backpressure
+
+Monitors overall JVM heap usage via `MemoryMXBean` and pauses the consumer when the heap gets too full — regardless of whether the pressure comes from in-flight records, producer buffers, caches, or anything else. This is especially useful for Kafka-to-Kafka forwarding pipelines where `producer.send()` buffers large amounts of data in flight. Disabled by default — opt in with:
+
+```java
+.heapBackpressure(HeapBackpressureConfig.builder()
+    .resumeThreshold(0.5)     // resume polling at 50% heap usage
+    .throttleThreshold(0.7)   // pause polling at 70% heap usage
+    .criticalThreshold(0.9)   // hard stop at 90% heap usage
+    .build())
+```
+
+Thresholds are ratios (0.0–1.0) of `heapUsed / heapMax` (your `-Xmx` or `-XX:MaxRAMPercentage`). The same hysteresis logic applies — once throttled at 70%, the consumer stays paused until usage drops back to 50%.
+
+Unlike record-count and byte-level sensors which only track the pipeline's own in-flight data, the heap sensor captures **all** JVM memory pressure. This makes it a good safety net when your handler allocates significant memory beyond the records themselves.
+
+#### Built-in Sensor Summary
+
+| Sensor | Enabled by default | What it tracks | When to use |
+|---|---|---|---|
+| Record-count | Yes | Number of in-flight records | Always — general-purpose flow control |
+| Byte-level | No | Payload bytes of in-flight records | Large/variable record sizes |
+| Heap | No | JVM heap usage (`used/max`) | Producer buffering, caches, or any heap-heavy workload |
+
+All active sensors run in parallel. The poll loop checks every sensor on each cycle and applies the worst status — if any single sensor says THROTTLE, the consumer pauses until **all** sensors return OK.
 
 #### Custom Backpressure Sensors
 
-You can plug in your own sensors for domain-specific pressure signals — external queue depth, downstream service health, JVM heap usage, anything:
+You can plug in your own sensors for domain-specific pressure signals — external queue depth, downstream service health, or anything else:
 
 ```java
 .addBackpressureSensor(new BackpressureSensor() {
     @Override
     public BackpressureStatus currentStatus() {
-        double heapUsage = Runtime.getRuntime().totalMemory()
-            / (double) Runtime.getRuntime().maxMemory();
-        if (heapUsage > 0.9) return BackpressureStatus.CRITICAL;
-        if (heapUsage > 0.7) return BackpressureStatus.THROTTLE;
+        if (downstreamService.isOverloaded()) return BackpressureStatus.CRITICAL;
+        if (downstreamService.queueDepth() > 10_000) return BackpressureStatus.THROTTLE;
         return BackpressureStatus.OK;
     }
 
     @Override
-    public String name() { return "heap-pressure"; }
+    public String name() { return "downstream-health"; }
 
     @Override
-    public String statusDetail() { return "custom heap monitor"; }
+    public String statusDetail() { return "queue depth: " + downstreamService.queueDepth(); }
 })
 ```
 
-The pipeline evaluates all sensors (record-count, byte-level, and any custom ones) on each poll cycle and uses the worst status across all of them.
+Custom sensors are evaluated alongside the built-in ones — the worst status across all of them determines whether the consumer pauses.
 
 When backpressure kicks in, the consumer is paused (not disconnected) — it stays in the group and responds to heartbeats, but stops fetching new records until workers catch up.
 
@@ -417,6 +444,7 @@ pipeline.awaitShutdown();
 | `concurrency(ThreadMode, int)` | *required* | Thread model and worker count |
 | `backpressure` | high=10k, low=6k, critical=50k | Record-count watermarks |
 | `byteBackpressure` | disabled | Byte-level watermarks for memory protection |
+| `heapBackpressure` | disabled | JVM heap usage watermarks (via `MemoryMXBean`) |
 | `addBackpressureSensor` | none | Custom backpressure sensor(s) |
 | `errorStrategy` | fail-fast | Retry + DLQ + fallback chain |
 | `lifecycleHook` | no-op | Before/after/error callbacks (per-record mode only) |

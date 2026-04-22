@@ -18,6 +18,7 @@ package io.github.openlogiclab.kafkapipeline;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.ByteBackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.backpressure.HeapBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
@@ -43,6 +44,7 @@ public record PipelineConfig<K, V>(
     ThreadMode threadMode,
     BackpressureConfig backpressure,
     ByteBackpressureConfig byteBackpressure,
+    HeapBackpressureConfig heapBackpressure,
     List<BackpressureSensor> customSensors,
     ErrorStrategy<K, V> errorStrategy,
     ProcessingLifecycleHook<K, V> lifecycleHook,
@@ -57,6 +59,7 @@ public record PipelineConfig<K, V>(
     Objects.requireNonNull(threadMode, "threadMode");
     Objects.requireNonNull(backpressure, "backpressure");
     Objects.requireNonNull(byteBackpressure, "byteBackpressure");
+    Objects.requireNonNull(heapBackpressure, "heapBackpressure");
     Objects.requireNonNull(customSensors, "customSensors");
     Objects.requireNonNull(errorStrategy, "errorStrategy");
     Objects.requireNonNull(lifecycleHook, "lifecycleHook");
@@ -96,6 +99,7 @@ public record PipelineConfig<K, V>(
     private ThreadMode threadMode;
     private BackpressureConfig backpressure = BackpressureConfig.defaults();
     private ByteBackpressureConfig byteBackpressure = ByteBackpressureConfig.disabled();
+    private HeapBackpressureConfig heapBackpressure = HeapBackpressureConfig.disabled();
     private List<BackpressureSensor> customSensors = new ArrayList<>();
     private ErrorStrategy<K, V> errorStrategy = ErrorStrategy.failFast();
     private ProcessingLifecycleHook<K, V> lifecycleHook = ProcessingLifecycleHook.noOp();
@@ -187,6 +191,18 @@ public record PipelineConfig<K, V>(
      */
     public Builder<K, V> byteBackpressure(ByteBackpressureConfig byteBackpressure) {
       this.byteBackpressure = byteBackpressure;
+      return this;
+    }
+
+    /**
+     * Heap-based backpressure thresholds. Disabled by default. Protects against OOM by monitoring
+     * JVM heap usage via {@code MemoryMXBean}. Works regardless of pressure source — in-flight
+     * records, producer buffers, caches, or any other heap-resident data.
+     *
+     * @see HeapBackpressureConfig#builder()
+     */
+    public Builder<K, V> heapBackpressure(HeapBackpressureConfig heapBackpressure) {
+      this.heapBackpressure = heapBackpressure;
       return this;
     }
 
@@ -314,6 +330,7 @@ public record PipelineConfig<K, V>(
           threadMode,
           backpressure,
           byteBackpressure,
+          heapBackpressure,
           List.copyOf(customSensors),
           errorStrategy,
           lifecycleHook,
