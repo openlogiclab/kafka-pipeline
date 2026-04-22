@@ -8,6 +8,7 @@
  */
 module io.github.openlogiclab.kafkapipeline {
   requires kafka.clients;
+  requires java.management;
 
   exports io.github.openlogiclab.kafkapipeline;
   exports io.github.openlogiclab.kafkapipeline.handler;

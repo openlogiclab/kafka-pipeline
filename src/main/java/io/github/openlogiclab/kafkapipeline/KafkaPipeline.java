@@ -18,6 +18,7 @@ package io.github.openlogiclab.kafkapipeline;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.ByteSizeSensor;
+import io.github.openlogiclab.kafkapipeline.backpressure.HeapSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
 import io.github.openlogiclab.kafkapipeline.dispatch.PeriodicCommitter;
 import io.github.openlogiclab.kafkapipeline.dispatch.PipelineRebalanceListener;
@@ -249,6 +250,9 @@ public final class KafkaPipeline<K, V> {
     sensors.add(new RecordCountSensor(config.backpressure(), counter));
     if (config.byteBackpressure().enabled()) {
       sensors.add(new ByteSizeSensor(config.byteBackpressure(), counter));
+    }
+    if (config.heapBackpressure().enabled()) {
+      sensors.add(new HeapSensor(config.heapBackpressure()));
     }
     sensors.addAll(config.customSensors());
     return new BackpressureController(config.backpressure(), sensors);
