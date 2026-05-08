@@ -47,11 +47,6 @@ public final class PeriodicCommitter {
   private final PipelineMetricsCollector metricsCollector;
 
   public PeriodicCommitter(
-      OffsetTracker offsetTracker, Consumer<?, ?> consumer, Duration commitInterval) {
-    this(offsetTracker, consumer, commitInterval, null);
-  }
-
-  public PeriodicCommitter(
       OffsetTracker offsetTracker,
       Consumer<?, ?> consumer,
       Duration commitInterval,
@@ -101,11 +96,11 @@ public final class PeriodicCommitter {
           offsets,
           (committedOffsets, exception) -> {
             if (exception != null) {
-              if (metricsCollector != null) metricsCollector.recordCommitFailure();
+              metricsCollector.recordCommitFailure();
               logger.log(
                   System.Logger.Level.WARNING, "Async commit failed: {0}", exception.getMessage());
             } else {
-              if (metricsCollector != null) metricsCollector.recordCommitSuccess();
+              metricsCollector.recordCommitSuccess();
               logger.log(
                   System.Logger.Level.DEBUG,
                   "Committed offsets for {0} partitions",
@@ -113,7 +108,7 @@ public final class PeriodicCommitter {
             }
           });
     } catch (Exception e) {
-      if (metricsCollector != null) metricsCollector.recordCommitFailure();
+      metricsCollector.recordCommitFailure();
       logger.log(System.Logger.Level.WARNING, "Error during async commit: {0}", e.getMessage());
     }
   }
@@ -124,11 +119,11 @@ public final class PeriodicCommitter {
       if (offsets.isEmpty()) return;
 
       consumer.commitSync(offsets);
-      if (metricsCollector != null) metricsCollector.recordCommitSuccess();
+      metricsCollector.recordCommitSuccess();
       logger.log(
           System.Logger.Level.INFO, "Sync committed offsets for {0} partitions", offsets.size());
     } catch (Exception e) {
-      if (metricsCollector != null) metricsCollector.recordCommitFailure();
+      metricsCollector.recordCommitFailure();
       logger.log(System.Logger.Level.ERROR, "Sync commit failed: {0}", e.getMessage());
     }
   }

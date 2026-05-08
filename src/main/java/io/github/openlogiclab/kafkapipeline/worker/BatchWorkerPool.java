@@ -40,25 +40,6 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   private final InFlightCounter counter;
   private final PipelineMetricsCollector metricsCollector;
 
-  public BatchWorkerPool(
-      int concurrency,
-      ThreadMode threadMode,
-      BatchRecordHandler<K, V> handler,
-      RetryExecutor<K, V> retryExecutor,
-      OffsetTracker offsetTracker,
-      InFlightCounter counter,
-      int taskQueueCapacity) {
-    this(
-        concurrency,
-        threadMode,
-        handler,
-        retryExecutor,
-        offsetTracker,
-        counter,
-        taskQueueCapacity,
-        null);
-  }
-
   /**
    * @param concurrency number of batch processing threads
    * @param threadMode platform or virtual threads
@@ -147,7 +128,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     if (lastError == null) {
       offsetTracker.ackBatch(tp, firstOffset, lastOffset);
       counter.completed(batch.size(), totalBytes);
-      if (metricsCollector != null) metricsCollector.recordProcessed(batch.size());
+      metricsCollector.recordProcessed(batch.size());
       return;
     }
 
@@ -158,7 +139,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       case DLQ_SUCCESS, SKIP -> offsetTracker.ackBatch(tp, firstOffset, lastOffset);
       case FAIL_PARTITION -> {
         offsetTracker.fail(tp, firstOffset);
-        if (metricsCollector != null) metricsCollector.recordFailed();
+        metricsCollector.recordFailed();
       }
     }
     counter.completed(batch.size(), totalBytes);

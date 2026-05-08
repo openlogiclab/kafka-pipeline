@@ -62,27 +62,6 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       RetryExecutor<K, V> retryExecutor,
       OffsetTracker offsetTracker,
       RecordDispatcher<K, V> dispatcher,
-      InFlightCounter counter) {
-    this(
-        concurrency,
-        threadMode,
-        handler,
-        hook,
-        retryExecutor,
-        offsetTracker,
-        dispatcher,
-        counter,
-        null);
-  }
-
-  public SingleRecordWorkerPool(
-      int concurrency,
-      ThreadMode threadMode,
-      RecordHandler<K, V> handler,
-      ProcessingLifecycleHook<K, V> hook,
-      RetryExecutor<K, V> retryExecutor,
-      OffsetTracker offsetTracker,
-      RecordDispatcher<K, V> dispatcher,
       InFlightCounter counter,
       PipelineMetricsCollector metricsCollector) {
     super(concurrency, threadMode, "kafka-pipeline-worker-", 0);
@@ -166,7 +145,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     if (shouldSkipViaHook) {
       offsetTracker.ack(tp, offset);
       counter.completed(1, recordBytes);
-      if (metricsCollector != null) metricsCollector.recordSkipped();
+      metricsCollector.recordSkipped();
       return;
     }
 
@@ -189,7 +168,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     if (lastError == null) {
       offsetTracker.ack(tp, offset);
       counter.completed(1, recordBytes);
-      if (metricsCollector != null) metricsCollector.recordProcessed(1);
+      metricsCollector.recordProcessed(1);
       return;
     }
 
@@ -200,7 +179,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       case DLQ_SUCCESS, SKIP -> offsetTracker.ack(tp, offset);
       case FAIL_PARTITION -> {
         offsetTracker.fail(tp, offset);
-        if (metricsCollector != null) metricsCollector.recordFailed();
+        metricsCollector.recordFailed();
       }
     }
     counter.completed(1, recordBytes);

@@ -54,16 +54,6 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       Runnable commitSync,
       InFlightCounter counter,
       Consumer<?, ?> consumer,
-      Duration drainTimeout) {
-    this(offsetTracker, dispatcher, commitSync, counter, consumer, drainTimeout, null);
-  }
-
-  public PipelineRebalanceListener(
-      OffsetTracker offsetTracker,
-      RecordDispatcher<?, ?> dispatcher,
-      Runnable commitSync,
-      InFlightCounter counter,
-      Consumer<?, ?> consumer,
       Duration drainTimeout,
       PipelineMetricsCollector metricsCollector) {
     this.offsetTracker = offsetTracker;
@@ -80,10 +70,10 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     if (partitions.isEmpty()) return;
 
     logger.log(System.Logger.Level.INFO, "Partitions revoked: {0}", partitions);
-    if (metricsCollector != null) metricsCollector.recordRebalance();
+    metricsCollector.recordRebalance();
 
     for (TopicPartition tp : partitions) {
-      if (metricsCollector != null) metricsCollector.partitionRevoked(tp);
+      metricsCollector.partitionRevoked(tp);
       List<? extends ConsumerRecord<?, ?>> abandoned = dispatcher.removePartition(tp);
       if (!abandoned.isEmpty()) {
         long abandonedBytes = 0;
@@ -91,7 +81,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
           abandonedBytes += RecordSize.estimateBytes(record);
         }
         counter.completed(abandoned.size(), abandonedBytes);
-        if (metricsCollector != null) metricsCollector.recordAbandoned(abandoned.size());
+        metricsCollector.recordAbandoned(abandoned.size());
       }
     }
 
@@ -103,7 +93,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
                         () -> {
                           PartitionDrainResult result =
                               offsetTracker.drainPartition(tp, drainTimeout);
-                          if (!result.allCompleted() && metricsCollector != null) {
+                          if (!result.allCompleted()) {
                             metricsCollector.recordDrainTimeout();
                             metricsCollector.recordAbandoned(result.abandonedCount());
                           }
@@ -130,7 +120,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       long position = consumer.position(tp);
       offsetTracker.initPartition(tp, position);
       dispatcher.addPartition(tp);
-      if (metricsCollector != null) metricsCollector.partitionAssigned(tp);
+      metricsCollector.partitionAssigned(tp);
 
       logger.log(System.Logger.Level.DEBUG, "Initialized {0} at offset {1}", tp, position);
     }

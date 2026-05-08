@@ -22,6 +22,7 @@ import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.error.Fallback;
+import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.time.Duration;
 import java.util.HashMap;
@@ -91,10 +92,11 @@ class BatchWorkerPoolTest {
                 }
                 completedBatches.incrementAndGet();
               },
-              new RetryExecutor<>(ErrorStrategy.failFast()),
+              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
-              1);
+              1,
+              NoOpMetricsCollector.INSTANCE);
       pool.start();
 
       // First dispatch (TP0) occupies the single thread
@@ -132,10 +134,11 @@ class BatchWorkerPoolTest {
               2,
               ThreadMode.PLATFORM,
               (tp, records) -> {},
-              new RetryExecutor<>(ErrorStrategy.failFast()),
+              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
-              100);
+              100,
+              NoOpMetricsCollector.INSTANCE);
       pool.start();
       assertThrows(IllegalStateException.class, pool::start);
       pool.stop(1000);
@@ -165,10 +168,11 @@ class BatchWorkerPoolTest {
                 for (var r : records) processed.add(r.value());
                 done.countDown();
               },
-              new RetryExecutor<>(ErrorStrategy.failFast()),
+              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
-              100);
+              100,
+              NoOpMetricsCollector.INSTANCE);
       pool.start();
 
       pool.dispatch(buildRecords(TP0, 0, 4));
@@ -187,10 +191,11 @@ class BatchWorkerPoolTest {
               (tp, records) -> {
                 throw new RuntimeException("always fails");
               },
-              new RetryExecutor<>(ErrorStrategy.failFast()),
+              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
-              100);
+              100,
+              NoOpMetricsCollector.INSTANCE);
       pool.start();
 
       pool.dispatch(buildRecords(TP0, 0, 2));
@@ -214,10 +219,11 @@ class BatchWorkerPoolTest {
               2,
               ThreadMode.PLATFORM,
               (tp, records) -> handlerCalls.incrementAndGet(),
-              new RetryExecutor<>(ErrorStrategy.failFast()),
+              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
-              100);
+              100,
+              NoOpMetricsCollector.INSTANCE);
       pool.start();
 
       // Resolve failure so registerBatch succeeds, but immediately fail again
@@ -250,10 +256,11 @@ class BatchWorkerPoolTest {
               (tp, records) -> {
                 throw new RuntimeException("always fails");
               },
-              new RetryExecutor<>(ErrorStrategy.skipOnError()),
+              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
-              100);
+              100,
+              NoOpMetricsCollector.INSTANCE);
       pool.start();
 
       pool.dispatch(buildRecords(TP0, 0, 2));
@@ -289,10 +296,11 @@ class BatchWorkerPoolTest {
               (tp, records) -> {
                 throw new RuntimeException("always fails");
               },
-              new RetryExecutor<>(strategy),
+              new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
-              100);
+              100,
+              NoOpMetricsCollector.INSTANCE);
       pool.start();
 
       pool.dispatch(buildRecords(TP0, 0, 2));

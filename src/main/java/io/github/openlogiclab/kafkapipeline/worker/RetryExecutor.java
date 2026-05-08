@@ -36,10 +36,6 @@ public final class RetryExecutor<K, V> {
   private final ErrorStrategy<K, V> strategy;
   private final PipelineMetricsCollector metricsCollector;
 
-  public RetryExecutor(ErrorStrategy<K, V> strategy) {
-    this(strategy, null);
-  }
-
   public RetryExecutor(ErrorStrategy<K, V> strategy, PipelineMetricsCollector metricsCollector) {
     this.strategy = strategy;
     this.metricsCollector = metricsCollector;
@@ -73,9 +69,7 @@ public final class RetryExecutor<K, V> {
       } catch (Exception e) {
         lastError = e;
         if (attempt < maxAttempts - 1) {
-          if (metricsCollector != null) {
-            metricsCollector.recordRetry();
-          }
+          metricsCollector.recordRetry();
           logger.log(
               System.Logger.Level.DEBUG,
               "Retry {0}/{1} for {2}: {3}",
@@ -98,15 +92,11 @@ public final class RetryExecutor<K, V> {
         for (ConsumerRecord<K, V> record : records) {
           dlq.send(record, error);
         }
-        if (metricsCollector != null) {
-          metricsCollector.recordDlqSuccess();
-        }
+        metricsCollector.recordDlqSuccess();
         logger.log(System.Logger.Level.INFO, "Sent to DLQ: {0} ({1})", tp, description);
         return FailureResolution.DLQ_SUCCESS;
       } catch (Exception dlqError) {
-        if (metricsCollector != null) {
-          metricsCollector.recordDlqFailure();
-        }
+        metricsCollector.recordDlqFailure();
         logger.log(
             System.Logger.Level.ERROR,
             "DLQ send failed for {0} ({1}): {2}",
@@ -117,9 +107,7 @@ public final class RetryExecutor<K, V> {
     }
 
     if (strategy.fallback() == Fallback.SKIP) {
-      if (metricsCollector != null) {
-        metricsCollector.recordSkipped();
-      }
+      metricsCollector.recordSkipped();
       logger.log(
           System.Logger.Level.WARNING,
           "Skipping failed {0} ({1}): {2}",
@@ -129,9 +117,7 @@ public final class RetryExecutor<K, V> {
       return FailureResolution.SKIP;
     }
 
-    if (metricsCollector != null) {
-      metricsCollector.recordPartitionFailure();
-    }
+    metricsCollector.recordPartitionFailure();
     logger.log(
         System.Logger.Level.ERROR,
         "Failing partition {0} due to {1}: {2}",

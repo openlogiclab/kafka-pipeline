@@ -39,7 +39,7 @@ import org.apache.kafka.common.TopicPartition;
  *
  * <p><strong>This is an internal API — not intended for direct use by library consumers.</strong>
  */
-public final class PipelineMetricsCollector {
+public class PipelineMetricsCollector {
 
   private final InFlightCounter inFlightCounter;
   private final BackpressureController backpressureController;

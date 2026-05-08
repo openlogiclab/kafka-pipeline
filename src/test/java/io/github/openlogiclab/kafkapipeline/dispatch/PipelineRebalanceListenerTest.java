@@ -18,6 +18,7 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.openlogiclab.kafkapipeline.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.time.Duration;
 import java.util.Collections;
@@ -59,7 +60,8 @@ class PipelineRebalanceListenerTest {
             commitSyncCalls::incrementAndGet,
             counter,
             mockConsumer,
-            Duration.ofSeconds(5));
+            Duration.ofSeconds(5),
+            NoOpMetricsCollector.INSTANCE);
   }
 
   @Nested
