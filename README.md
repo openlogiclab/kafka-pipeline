@@ -84,6 +84,49 @@ Worker Worker Worker              platform or virtual threads
 OffsetTracker → PeriodicCommitter sliding-window offset tracking, async commits
 ```
 
+### Architecture
+
+```mermaid
+flowchart TB
+  Broker["☁ Kafka Broker"]
+
+  Broker -->|"poll()"| KafkaConsumer
+  PeriodicCommitter -->|"commit"| Broker
+
+  subgraph Pipeline["KafkaPipeline"]
+    direction TB
+
+    KafkaConsumer["KafkaConsumer\n(1 poll thread)"]
+    KafkaConsumer <-->|"pause / resume"| BackpressureController
+    BackpressureController --- Sensors
+    subgraph Sensors["Sensors"]
+      direction LR
+      RecordCount["RecordCount"] ~~~ ByteSize["ByteSize"] ~~~ Heap["Heap"] ~~~ Custom["Custom"]
+    end
+
+    KafkaConsumer -->|"dispatch"| RecordDispatcher
+    RecordDispatcher --> WorkerPool["WorkerPool\n(platform or virtual threads)"]
+
+    WorkerPool -->|"ack / fail"| OffsetTracker
+    OffsetTracker -->|"committable offsets"| PeriodicCommitter
+
+    WorkerPool -->|"throws"| RetryExecutor
+    subgraph ErrorHandling["Error Handling"]
+      RetryExecutor -->|"exhausted"| DlqHandler["DLQ Handler"]
+      DlqHandler -->|"fails"| Fallback["Fallback\n(SKIP / FAIL_PARTITION)"]
+    end
+
+    RebalanceListener -->|"drain + commit"| OffsetTracker
+    RebalanceListener -->|"add / remove queues"| RecordDispatcher
+
+    MetricsCollector -->|"snapshot()"| PipelineMetrics
+  end
+
+  UserCode["User Code"] -->|"pipeline.metrics()"| PipelineMetrics
+```
+
+**Solid arrows** = data / control flow. The main path reads top-to-bottom: poll → dispatch → process → track → commit.
+
 1. A single poll loop fetches records and registers each offset with the tracker.
 2. Records are dispatched to per-partition queues (partition ordering preserved within each queue).
 3. Workers pull from queues and run your handler. Processing across partitions (and within a partition) is concurrent and unordered.
@@ -418,6 +461,92 @@ For cross-cutting concerns — deduplication, metrics, tracing — without clutt
 ```
 
 `beforeProcess` returning `false` is the idempotency hook — the record gets acked without touching your handler.
+
+### Metrics
+
+The pipeline collects operational metrics internally — throughput, backpressure, retries, commits, rebalances — and exposes them via an on-demand snapshot API. No background threads, no timers, no external dependencies. You call `metrics()` when you want a reading; the library doesn't push anything.
+
+```java
+PipelineMetrics m = pipeline.metrics();
+
+System.out.println("Processed: " + m.recordsProcessed());
+System.out.println("In-flight: " + m.inFlightRecords());
+System.out.println("Retries:   " + m.retryAttempts());
+System.out.println("Backpressure: " + m.backpressureStatus());
+```
+
+The returned `PipelineMetrics` record is immutable and safe to pass across threads, serialize, or log. Each call reads the current counter values — there's no stale cache.
+
+#### Counter vs. Gauge
+
+- **Counters** (`recordsProcessed`, `retryAttempts`, `commitSuccesses`, etc.) are monotonically increasing cumulative totals since pipeline start. Compute rates by diffing two snapshots:
+  ```java
+  long rate = (current.recordsProcessed() - previous.recordsProcessed()) / elapsedSeconds;
+  ```
+- **Gauges** (`inFlightRecords`, `inFlightBytes`, `backpressureStatus`, `assignedPartitions`) are instantaneous values that go up and down.
+
+#### Available Metrics
+
+| Category | Metric | Type | Description |
+|---|---|---|---|
+| Throughput | `recordsProcessed` | Counter | Records successfully handled |
+| | `recordsFailed` | Counter | Records that triggered partition failure |
+| | `recordsSkipped` | Counter | Records skipped by hook or fallback |
+| | `pollCount` | Counter | Total `consumer.poll()` calls |
+| | `emptyPollCount` | Counter | Polls that returned zero records |
+| Pressure | `inFlightRecords` | Gauge | Records between poll and ack |
+| | `inFlightBytes` | Gauge | Estimated bytes of in-flight records |
+| | `backpressureStatus` | Gauge | Current backpressure level (OK / THROTTLE / CRITICAL) |
+| | `throttleCount` | Counter | Times backpressure activated |
+| | `partitionLags` | Gauge | Per-partition processing lag (Map) |
+| Errors | `retryAttempts` | Counter | Total retry attempts across all records |
+| | `dlqSuccesses` | Counter | Records sent to DLQ successfully |
+| | `dlqFailures` | Counter | DLQ send failures |
+| | `partitionFailures` | Counter | Partitions entered failed state |
+| | `commitSuccesses` | Counter | Successful offset commits |
+| | `commitFailures` | Counter | Failed offset commits |
+| Rebalance | `rebalanceCount` | Counter | Consumer group rebalances |
+| | `drainTimeouts` | Counter | Drains that didn't complete in time |
+| | `recordsAbandoned` | Counter | Records abandoned during rebalance |
+| | `assignedPartitions` | Gauge | Currently assigned partitions (Set) |
+
+#### Export Examples
+
+The library collects; you decide how to export. A few common patterns:
+
+**Periodic logging**
+```java
+scheduler.scheduleAtFixedRate(() -> {
+    logger.info("pipeline: {}", pipeline.metrics());
+}, 0, 30, TimeUnit.SECONDS);
+```
+
+**Prometheus gauge**
+```java
+Gauge inFlight = Gauge.build("kafka_pipeline_in_flight_records", "In-flight records").register();
+scheduler.scheduleAtFixedRate(() -> {
+    inFlight.set(pipeline.metrics().inFlightRecords());
+}, 0, 15, TimeUnit.SECONDS);
+```
+
+**Health-check endpoint**
+```java
+app.get("/health", ctx -> {
+    PipelineMetrics m = pipeline.metrics();
+    ctx.status(m.backpressureStatus() == BackpressureStatus.CRITICAL ? 503 : 200);
+    ctx.json(m);
+});
+```
+
+#### Diagnostic Quick Reference
+
+| Symptom | Check | Likely Cause |
+|---|---|---|
+| Throughput drops to zero | `backpressureStatus`, `inFlightRecords` | Backpressure triggered — workers slower than poll rate |
+| Consumer lag growing | `partitionLags`, `retryAttempts` | Retry storms or slow handler |
+| Frequent rebalances | `rebalanceCount`, `drainTimeouts` | `max.poll.interval.ms` too low for handler time |
+| Data loss suspected | `recordsSkipped`, `dlqSuccesses` | Fallback=SKIP dropping records |
+| Memory pressure | `inFlightRecords`, `inFlightBytes` | Backpressure thresholds too high |
 
 ### Async Start
 

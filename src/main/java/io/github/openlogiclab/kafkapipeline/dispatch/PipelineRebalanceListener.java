@@ -17,6 +17,7 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.RecordSize;
+import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.PartitionDrainResult;
 import java.time.Duration;
@@ -45,6 +46,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
   private final InFlightCounter counter;
   private final Consumer<?, ?> consumer;
   private final Duration drainTimeout;
+  private final PipelineMetricsCollector metricsCollector;
 
   public PipelineRebalanceListener(
       OffsetTracker offsetTracker,
@@ -53,12 +55,24 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       InFlightCounter counter,
       Consumer<?, ?> consumer,
       Duration drainTimeout) {
+    this(offsetTracker, dispatcher, commitSync, counter, consumer, drainTimeout, null);
+  }
+
+  public PipelineRebalanceListener(
+      OffsetTracker offsetTracker,
+      RecordDispatcher<?, ?> dispatcher,
+      Runnable commitSync,
+      InFlightCounter counter,
+      Consumer<?, ?> consumer,
+      Duration drainTimeout,
+      PipelineMetricsCollector metricsCollector) {
     this.offsetTracker = offsetTracker;
     this.dispatcher = dispatcher;
     this.commitSync = commitSync;
     this.counter = counter;
     this.consumer = consumer;
     this.drainTimeout = drainTimeout;
+    this.metricsCollector = metricsCollector;
   }
 
   @Override
@@ -66,8 +80,10 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     if (partitions.isEmpty()) return;
 
     logger.log(System.Logger.Level.INFO, "Partitions revoked: {0}", partitions);
+    if (metricsCollector != null) metricsCollector.recordRebalance();
 
     for (TopicPartition tp : partitions) {
+      if (metricsCollector != null) metricsCollector.partitionRevoked(tp);
       List<? extends ConsumerRecord<?, ?>> abandoned = dispatcher.removePartition(tp);
       if (!abandoned.isEmpty()) {
         long abandonedBytes = 0;
@@ -75,6 +91,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
           abandonedBytes += RecordSize.estimateBytes(record);
         }
         counter.completed(abandoned.size(), abandonedBytes);
+        if (metricsCollector != null) metricsCollector.recordAbandoned(abandoned.size());
       }
     }
 
@@ -86,6 +103,10 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
                         () -> {
                           PartitionDrainResult result =
                               offsetTracker.drainPartition(tp, drainTimeout);
+                          if (!result.allCompleted() && metricsCollector != null) {
+                            metricsCollector.recordDrainTimeout();
+                            metricsCollector.recordAbandoned(result.abandonedCount());
+                          }
                           logger.log(System.Logger.Level.INFO, "Drained {0}: {1}", tp, result);
                         }))
             .toArray(CompletableFuture<?>[]::new);
@@ -109,6 +130,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       long position = consumer.position(tp);
       offsetTracker.initPartition(tp, position);
       dispatcher.addPartition(tp);
+      if (metricsCollector != null) metricsCollector.partitionAssigned(tp);
 
       logger.log(System.Logger.Level.DEBUG, "Initialized {0} at offset {1}", tp, position);
     }

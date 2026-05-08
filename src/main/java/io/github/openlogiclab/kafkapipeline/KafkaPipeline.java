@@ -23,6 +23,7 @@ import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
 import io.github.openlogiclab.kafkapipeline.dispatch.PeriodicCommitter;
 import io.github.openlogiclab.kafkapipeline.dispatch.PipelineRebalanceListener;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
+import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import io.github.openlogiclab.kafkapipeline.worker.BatchWorkerPool;
@@ -137,6 +138,7 @@ public final class KafkaPipeline<K, V> {
   private final RecordDispatcher<K, V> dispatcher;
   private final BackpressureController backpressure;
   private final WorkerPool<K, V> workerPool;
+  private final PipelineMetricsCollector metricsCollector;
 
   private Consumer<K, V> consumer;
   private PeriodicCommitter committer;
@@ -148,10 +150,13 @@ public final class KafkaPipeline<K, V> {
 
     this.offsetTracker = new UnorderedOffsetTracker();
     this.counter = new InFlightCounter();
-    this.retryExecutor = new RetryExecutor<>(config.errorStrategy());
-    this.dispatcher = new RecordDispatcher<>(config.dispatchQueueCapacity());
     this.backpressure = buildBackpressureController(config, counter);
-    this.workerPool = buildWorkerPool(config, retryExecutor, offsetTracker, dispatcher, counter);
+    this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
+    this.retryExecutor = new RetryExecutor<>(config.errorStrategy(), metricsCollector);
+    this.dispatcher = new RecordDispatcher<>(config.dispatchQueueCapacity());
+    this.workerPool =
+        buildWorkerPool(
+            config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
   }
 
   /**
@@ -174,10 +179,13 @@ public final class KafkaPipeline<K, V> {
 
     this.offsetTracker = new UnorderedOffsetTracker();
     this.counter = new InFlightCounter();
-    this.retryExecutor = new RetryExecutor<>(config.errorStrategy());
-    this.dispatcher = new RecordDispatcher<>(config.dispatchQueueCapacity());
     this.backpressure = buildBackpressureController(config, counter);
-    this.workerPool = buildWorkerPool(config, retryExecutor, offsetTracker, dispatcher, counter);
+    this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
+    this.retryExecutor = new RetryExecutor<>(config.errorStrategy(), metricsCollector);
+    this.dispatcher = new RecordDispatcher<>(config.dispatchQueueCapacity());
+    this.workerPool =
+        buildWorkerPool(
+            config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
   }
 
   public static <K, V> PipelineConfig.Builder<K, V> builder() {
@@ -244,6 +252,18 @@ public final class KafkaPipeline<K, V> {
     return running.get();
   }
 
+  /**
+   * Returns a point-in-time snapshot of pipeline operational metrics.
+   *
+   * <p>This method is safe to call from any thread at any time, including before {@link #start()}.
+   * Each call reads the current counter values — no background threads or timers involved.
+   *
+   * @see PipelineMetrics
+   */
+  public PipelineMetrics metrics() {
+    return metricsCollector.snapshot();
+  }
+
   private static <K, V> BackpressureController buildBackpressureController(
       PipelineConfig<K, V> config, InFlightCounter counter) {
     List<BackpressureSensor> sensors = new ArrayList<>();
@@ -263,7 +283,8 @@ public final class KafkaPipeline<K, V> {
       RetryExecutor<K, V> retryExecutor,
       OffsetTracker offsetTracker,
       RecordDispatcher<K, V> dispatcher,
-      InFlightCounter counter) {
+      InFlightCounter counter,
+      PipelineMetricsCollector metricsCollector) {
     if (config.isBatchMode()) {
       return new BatchWorkerPool<>(
           config.concurrency(),
@@ -272,7 +293,8 @@ public final class KafkaPipeline<K, V> {
           retryExecutor,
           offsetTracker,
           counter,
-          config.dispatchQueueCapacity());
+          config.dispatchQueueCapacity(),
+          metricsCollector);
     }
     return new SingleRecordWorkerPool<>(
         config.concurrency(),
@@ -282,7 +304,8 @@ public final class KafkaPipeline<K, V> {
         retryExecutor,
         offsetTracker,
         dispatcher,
-        counter);
+        counter,
+        metricsCollector);
   }
 
   private void initConsumer() {
@@ -293,7 +316,8 @@ public final class KafkaPipeline<K, V> {
       consumer = new KafkaConsumer<>(props);
     }
 
-    committer = new PeriodicCommitter(offsetTracker, consumer, config.commitInterval());
+    committer =
+        new PeriodicCommitter(offsetTracker, consumer, config.commitInterval(), metricsCollector);
 
     PipelineRebalanceListener rebalanceListener =
         new PipelineRebalanceListener(
@@ -302,7 +326,8 @@ public final class KafkaPipeline<K, V> {
             committer::commitSync,
             counter,
             consumer,
-            config.drainTimeout());
+            config.drainTimeout(),
+            metricsCollector);
 
     consumer.subscribe(config.topics(), rebalanceListener);
   }
@@ -316,12 +341,15 @@ public final class KafkaPipeline<K, V> {
           if (!paused) {
             consumer.pause(consumer.assignment());
             paused = true;
+            metricsCollector.recordThrottle();
             logger.log(
                 System.Logger.Level.DEBUG,
                 "Backpressure: paused. {0}",
                 backpressure.statusSummary());
           }
           consumer.poll(config.pollTimeout());
+          metricsCollector.recordPoll();
+          metricsCollector.recordEmptyPoll();
           continue;
         }
 
@@ -332,7 +360,11 @@ public final class KafkaPipeline<K, V> {
         }
 
         ConsumerRecords<K, V> records = consumer.poll(config.pollTimeout());
-        if (records.isEmpty()) continue;
+        metricsCollector.recordPoll();
+        if (records.isEmpty()) {
+          metricsCollector.recordEmptyPoll();
+          continue;
+        }
 
         workerPool.dispatch(records);
       } catch (org.apache.kafka.common.errors.WakeupException e) {

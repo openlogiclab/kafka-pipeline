@@ -15,6 +15,7 @@
  */
 package io.github.openlogiclab.kafkapipeline.dispatch;
 
+import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import java.time.Duration;
 import java.util.HashMap;
@@ -43,12 +44,22 @@ public final class PeriodicCommitter {
   private final Duration commitInterval;
   private final ScheduledExecutorService scheduler;
   private final AtomicBoolean running = new AtomicBoolean(false);
+  private final PipelineMetricsCollector metricsCollector;
 
   public PeriodicCommitter(
       OffsetTracker offsetTracker, Consumer<?, ?> consumer, Duration commitInterval) {
+    this(offsetTracker, consumer, commitInterval, null);
+  }
+
+  public PeriodicCommitter(
+      OffsetTracker offsetTracker,
+      Consumer<?, ?> consumer,
+      Duration commitInterval,
+      PipelineMetricsCollector metricsCollector) {
     this.offsetTracker = offsetTracker;
     this.consumer = consumer;
     this.commitInterval = commitInterval;
+    this.metricsCollector = metricsCollector;
     this.scheduler =
         Executors.newSingleThreadScheduledExecutor(
             r -> {
@@ -90,9 +101,11 @@ public final class PeriodicCommitter {
           offsets,
           (committedOffsets, exception) -> {
             if (exception != null) {
+              if (metricsCollector != null) metricsCollector.recordCommitFailure();
               logger.log(
                   System.Logger.Level.WARNING, "Async commit failed: {0}", exception.getMessage());
             } else {
+              if (metricsCollector != null) metricsCollector.recordCommitSuccess();
               logger.log(
                   System.Logger.Level.DEBUG,
                   "Committed offsets for {0} partitions",
@@ -100,6 +113,7 @@ public final class PeriodicCommitter {
             }
           });
     } catch (Exception e) {
+      if (metricsCollector != null) metricsCollector.recordCommitFailure();
       logger.log(System.Logger.Level.WARNING, "Error during async commit: {0}", e.getMessage());
     }
   }
@@ -110,9 +124,11 @@ public final class PeriodicCommitter {
       if (offsets.isEmpty()) return;
 
       consumer.commitSync(offsets);
+      if (metricsCollector != null) metricsCollector.recordCommitSuccess();
       logger.log(
           System.Logger.Level.INFO, "Sync committed offsets for {0} partitions", offsets.size());
     } catch (Exception e) {
+      if (metricsCollector != null) metricsCollector.recordCommitFailure();
       logger.log(System.Logger.Level.ERROR, "Sync commit failed: {0}", e.getMessage());
     }
   }

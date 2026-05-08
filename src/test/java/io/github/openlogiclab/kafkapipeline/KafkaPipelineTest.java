@@ -345,6 +345,46 @@ class KafkaPipelineTest {
   }
 
   @Nested
+  class MetricsAccess {
+
+    @Test
+    void metricsAvailableBeforeStart() {
+      PipelineConfig<String, String> config = baseBuilder().handler(record -> {}).build();
+      pipeline = new KafkaPipeline<>(config, mockConsumer);
+
+      PipelineMetrics m = pipeline.metrics();
+      assertNotNull(m);
+      assertEquals(0, m.recordsProcessed());
+      assertEquals(0, m.pollCount());
+    }
+
+    @Test
+    void metricsReflectsProcessedRecords() throws Exception {
+      CopyOnWriteArrayList<String> processed = new CopyOnWriteArrayList<>();
+
+      PipelineConfig<String, String> config =
+          baseBuilder().handler(record -> processed.add(record.value())).build();
+      pipeline = new KafkaPipeline<>(config, mockConsumer);
+
+      startAndAssign(TP0);
+      for (int i = 0; i < 5; i++) {
+        mockConsumer.addRecord(new ConsumerRecord<>(TOPIC, 0, i, "k", "v" + i));
+      }
+
+      assertTrue(
+          awaitCondition(() -> processed.size() == 5, Duration.ofSeconds(5)),
+          "Expected 5 processed, got " + processed.size());
+
+      PipelineMetrics m = pipeline.metrics();
+      assertEquals(5, m.recordsProcessed());
+      assertTrue(m.pollCount() > 0, "Should have at least one poll");
+
+      pipeline.stop();
+      pipeline.awaitShutdown();
+    }
+  }
+
+  @Nested
   class ShutdownErrorPaths {
 
     @Test

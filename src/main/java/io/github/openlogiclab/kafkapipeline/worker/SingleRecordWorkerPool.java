@@ -24,6 +24,7 @@ import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
+import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import java.util.List;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -51,6 +52,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private final OffsetTracker offsetTracker;
   private final RecordDispatcher<K, V> dispatcher;
   private final InFlightCounter counter;
+  private final PipelineMetricsCollector metricsCollector;
 
   public SingleRecordWorkerPool(
       int concurrency,
@@ -61,6 +63,28 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       OffsetTracker offsetTracker,
       RecordDispatcher<K, V> dispatcher,
       InFlightCounter counter) {
+    this(
+        concurrency,
+        threadMode,
+        handler,
+        hook,
+        retryExecutor,
+        offsetTracker,
+        dispatcher,
+        counter,
+        null);
+  }
+
+  public SingleRecordWorkerPool(
+      int concurrency,
+      ThreadMode threadMode,
+      RecordHandler<K, V> handler,
+      ProcessingLifecycleHook<K, V> hook,
+      RetryExecutor<K, V> retryExecutor,
+      OffsetTracker offsetTracker,
+      RecordDispatcher<K, V> dispatcher,
+      InFlightCounter counter,
+      PipelineMetricsCollector metricsCollector) {
     super(concurrency, threadMode, "kafka-pipeline-worker-", 0);
     this.handler = handler;
     this.hook = hook;
@@ -68,6 +92,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     this.offsetTracker = offsetTracker;
     this.dispatcher = dispatcher;
     this.counter = counter;
+    this.metricsCollector = metricsCollector;
   }
 
   @Override
@@ -141,6 +166,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     if (shouldSkipViaHook) {
       offsetTracker.ack(tp, offset);
       counter.completed(1, recordBytes);
+      if (metricsCollector != null) metricsCollector.recordSkipped();
       return;
     }
 
@@ -163,6 +189,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     if (lastError == null) {
       offsetTracker.ack(tp, offset);
       counter.completed(1, recordBytes);
+      if (metricsCollector != null) metricsCollector.recordProcessed(1);
       return;
     }
 
@@ -171,7 +198,10 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
 
     switch (resolution) {
       case DLQ_SUCCESS, SKIP -> offsetTracker.ack(tp, offset);
-      case FAIL_PARTITION -> offsetTracker.fail(tp, offset);
+      case FAIL_PARTITION -> {
+        offsetTracker.fail(tp, offset);
+        if (metricsCollector != null) metricsCollector.recordFailed();
+      }
     }
     counter.completed(1, recordBytes);
   }
