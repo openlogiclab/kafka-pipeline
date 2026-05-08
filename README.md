@@ -24,12 +24,12 @@ This library packages all of that into a clean pipeline that you configure once 
 
 **Gradle (Kotlin DSL)**
 ```kotlin
-implementation("io.github.openlogiclab:kafka-pipeline:0.1.0-beta.1")
+implementation("io.github.openlogiclab:kafka-pipeline:0.1.0-beta.2")
 ```
 
 **Gradle (Groovy)**
 ```groovy
-implementation 'io.github.openlogiclab:kafka-pipeline:0.1.0-beta.1'
+implementation 'io.github.openlogiclab:kafka-pipeline:0.1.0-beta.2'
 ```
 
 **Maven**
@@ -37,7 +37,7 @@ implementation 'io.github.openlogiclab:kafka-pipeline:0.1.0-beta.1'
 <dependency>
     <groupId>io.github.openlogiclab</groupId>
     <artifactId>kafka-pipeline</artifactId>
-    <version>0.1.0-beta.1</version>
+    <version>0.1.0-beta.2</version>
 </dependency>
 ```
 
