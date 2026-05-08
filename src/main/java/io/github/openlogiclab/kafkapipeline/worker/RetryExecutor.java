@@ -18,6 +18,7 @@ package io.github.openlogiclab.kafkapipeline.worker;
 import io.github.openlogiclab.kafkapipeline.error.DLQHandler;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.error.Fallback;
+import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import java.util.List;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
@@ -33,9 +34,11 @@ public final class RetryExecutor<K, V> {
   private static final System.Logger logger = System.getLogger(RetryExecutor.class.getName());
 
   private final ErrorStrategy<K, V> strategy;
+  private final PipelineMetricsCollector metricsCollector;
 
-  public RetryExecutor(ErrorStrategy<K, V> strategy) {
+  public RetryExecutor(ErrorStrategy<K, V> strategy, PipelineMetricsCollector metricsCollector) {
     this.strategy = strategy;
+    this.metricsCollector = metricsCollector;
   }
 
   @FunctionalInterface
@@ -66,6 +69,7 @@ public final class RetryExecutor<K, V> {
       } catch (Exception e) {
         lastError = e;
         if (attempt < maxAttempts - 1) {
+          metricsCollector.recordRetry();
           logger.log(
               System.Logger.Level.DEBUG,
               "Retry {0}/{1} for {2}: {3}",
@@ -88,9 +92,11 @@ public final class RetryExecutor<K, V> {
         for (ConsumerRecord<K, V> record : records) {
           dlq.send(record, error);
         }
+        metricsCollector.recordDlqSuccess();
         logger.log(System.Logger.Level.INFO, "Sent to DLQ: {0} ({1})", tp, description);
         return FailureResolution.DLQ_SUCCESS;
       } catch (Exception dlqError) {
+        metricsCollector.recordDlqFailure();
         logger.log(
             System.Logger.Level.ERROR,
             "DLQ send failed for {0} ({1}): {2}",
@@ -101,6 +107,7 @@ public final class RetryExecutor<K, V> {
     }
 
     if (strategy.fallback() == Fallback.SKIP) {
+      metricsCollector.recordSkipped();
       logger.log(
           System.Logger.Level.WARNING,
           "Skipping failed {0} ({1}): {2}",
@@ -110,6 +117,7 @@ public final class RetryExecutor<K, V> {
       return FailureResolution.SKIP;
     }
 
+    metricsCollector.recordPartitionFailure();
     logger.log(
         System.Logger.Level.ERROR,
         "Failing partition {0} due to {1}: {2}",

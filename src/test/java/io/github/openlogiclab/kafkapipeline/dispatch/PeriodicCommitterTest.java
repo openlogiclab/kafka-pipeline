@@ -17,6 +17,7 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.time.Duration;
 import java.util.HashMap;
@@ -61,7 +62,9 @@ class PeriodicCommitterTest {
       AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
       Consumer<String, String> spy = new SpyConsumer(captured, null);
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, spy, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.commitSync();
 
       assertNotNull(captured.get());
@@ -73,7 +76,9 @@ class PeriodicCommitterTest {
       AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
       Consumer<String, String> spy = new SpyConsumer(captured, null);
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, spy, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.commitSync();
 
       assertNull(captured.get(), "Should not call commitSync when no offsets to commit");
@@ -89,7 +94,9 @@ class PeriodicCommitterTest {
       AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
       Consumer<String, String> spy = new SpyConsumer(captured, null);
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, spy, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.commitSync();
 
       assertEquals(1L, captured.get().get(TP0).offset());
@@ -109,7 +116,9 @@ class PeriodicCommitterTest {
             }
           };
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, broken, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, broken, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       assertDoesNotThrow(c::commitSync);
     }
   }
@@ -125,7 +134,9 @@ class PeriodicCommitterTest {
       AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
       Consumer<String, String> spy = new SpyConsumer(null, captured);
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, spy, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.start();
       c.commitAsync();
       c.stop();
@@ -139,7 +150,9 @@ class PeriodicCommitterTest {
       AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
       Consumer<String, String> spy = new SpyConsumer(null, captured);
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, spy, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.start();
       c.commitAsync();
       c.stop();
@@ -152,7 +165,9 @@ class PeriodicCommitterTest {
       AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
       Consumer<String, String> spy = new SpyConsumer(null, captured);
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, spy, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.commitAsync();
 
       assertNull(captured.get(), "commitAsync should skip when not running");
@@ -172,7 +187,9 @@ class PeriodicCommitterTest {
             }
           };
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, spy, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.start();
       assertDoesNotThrow(c::commitAsync);
       c.stop();
@@ -192,7 +209,9 @@ class PeriodicCommitterTest {
             }
           };
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, broken, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, broken, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.start();
       assertDoesNotThrow(c::commitAsync);
       c.stop();
@@ -205,7 +224,8 @@ class PeriodicCommitterTest {
     @Test
     void doubleStartThrows() {
       MockConsumer<String, String> mc = new MockConsumer<>("earliest");
-      PeriodicCommitter c = new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       c.start();
       assertThrows(IllegalStateException.class, c::start);
       c.stop();
@@ -227,7 +247,8 @@ class PeriodicCommitterTest {
             }
           };
 
-      PeriodicCommitter c = new PeriodicCommitter(tracker, spy, Duration.ofMillis(50));
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, spy, Duration.ofMillis(50), NoOpMetricsCollector.INSTANCE);
       c.start();
       Thread.sleep(250);
       c.stop();
@@ -238,7 +259,8 @@ class PeriodicCommitterTest {
     @Test
     void stopWithoutStart() {
       MockConsumer<String, String> mc = new MockConsumer<>("earliest");
-      PeriodicCommitter c = new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60));
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
       assertDoesNotThrow(c::stop);
     }
   }

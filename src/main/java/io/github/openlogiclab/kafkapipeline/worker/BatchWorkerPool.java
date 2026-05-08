@@ -19,6 +19,7 @@ import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.RecordSize;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
+import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import java.util.List;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -37,6 +38,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   private final RetryExecutor<K, V> retryExecutor;
   private final OffsetTracker offsetTracker;
   private final InFlightCounter counter;
+  private final PipelineMetricsCollector metricsCollector;
 
   /**
    * @param concurrency number of batch processing threads
@@ -48,6 +50,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
    * @param taskQueueCapacity max queued batch tasks for PLATFORM mode; acts as a safety net when
    *     backpressure alone is insufficient. For VIRTUAL threads this is ignored (each task gets its
    *     own lightweight thread).
+   * @param metricsCollector pipeline metrics collector
    */
   public BatchWorkerPool(
       int concurrency,
@@ -56,12 +59,14 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       RetryExecutor<K, V> retryExecutor,
       OffsetTracker offsetTracker,
       InFlightCounter counter,
-      int taskQueueCapacity) {
+      int taskQueueCapacity,
+      PipelineMetricsCollector metricsCollector) {
     super(concurrency, threadMode, "kafka-pipeline-batch-", taskQueueCapacity);
     this.handler = handler;
     this.retryExecutor = retryExecutor;
     this.offsetTracker = offsetTracker;
     this.counter = counter;
+    this.metricsCollector = metricsCollector;
   }
 
   @Override
@@ -123,6 +128,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     if (lastError == null) {
       offsetTracker.ackBatch(tp, firstOffset, lastOffset);
       counter.completed(batch.size(), totalBytes);
+      metricsCollector.recordProcessed(batch.size());
       return;
     }
 
@@ -131,7 +137,10 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
 
     switch (resolution) {
       case DLQ_SUCCESS, SKIP -> offsetTracker.ackBatch(tp, firstOffset, lastOffset);
-      case FAIL_PARTITION -> offsetTracker.fail(tp, firstOffset);
+      case FAIL_PARTITION -> {
+        offsetTracker.fail(tp, firstOffset);
+        metricsCollector.recordFailed();
+      }
     }
     counter.completed(batch.size(), totalBytes);
   }

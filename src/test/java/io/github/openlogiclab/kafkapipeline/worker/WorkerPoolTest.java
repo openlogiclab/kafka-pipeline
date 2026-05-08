@@ -25,6 +25,7 @@ import io.github.openlogiclab.kafkapipeline.error.Fallback;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
+import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.time.Duration;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -70,10 +71,11 @@ class WorkerPoolTest {
         ThreadMode.PLATFORM,
         handler,
         hook,
-        new RetryExecutor<>(errorStrategy),
+        new RetryExecutor<>(errorStrategy, NoOpMetricsCollector.INSTANCE),
         tracker,
         dispatcher,
-        counter);
+        counter,
+        NoOpMetricsCollector.INSTANCE);
   }
 
   private WorkerPool<String, String> pool(RecordHandler<String, String> handler) {
