@@ -3,8 +3,8 @@
  * backpressure, and offset management out of the box.
  *
  * <p>Exported packages contain the public API for library consumers. Internal packages ({@code
- * worker}, {@code dispatch}, {@code offset}) are encapsulated and not accessible to downstream
- * modules.
+ * worker}, {@code dispatch}, {@code offset}, {@code internal}) are encapsulated and not accessible
+ * to downstream modules.
  */
 module io.github.openlogiclab.kafkapipeline {
   requires kafka.clients;

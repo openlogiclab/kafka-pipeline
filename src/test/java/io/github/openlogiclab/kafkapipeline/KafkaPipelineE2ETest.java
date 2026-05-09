@@ -151,6 +151,11 @@ class KafkaPipelineE2ETest {
 
       assertEquals(count, processed.size());
 
+      PipelineMetrics m = pipeline.metrics();
+      assertEquals(count, m.recordsProcessed(), "Metrics should reflect all processed records");
+      assertTrue(m.pollCount() > 0, "Should have at least one poll");
+      assertTrue(m.commitSuccesses() > 0, "Should have at least one commit");
+
       Map<TopicPartition, OffsetAndMetadata> committed = mockConsumer.committed(Set.of(TP0));
       assertNotNull(committed.get(TP0), "Offset should be committed for TP0");
       assertEquals(count, committed.get(TP0).offset());
@@ -253,6 +258,10 @@ class KafkaPipelineE2ETest {
 
       assertEquals("retry-me", processed.getFirst());
       assertEquals(3, attempts.get());
+
+      PipelineMetrics m = pipeline.metrics();
+      assertEquals(2, m.retryAttempts(), "Two retry attempts expected");
+      assertEquals(1, m.recordsProcessed(), "Record should be processed after retries");
     }
   }
 
@@ -295,6 +304,10 @@ class KafkaPipelineE2ETest {
       assertEquals("dlq-me", dlqRecords.getFirst().value());
       assertEquals(3, handlerCalls.get());
 
+      PipelineMetrics m = pipeline.metrics();
+      assertEquals(1, m.dlqSuccesses(), "One DLQ success expected");
+      assertEquals(2, m.retryAttempts(), "Two retry attempts before DLQ");
+
       Map<TopicPartition, OffsetAndMetadata> committed = mockConsumer.committed(Set.of(TP0));
       assertNotNull(committed.get(TP0), "DLQ success should still advance offset");
     }
@@ -335,6 +348,10 @@ class KafkaPipelineE2ETest {
       assertTrue(processed.contains("good-0"));
       assertTrue(processed.contains("good-2"));
       assertFalse(processed.contains("poison"));
+
+      PipelineMetrics m = pipeline.metrics();
+      assertEquals(2, m.recordsProcessed(), "Two good records processed");
+      assertEquals(1, m.recordsSkipped(), "One poison record skipped");
 
       Map<TopicPartition, OffsetAndMetadata> committed = mockConsumer.committed(Set.of(TP0));
       assertNotNull(committed.get(TP0));
@@ -384,6 +401,10 @@ class KafkaPipelineE2ETest {
       assertTrue(processed.contains("normal"));
       assertTrue(processed.contains("normal-2"));
       assertTrue(skippedOffsets.contains(1L));
+
+      PipelineMetrics m = pipeline.metrics();
+      assertEquals(2, m.recordsProcessed(), "Two normal records processed");
+      assertEquals(1, m.recordsSkipped(), "One record skipped by hook");
 
       Map<TopicPartition, OffsetAndMetadata> committed = mockConsumer.committed(Set.of(TP0));
       assertNotNull(committed.get(TP0));
