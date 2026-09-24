@@ -2,7 +2,7 @@ plugins {
     `java-library`
     id("jacoco")
     id("com.diffplug.spotless") version "8.4.0"
-    id("com.vanniktech.maven.publish") version "0.36.0"
+    id("com.vanniktech.maven.publish") version "0.37.0"
 }
 
 group = "io.github.openlogiclab"
