@@ -45,15 +45,7 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
   void register(TopicPartition tp, long offset);
 
   /**
-   * Registers a contiguous range of offsets [fromOffset, toOffset] inclusive.
-   *
-   * @throws IllegalArgumentException if fromOffset > toOffset
-   * @throws IllegalStateException if any offset in the range overlaps with existing entries
-   */
-  void registerBatch(TopicPartition tp, long fromOffset, long toOffset);
-
-  /**
-   * Registers a batch offsets.
+   * Registers a batch of offsets.
    *
    * @throws IllegalArgumentException if offsets is empty or null
    * @throws IllegalStateException if any offset in the range overlaps with existing entries
@@ -70,16 +62,7 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
   void markInProgress(TopicPartition tp, long offset);
 
   /**
-   * Marks a contiguous range of offsets [fromOffset, toOffset] as IN_PROGRESS under a single lock
-   * acquisition. Used by batch processing mode for efficiency.
-   *
-   * @throws IllegalStateException if any offset in the range is not in REGISTERED state
-   */
-  void markBatchInProgress(TopicPartition tp, long fromOffset, long toOffset);
-
-  /**
-   * Marks a batch of specific offsets as IN_PROGRESS under a single lock acquisition. Used by batch
-   * processing mode when offsets are non-contiguous.
+   * Marks a batch of offsets as IN_PROGRESS. Used by batch processing mode.
    *
    * @throws IllegalStateException if any offset is not in REGISTERED state
    */
@@ -94,16 +77,7 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
   void ack(TopicPartition tp, long offset);
 
   /**
-   * Marks a contiguous range of offsets [fromOffset, toOffset] as DONE under a single lock
-   * acquisition. Used by batch processing mode for efficiency.
-   *
-   * @throws IllegalStateException if any offset in the range is not in IN_PROGRESS state
-   */
-  void ackBatch(TopicPartition tp, long fromOffset, long toOffset);
-
-  /**
-   * Marks a batch of specific offsets as DONE under a single lock acquisition. Used by batch
-   * processing mode when offsets are non-contiguous.
+   * Marks a batch of offsets as DONE. Used by batch processing mode.
    *
    * @throws IllegalStateException if any offset is not in IN_PROGRESS state
    */

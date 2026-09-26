@@ -42,14 +42,6 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
-  public void registerBatch(TopicPartition tp, long fromOffset, long toOffset) {
-    if (fromOffset > toOffset) {
-      throw new IllegalArgumentException("fromOffset " + fromOffset + " > toOffset " + toOffset);
-    }
-    getOrThrow(tp).registerBatch(fromOffset, toOffset);
-  }
-
-  @Override
   public void registerBatch(TopicPartition tp, long[] offsets) {
     if (Objects.isNull(offsets)) {
       throw new IllegalArgumentException("offset cannot be Null");
@@ -66,11 +58,6 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
-  public void markBatchInProgress(TopicPartition tp, long fromOffset, long toOffset) {
-    getOrThrow(tp).markBatchInProgress(fromOffset, toOffset);
-  }
-
-  @Override
   public void markBatchInProgress(TopicPartition tp, long[] offsets) {
     getOrThrow(tp).markBatchInProgress(offsets);
   }
@@ -78,11 +65,6 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   @Override
   public void ack(TopicPartition tp, long offset) {
     getOrThrow(tp).ack(offset);
-  }
-
-  @Override
-  public void ackBatch(TopicPartition tp, long fromOffset, long toOffset) {
-    getOrThrow(tp).ackBatch(fromOffset, toOffset);
   }
 
   @Override
