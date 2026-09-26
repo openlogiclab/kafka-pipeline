@@ -485,6 +485,25 @@ class PartitionWindowTest {
       window.resolveBatchFailure(batch1);
       assertEquals(OptionalLong.of(116), window.getCommittableOffset());
     }
+
+    @Test
+    void failBatch_unknownOffset_throws() {
+      long[] offsets = {100, 999}; // 999 is not registered
+      window.register(100);
+      window.markInProgress(100);
+
+      assertThrows(IllegalStateException.class, () -> window.failBatch(offsets));
+    }
+
+    @Test
+    void resolveBatchFailure_unknownOffset_throws() {
+      long[] offsets = {100, 999}; // 999 is not registered
+      window.register(100);
+      window.markInProgress(100);
+      window.fail(100);
+
+      assertThrows(IllegalStateException.class, () -> window.resolveBatchFailure(offsets));
+    }
   }
 
   @Nested

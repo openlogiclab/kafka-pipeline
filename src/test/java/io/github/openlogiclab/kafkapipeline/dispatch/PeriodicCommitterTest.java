@@ -385,6 +385,40 @@ class PeriodicCommitterTest {
     }
   }
 
+  @Nested
+  class Stop {
+
+    @Test
+    void stop_setsRunningToFalse() throws Exception {
+      tracker.initPartition(TP0, 0);
+      MockConsumer<String, String> consumer = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, consumer, Duration.ofMinutes(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      c.stop();
+
+      // Calling stop again should be a no-op
+      assertDoesNotThrow(() -> c.stop());
+    }
+
+    @Test
+    void stop_interruptHandling() throws Exception {
+      tracker.initPartition(TP0, 0);
+      MockConsumer<String, String> consumer = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, consumer, Duration.ofMinutes(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      Thread.currentThread().interrupt();
+      c.stop();
+
+      assertTrue(Thread.currentThread().isInterrupted());
+      Thread.interrupted();
+    }
+  }
+
   private static class SpyConsumer extends MockConsumer<String, String> {
     private final AtomicReference<Map<TopicPartition, OffsetAndMetadata>> syncCapture;
     private final AtomicReference<Map<TopicPartition, OffsetAndMetadata>> asyncCapture;
