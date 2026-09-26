@@ -546,6 +546,68 @@ class UnorderedOffsetTrackerTest {
     }
   }
 
+  // ── Batch Failure ────────────────────────────────────────────
+
+  @Nested
+  class BatchFailure {
+
+    @BeforeEach
+    void init() {
+      tracker.initPartition(TP0, 100);
+    }
+
+    @Test
+    void failBatch_marksAllOffsetsAsFailed() {
+      long[] offsets = {100, 105, 110};
+      tracker.registerBatch(TP0, offsets);
+      tracker.markBatchInProgress(TP0, offsets);
+
+      tracker.failBatch(TP0, offsets);
+
+      assertThrows(IllegalStateException.class, () -> tracker.register(TP0, 200));
+    }
+
+    @Test
+    void failBatch_uninitializedPartition_throws() {
+      long[] offsets = {100, 105};
+      assertThrows(IllegalStateException.class, () -> tracker.failBatch(TP_UNKNOWN, offsets));
+    }
+
+    @Test
+    void resolveBatchFailure_clearsFailedState() {
+      long[] offsets = {100, 105, 110};
+      tracker.registerBatch(TP0, offsets);
+      tracker.markBatchInProgress(TP0, offsets);
+      tracker.failBatch(TP0, offsets);
+
+      tracker.resolveBatchFailure(TP0, offsets);
+
+      assertDoesNotThrow(() -> tracker.register(TP0, 200));
+      assertEquals(OptionalLong.of(111), tracker.getCommittableOffset(TP0));
+    }
+
+    @Test
+    void resolveBatchFailure_uninitializedPartition_throws() {
+      long[] offsets = {100, 105};
+      assertThrows(
+          IllegalStateException.class, () -> tracker.resolveBatchFailure(TP_UNKNOWN, offsets));
+    }
+
+    @Test
+    void failBatch_thenResolveBatch_fullLifecycle() {
+      long[] offsets = {100, 200, 300};
+      tracker.registerBatch(TP0, offsets);
+      tracker.markBatchInProgress(TP0, offsets);
+
+      tracker.failBatch(TP0, offsets);
+      assertThrows(IllegalStateException.class, () -> tracker.register(TP0, 400));
+
+      tracker.resolveBatchFailure(TP0, offsets);
+      assertDoesNotThrow(() -> tracker.register(TP0, 400));
+      assertEquals(OptionalLong.of(301), tracker.getCommittableOffset(TP0));
+    }
+  }
+
   // ── Window Max Size ──────────────────────────────────────────
 
   @Nested

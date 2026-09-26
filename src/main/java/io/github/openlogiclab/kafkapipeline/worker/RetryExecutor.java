@@ -86,17 +86,32 @@ public final class RetryExecutor<K, V> {
   public FailureResolution handleFailure(
       List<ConsumerRecord<K, V>> records, TopicPartition tp, Exception error, String description) {
 
+    int recordCount = records.size();
+
     if (strategy.hasDlq()) {
+      int sentToDlq = 0;
       try {
         DLQHandler<K, V> dlq = strategy.dlqHandler();
         for (ConsumerRecord<K, V> record : records) {
           dlq.send(record, error);
+          sentToDlq++;
         }
-        metricsCollector.recordDlqSuccess();
+        metricsCollector.recordDlqSuccess(recordCount);
         logger.log(System.Logger.Level.INFO, "Sent to DLQ: {0} ({1})", tp, description);
         return FailureResolution.DLQ_SUCCESS;
       } catch (Exception dlqError) {
-        metricsCollector.recordDlqFailure();
+        int failedToSend = recordCount - sentToDlq;
+        if (sentToDlq > 0) {
+          metricsCollector.recordDlqSuccess(sentToDlq);
+          logger.log(
+              System.Logger.Level.WARNING,
+              "Partial DLQ send for {0} ({1}): {2}/{3} records sent before failure",
+              tp,
+              description,
+              sentToDlq,
+              recordCount);
+        }
+        metricsCollector.recordDlqFailure(failedToSend);
         logger.log(
             System.Logger.Level.ERROR,
             "DLQ send failed for {0} ({1}): {2}",
@@ -107,7 +122,7 @@ public final class RetryExecutor<K, V> {
     }
 
     if (strategy.fallback() == Fallback.SKIP) {
-      metricsCollector.recordSkipped();
+      metricsCollector.recordSkipped(recordCount);
       logger.log(
           System.Logger.Level.WARNING,
           "Skipping failed {0} ({1}): {2}",
