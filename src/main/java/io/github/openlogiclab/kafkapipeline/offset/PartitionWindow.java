@@ -85,26 +85,6 @@ final class PartitionWindow {
     }
   }
 
-  void registerBatch(long fromOffset, long toOffset) {
-    registerLock.lock();
-    try {
-      validateNotFailed();
-      int batchSize = (int) (toOffset - fromOffset + 1);
-      validateWindowCapacity(batchSize);
-      for (long offset = fromOffset; offset <= toOffset; offset++) {
-        if (entries.containsKey(offset)) {
-          rollbackBatch(fromOffset, offset);
-          throw new IllegalStateException("Offset " + offset + " already tracked in window");
-        }
-        entries.put(offset, OffsetStatus.REGISTERED);
-        pendingCount.incrementAndGet();
-      }
-      updateHighestRegistered(toOffset);
-    } finally {
-      registerLock.unlock();
-    }
-  }
-
   void registerBatch(long[] offsets) {
     registerLock.lock();
     try {
@@ -145,13 +125,6 @@ final class PartitionWindow {
     inProgressCount.incrementAndGet();
   }
 
-  void markBatchInProgress(long fromOffset, long toOffset) {
-    validateNotFailed();
-    for (long offset = fromOffset; offset <= toOffset; offset++) {
-      markInProgress(offset);
-    }
-  }
-
   void markBatchInProgress(long[] offsets) {
     validateNotFailed();
     for (long offset : offsets) {
@@ -176,28 +149,6 @@ final class PartitionWindow {
     inProgressCount.decrementAndGet();
     completedCount.incrementAndGet();
 
-    tryShrinkAndSignal();
-  }
-
-  void ackBatch(long fromOffset, long toOffset) {
-    for (long off = fromOffset; off <= toOffset; off++) {
-      final long offset = off;
-      OffsetStatus prev =
-          entries.computeIfPresent(
-              offset,
-              (k, status) -> {
-                if (status != OffsetStatus.IN_PROGRESS) {
-                  throw new IllegalStateException(
-                      "Cannot ack offset " + offset + ", current status: " + status);
-                }
-                return OffsetStatus.DONE;
-              });
-      if (prev == null) {
-        throw new IllegalStateException("Cannot ack offset " + offset + ", current status: null");
-      }
-      inProgressCount.decrementAndGet();
-      completedCount.incrementAndGet();
-    }
     tryShrinkAndSignal();
   }
 
@@ -401,13 +352,6 @@ final class PartitionWindow {
       current = highestRegistered.get();
       if (offset <= current) return;
     } while (!highestRegistered.compareAndSet(current, offset));
-  }
-
-  private void rollbackBatch(long fromOffset, long failedAt) {
-    for (long offset = fromOffset; offset < failedAt; offset++) {
-      entries.remove(offset);
-      pendingCount.decrementAndGet();
-    }
   }
 
   private void rollbackBatch(long[] offsets, int failedAtIndex) {

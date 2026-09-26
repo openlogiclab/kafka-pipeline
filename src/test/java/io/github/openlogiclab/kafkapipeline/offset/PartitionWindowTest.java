@@ -22,6 +22,7 @@ import java.util.OptionalLong;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.LongStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -29,6 +30,10 @@ import org.junit.jupiter.api.Test;
 class PartitionWindowTest {
 
   private PartitionWindow window;
+
+  private static long[] range(long from, long to) {
+    return LongStream.rangeClosed(from, to).toArray();
+  }
 
   @BeforeEach
   void setUp() {
@@ -136,19 +141,19 @@ class PartitionWindowTest {
       window.markInProgress(100);
       window.fail(100);
 
-      assertThrows(IllegalStateException.class, () -> window.registerBatch(101, 105));
+      assertThrows(IllegalStateException.class, () -> window.registerBatch(range(101, 105)));
     }
 
     @Test
     void batchExceedsCapacity() {
       PartitionWindow small = new PartitionWindow(0, 3);
-      assertThrows(IllegalStateException.class, () -> small.registerBatch(0, 5));
+      assertThrows(IllegalStateException.class, () -> small.registerBatch(range(0, 5)));
     }
 
     @Test
     void batchWithDuplicateRollsBack() {
       window.register(102);
-      assertThrows(IllegalStateException.class, () -> window.registerBatch(100, 104));
+      assertThrows(IllegalStateException.class, () -> window.registerBatch(range(100, 104)));
       assertEquals(1, window.pendingCount());
     }
   }
@@ -309,13 +314,13 @@ class PartitionWindowTest {
 
     @Test
     void markBatchInProgress_thenAckBatch_advancesWindow() {
-      window.registerBatch(100, 104);
-      window.markBatchInProgress(100, 104);
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
 
       assertEquals(0, window.pendingCount());
       assertEquals(5, window.inProgressCount());
 
-      window.ackBatch(100, 104);
+      window.ackBatch(range(100, 104));
       assertEquals(0, window.inProgressCount());
       assertEquals(OptionalLong.of(105), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
@@ -323,8 +328,8 @@ class PartitionWindowTest {
 
     @Test
     void markBatchInProgress_partialRange() {
-      window.registerBatch(100, 109);
-      window.markBatchInProgress(100, 104);
+      window.registerBatch(range(100, 109));
+      window.markBatchInProgress(range(100, 104));
 
       assertEquals(5, window.pendingCount());
       assertEquals(5, window.inProgressCount());
@@ -332,14 +337,14 @@ class PartitionWindowTest {
 
     @Test
     void ackBatch_partialRange_onlyShrinksContinuous() {
-      window.registerBatch(100, 104);
-      window.markBatchInProgress(100, 104);
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
 
       window.ack(100);
       window.ack(101);
       assertEquals(OptionalLong.of(102), window.getCommittableOffset());
 
-      window.ackBatch(102, 104);
+      window.ackBatch(range(102, 104));
       assertEquals(OptionalLong.of(105), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
     }
@@ -347,34 +352,34 @@ class PartitionWindowTest {
     @Test
     void markBatchInProgress_onUnregisteredOffset_throws() {
       window.register(100);
-      assertThrows(IllegalStateException.class, () -> window.markBatchInProgress(100, 102));
+      assertThrows(IllegalStateException.class, () -> window.markBatchInProgress(range(100, 102)));
     }
 
     @Test
     void ackBatch_onNonInProgressOffset_throws() {
-      window.registerBatch(100, 102);
-      assertThrows(IllegalStateException.class, () -> window.ackBatch(100, 102));
+      window.registerBatch(range(100, 102));
+      assertThrows(IllegalStateException.class, () -> window.ackBatch(range(100, 102)));
     }
 
     @Test
     void multipleBatches_sequentially() {
-      window.registerBatch(100, 102);
-      window.markBatchInProgress(100, 102);
-      window.ackBatch(100, 102);
+      window.registerBatch(range(100, 102));
+      window.markBatchInProgress(range(100, 102));
+      window.ackBatch(range(100, 102));
       assertEquals(OptionalLong.of(103), window.getCommittableOffset());
 
-      window.registerBatch(103, 105);
-      window.markBatchInProgress(103, 105);
-      window.ackBatch(103, 105);
+      window.registerBatch(range(103, 105));
+      window.markBatchInProgress(range(103, 105));
+      window.ackBatch(range(103, 105));
       assertEquals(OptionalLong.of(106), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
     }
 
     @Test
     void batchAndSingleRecordInterleaved() {
-      window.registerBatch(100, 104);
-      window.markBatchInProgress(100, 104);
-      window.ackBatch(100, 104);
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
+      window.ackBatch(range(100, 104));
 
       window.register(105);
       window.markInProgress(105);
@@ -387,9 +392,10 @@ class PartitionWindowTest {
     void largeBatch_singleLockAcquisition() {
       int batchSize = 1000;
       window = new PartitionWindow(0, 2000);
-      window.registerBatch(0, batchSize - 1);
-      window.markBatchInProgress(0, batchSize - 1);
-      window.ackBatch(0, batchSize - 1);
+      long[] offsets = range(0, batchSize - 1);
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+      window.ackBatch(offsets);
 
       assertEquals(OptionalLong.of(batchSize), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
@@ -601,7 +607,7 @@ class PartitionWindowTest {
       window.registerBatch(offsets1);
 
       // Register using range (consecutive)
-      window.registerBatch(110, 112);
+      window.registerBatch(range(110, 112));
 
       assertEquals(5, window.windowSize()); // 100, 105, 110, 111, 112
 
@@ -610,7 +616,7 @@ class PartitionWindowTest {
       assertEquals(2, window.inProgressCount());
 
       // Mark range batch in progress
-      window.markBatchInProgress(110, 112);
+      window.markBatchInProgress(range(110, 112));
       assertEquals(5, window.inProgressCount());
 
       // Ack array batch - all entries are DONE, shrinks through 100, 105
@@ -621,7 +627,7 @@ class PartitionWindowTest {
       assertEquals(3, window.windowSize());
 
       // Ack range batch
-      window.ackBatch(110, 112);
+      window.ackBatch(range(110, 112));
       // Now 110, 111, 112 are DONE, shrinks through all
       assertEquals(OptionalLong.of(113), window.getCommittableOffset());
       assertEquals(0, window.windowSize());

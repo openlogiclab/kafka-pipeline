@@ -26,6 +26,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.LongStream;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
@@ -37,6 +38,10 @@ class UnorderedOffsetTrackerTest {
   private static final TopicPartition TP1 = new TopicPartition("test", 1);
   private static final TopicPartition TP2 = new TopicPartition("test", 2);
   private static final TopicPartition TP_UNKNOWN = new TopicPartition("test", 99);
+
+  private static long[] range(long from, long to) {
+    return LongStream.rangeClosed(from, to).toArray();
+  }
 
   private UnorderedOffsetTracker tracker;
 
@@ -119,7 +124,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void multipleRecords_inOrder() {
-      tracker.registerBatch(TP0, 100, 102);
+      tracker.registerBatch(TP0, range(100, 102));
 
       for (long offset = 100; offset <= 102; offset++) {
         tracker.markInProgress(TP0, offset);
@@ -162,7 +167,7 @@ class UnorderedOffsetTrackerTest {
     @BeforeEach
     void init() {
       tracker.initPartition(TP0, 100);
-      tracker.registerBatch(TP0, 100, 104);
+      tracker.registerBatch(TP0, range(100, 104));
     }
 
     @Test
@@ -303,34 +308,29 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void registerBatch_registersCorrectCount() {
-      tracker.registerBatch(TP0, 100, 104);
+      tracker.registerBatch(TP0, range(100, 104));
       assertEquals(5, tracker.pendingCount(TP0));
     }
 
     @Test
     void registerBatch_singleOffset() {
-      tracker.registerBatch(TP0, 100, 100);
+      tracker.registerBatch(TP0, range(100, 100));
       assertEquals(1, tracker.pendingCount(TP0));
-    }
-
-    @Test
-    void registerBatch_invalidRangeThrows() {
-      assertThrows(IllegalArgumentException.class, () -> tracker.registerBatch(TP0, 104, 100));
     }
 
     @Test
     void registerBatch_duplicateOffset_throwsAndRollsBack() {
       tracker.register(TP0, 102);
 
-      assertThrows(IllegalStateException.class, () -> tracker.registerBatch(TP0, 100, 104));
+      assertThrows(IllegalStateException.class, () -> tracker.registerBatch(TP0, range(100, 104)));
 
       assertEquals(1, tracker.pendingCount(TP0), "only the original register(102) should remain");
     }
 
     @Test
     void multipleBatches_sequential() {
-      tracker.registerBatch(TP0, 100, 102);
-      tracker.registerBatch(TP0, 103, 105);
+      tracker.registerBatch(TP0, range(100, 102));
+      tracker.registerBatch(TP0, range(103, 105));
       assertEquals(6, tracker.pendingCount(TP0));
     }
   }
@@ -441,7 +441,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void fail_blocksSubsequentMarkInProgress() {
-      tracker.registerBatch(TP0, 100, 101);
+      tracker.registerBatch(TP0, range(100, 101));
       tracker.markInProgress(TP0, 100);
       tracker.fail(TP0, 100);
 
@@ -450,7 +450,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void fail_doesNotAdvanceCommittableOffset() {
-      tracker.registerBatch(TP0, 100, 102);
+      tracker.registerBatch(TP0, range(100, 102));
       tracker.markInProgress(TP0, 100);
       tracker.ack(TP0, 100);
 
@@ -465,7 +465,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void fail_withCompletedRecordsBehind_preservesCommittable() {
-      tracker.registerBatch(TP0, 100, 103);
+      tracker.registerBatch(TP0, range(100, 103));
       tracker.markInProgress(TP0, 100);
       tracker.markInProgress(TP0, 101);
       tracker.markInProgress(TP0, 102);
@@ -499,7 +499,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void resolveFailure_allowsWindowToAdvance() {
-      tracker.registerBatch(TP0, 100, 102);
+      tracker.registerBatch(TP0, range(100, 102));
       tracker.markInProgress(TP0, 100);
       tracker.markInProgress(TP0, 101);
       tracker.markInProgress(TP0, 102);
@@ -537,7 +537,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void resolveFailure_atLeftEdge_shrinksWindow() {
-      tracker.registerBatch(TP0, 100, 102);
+      tracker.registerBatch(TP0, range(100, 102));
       tracker.markInProgress(TP0, 100);
       tracker.fail(TP0, 100);
 
@@ -632,7 +632,7 @@ class UnorderedOffsetTrackerTest {
 
       assertThrows(
           IllegalStateException.class,
-          () -> tracker.registerBatch(TP0, 0, PartitionWindow.DEFAULT_MAX_WINDOW_SIZE));
+          () -> tracker.registerBatch(TP0, range(0, PartitionWindow.DEFAULT_MAX_WINDOW_SIZE)));
     }
 
     @Test
@@ -669,7 +669,7 @@ class UnorderedOffsetTrackerTest {
     void lag_tracksDistanceBetweenRegisteredAndCommitted() {
       assertEquals(0, tracker.lag(TP0));
 
-      tracker.registerBatch(TP0, 100, 104);
+      tracker.registerBatch(TP0, range(100, 104));
       assertEquals(5, tracker.lag(TP0));
 
       tracker.markInProgress(TP0, 100);
@@ -680,7 +680,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void countsAccurateThroughLifecycle() {
-      tracker.registerBatch(TP0, 100, 102);
+      tracker.registerBatch(TP0, range(100, 102));
       assertEquals(3, tracker.pendingCount(TP0));
       assertEquals(0, tracker.inProgressCount(TP0));
 
@@ -785,7 +785,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void drain_afterAllCompleted() {
-      tracker.registerBatch(TP0, 100, 102);
+      tracker.registerBatch(TP0, range(100, 102));
       for (long o = 100; o <= 102; o++) {
         tracker.markInProgress(TP0, o);
         tracker.ack(TP0, o);
@@ -800,7 +800,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void drain_withPendingRecords_reportsAbandoned() {
-      tracker.registerBatch(TP0, 100, 104);
+      tracker.registerBatch(TP0, range(100, 104));
       tracker.markInProgress(TP0, 100);
       tracker.ack(TP0, 100);
 
@@ -826,7 +826,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void drain_inProgressCompletesOnAnotherThread() throws Exception {
-      tracker.registerBatch(TP0, 100, 102);
+      tracker.registerBatch(TP0, range(100, 102));
       tracker.markInProgress(TP0, 100);
       tracker.markInProgress(TP0, 101);
       tracker.markInProgress(TP0, 102);
@@ -875,7 +875,7 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void drain_partiallyCompleted_reportsCorrectCounts() {
-      tracker.registerBatch(TP0, 100, 104);
+      tracker.registerBatch(TP0, range(100, 104));
       for (long o = 100; o <= 104; o++) {
         tracker.markInProgress(TP0, o);
       }
@@ -973,8 +973,8 @@ class UnorderedOffsetTrackerTest {
       tracker.initPartition(TP0, 100);
       tracker.initPartition(TP1, 200);
 
-      tracker.registerBatch(TP0, 100, 102);
-      tracker.registerBatch(TP1, 200, 202);
+      tracker.registerBatch(TP0, range(100, 102));
+      tracker.registerBatch(TP1, range(200, 202));
 
       for (long o = 100; o <= 102; o++) {
         tracker.markInProgress(TP0, o);
