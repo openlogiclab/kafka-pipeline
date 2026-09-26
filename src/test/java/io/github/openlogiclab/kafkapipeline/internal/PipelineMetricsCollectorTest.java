@@ -69,15 +69,27 @@ class PipelineMetricsCollectorTest {
 
     @Test
     void recordFailedIncrements() {
-      collector.recordFailed();
-      collector.recordFailed();
+      collector.recordFailed(1);
+      collector.recordFailed(1);
       assertEquals(2, collector.snapshot().recordsFailed());
     }
 
     @Test
+    void recordFailedWithCount() {
+      collector.recordFailed(5);
+      assertEquals(5, collector.snapshot().recordsFailed());
+    }
+
+    @Test
     void recordSkippedIncrements() {
-      collector.recordSkipped();
+      collector.recordSkipped(1);
       assertEquals(1, collector.snapshot().recordsSkipped());
+    }
+
+    @Test
+    void recordSkippedWithCount() {
+      collector.recordSkipped(3);
+      assertEquals(3, collector.snapshot().recordsSkipped());
     }
 
     @Test
@@ -150,13 +162,23 @@ class PipelineMetricsCollectorTest {
 
     @Test
     void dlqCounters() {
-      collector.recordDlqSuccess();
-      collector.recordDlqSuccess();
-      collector.recordDlqFailure();
+      collector.recordDlqSuccess(1);
+      collector.recordDlqSuccess(1);
+      collector.recordDlqFailure(1);
 
       PipelineMetrics m = collector.snapshot();
       assertEquals(2, m.dlqSuccesses());
       assertEquals(1, m.dlqFailures());
+    }
+
+    @Test
+    void dlqCountersWithBatchCounts() {
+      collector.recordDlqSuccess(5);
+      collector.recordDlqFailure(3);
+
+      PipelineMetrics m = collector.snapshot();
+      assertEquals(5, m.dlqSuccesses());
+      assertEquals(3, m.dlqFailures());
     }
 
     @Test

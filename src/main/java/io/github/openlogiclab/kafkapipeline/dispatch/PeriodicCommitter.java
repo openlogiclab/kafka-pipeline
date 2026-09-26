@@ -32,6 +32,11 @@ import org.apache.kafka.common.TopicPartition;
  * Timer-based offset committer that periodically reads committable offsets from the {@link
  * OffsetTracker} and commits them via the Kafka consumer.
  *
+ * <p>Thread-safety: Kafka's consumer is not thread-safe (only {@code wakeup()} may be called from
+ * another thread). This committer uses a flag-based signaling approach: the scheduler thread sets a
+ * {@code commitDue} flag, and the poll loop calls {@link #maybeCommitAsync()} to perform the actual
+ * commit on the poll thread.
+ *
  * <p>Uses {@code commitAsync()} for periodic commits (non-blocking on the poll loop) and {@code
  * commitSync()} for the final commit during shutdown/rebalance.
  */
@@ -44,6 +49,7 @@ public final class PeriodicCommitter {
   private final Duration commitInterval;
   private final ScheduledExecutorService scheduler;
   private final AtomicBoolean running = new AtomicBoolean(false);
+  private final AtomicBoolean commitDue = new AtomicBoolean(false);
   private final PipelineMetricsCollector metricsCollector;
 
   public PeriodicCommitter(
@@ -70,7 +76,8 @@ public final class PeriodicCommitter {
       throw new IllegalStateException("PeriodicCommitter already started");
     }
     long intervalMs = commitInterval.toMillis();
-    scheduler.scheduleAtFixedRate(this::commitAsync, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+    scheduler.scheduleAtFixedRate(
+        this::signalCommitDue, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
     logger.log(
         System.Logger.Level.INFO, "PeriodicCommitter started with interval {0}ms", intervalMs);
   }
@@ -79,13 +86,34 @@ public final class PeriodicCommitter {
     running.set(false);
     scheduler.shutdown();
     try {
-      scheduler.awaitTermination(5, TimeUnit.SECONDS);
+      if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+        scheduler.shutdownNow();
+      }
     } catch (InterruptedException e) {
+      scheduler.shutdownNow();
       Thread.currentThread().interrupt();
     }
     logger.log(System.Logger.Level.INFO, "PeriodicCommitter stopped");
   }
 
+  /** Called by the scheduler thread to signal that a commit is due. Does not touch the consumer. */
+  private void signalCommitDue() {
+    if (running.get()) {
+      commitDue.set(true);
+    }
+  }
+
+  /**
+   * Called by the poll loop to check if a commit is due and perform it. Must be called from the
+   * poll thread (the same thread that calls {@code consumer.poll()}).
+   */
+  public void maybeCommitAsync() {
+    if (commitDue.compareAndSet(true, false)) {
+      commitAsync();
+    }
+  }
+
+  /** Performs an async commit. Must be called from the poll thread. */
   public void commitAsync() {
     if (!running.get()) return;
     try {

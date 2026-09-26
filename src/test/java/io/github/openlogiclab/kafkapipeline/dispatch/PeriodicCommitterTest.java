@@ -232,7 +232,29 @@ class PeriodicCommitterTest {
     }
 
     @Test
-    void periodicCommitFires() throws Exception {
+    void stopWithoutStart() {
+      MockConsumer<String, String> mc = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      assertDoesNotThrow(c::stop);
+    }
+
+    @Test
+    void stopCompletesEvenIfSchedulerIsSlow() {
+      MockConsumer<String, String> mc = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      // stop() should complete without hanging even if scheduler is slow
+      assertDoesNotThrow(c::stop);
+    }
+  }
+
+  @Nested
+  class MaybeCommitAsync {
+
+    @Test
+    void maybeCommitAsyncCommitsWhenFlagIsSet() throws Exception {
       tracker.initPartition(TP0, 0);
       completeRecord(TP0, 0);
 
@@ -250,18 +272,150 @@ class PeriodicCommitterTest {
       PeriodicCommitter c =
           new PeriodicCommitter(tracker, spy, Duration.ofMillis(50), NoOpMetricsCollector.INSTANCE);
       c.start();
-      Thread.sleep(250);
+
+      // Wait for the scheduler to signal commit due
+      Thread.sleep(100);
+
+      // Poll loop calls maybeCommitAsync, which should trigger the commit
+      c.maybeCommitAsync();
       c.stop();
 
-      assertTrue(asyncCalls.get() >= 2, "Expected at least 2 periodic commits, got " + asyncCalls);
+      assertEquals(1, asyncCalls.get(), "Expected exactly 1 commit from maybeCommitAsync");
     }
 
     @Test
-    void stopWithoutStart() {
-      MockConsumer<String, String> mc = new MockConsumer<>("earliest");
+    void maybeCommitAsyncDoesNothingWhenFlagNotSet() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicInteger asyncCalls = new AtomicInteger();
+      Consumer<String, String> spy =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              asyncCalls.incrementAndGet();
+              if (callback != null) callback.onComplete(offsets, null);
+            }
+          };
+
+      // Use a very long interval so the flag won't be set
       PeriodicCommitter c =
-          new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
-      assertDoesNotThrow(c::stop);
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofMinutes(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      // Immediately call maybeCommitAsync before scheduler has a chance to set flag
+      c.maybeCommitAsync();
+      c.stop();
+
+      assertEquals(0, asyncCalls.get(), "Expected no commits when flag not set");
+    }
+
+    @Test
+    void maybeCommitAsyncClearsFlag() throws Exception {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicInteger asyncCalls = new AtomicInteger();
+      Consumer<String, String> spy =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              asyncCalls.incrementAndGet();
+              if (callback != null) callback.onComplete(offsets, null);
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, spy, Duration.ofMillis(50), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      // Wait for flag to be set (scheduler fires every 50ms, wait 200ms to be safe)
+      Thread.sleep(200);
+
+      // First call consumes the flag
+      c.maybeCommitAsync();
+      int firstCount = asyncCalls.get();
+
+      // Second immediate call should not commit (flag cleared)
+      c.maybeCommitAsync();
+      int secondCount = asyncCalls.get();
+
+      c.stop();
+
+      assertEquals(1, firstCount, "First maybeCommitAsync should commit");
+      assertEquals(1, secondCount, "Second maybeCommitAsync should not commit (flag cleared)");
+    }
+
+    @Test
+    void schedulerSetsCommitDueFlagButDoesNotCallConsumer() throws Exception {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicInteger asyncCalls = new AtomicInteger();
+      Consumer<String, String> spy =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              asyncCalls.incrementAndGet();
+              if (callback != null) callback.onComplete(offsets, null);
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, spy, Duration.ofMillis(30), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      // Let the scheduler fire multiple times
+      Thread.sleep(150);
+
+      // Without calling maybeCommitAsync, no commits should have happened
+      assertEquals(0, asyncCalls.get(), "Scheduler should only set flag, not call consumer");
+
+      // Now poll loop calls maybeCommitAsync
+      c.maybeCommitAsync();
+      c.stop();
+
+      // Should have exactly 1 commit (flag set multiple times but only 1 actual commit)
+      assertEquals(
+          1, asyncCalls.get(), "Only 1 commit should occur when poll loop calls maybeCommitAsync");
+    }
+  }
+
+  @Nested
+  class Stop {
+
+    @Test
+    void stop_setsRunningToFalse() throws Exception {
+      tracker.initPartition(TP0, 0);
+      MockConsumer<String, String> consumer = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, consumer, Duration.ofMinutes(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      c.stop();
+
+      // Calling stop again should be a no-op
+      assertDoesNotThrow(() -> c.stop());
+    }
+
+    @Test
+    void stop_interruptHandling() throws Exception {
+      tracker.initPartition(TP0, 0);
+      MockConsumer<String, String> consumer = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, consumer, Duration.ofMinutes(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      Thread.currentThread().interrupt();
+      c.stop();
+
+      assertTrue(Thread.currentThread().isInterrupted());
+      Thread.interrupted();
     }
   }
 
