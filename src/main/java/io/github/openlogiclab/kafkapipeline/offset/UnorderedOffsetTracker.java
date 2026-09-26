@@ -50,6 +50,17 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
+  public void registerBatch(TopicPartition tp, long[] offsets) {
+    if (Objects.isNull(offsets)) {
+      throw new IllegalArgumentException("offset cannot be Null");
+    }
+    if (offsets.length == 0) {
+      throw new IllegalArgumentException("offset cannot be empty");
+    }
+    getOrThrow(tp).registerBatch(offsets);
+  }
+
+  @Override
   public void markInProgress(TopicPartition tp, long offset) {
     getOrThrow(tp).markInProgress(offset);
   }
@@ -57,6 +68,11 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   @Override
   public void markBatchInProgress(TopicPartition tp, long fromOffset, long toOffset) {
     getOrThrow(tp).markBatchInProgress(fromOffset, toOffset);
+  }
+
+  @Override
+  public void markBatchInProgress(TopicPartition tp, long[] offsets) {
+    getOrThrow(tp).markBatchInProgress(offsets);
   }
 
   @Override
@@ -70,13 +86,28 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
+  public void ackBatch(TopicPartition tp, long[] offsets) {
+    getOrThrow(tp).ackBatch(offsets);
+  }
+
+  @Override
   public void fail(TopicPartition tp, long offset) {
     getOrThrow(tp).fail(offset);
   }
 
   @Override
+  public void failBatch(TopicPartition tp, long[] offsets) {
+    getOrThrow(tp).failBatch(offsets);
+  }
+
+  @Override
   public void resolveFailure(TopicPartition tp, long offset) {
     getOrThrow(tp).resolveFailure(offset);
+  }
+
+  @Override
+  public void resolveBatchFailure(TopicPartition tp, long[] offsets) {
+    getOrThrow(tp).resolveBatchFailure(offsets);
   }
 
   @Override

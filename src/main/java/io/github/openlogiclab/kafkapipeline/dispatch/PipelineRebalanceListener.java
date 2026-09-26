@@ -24,6 +24,8 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -47,6 +49,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
   private final Consumer<?, ?> consumer;
   private final Duration drainTimeout;
   private final PipelineMetricsCollector metricsCollector;
+  private final ExecutorService drainExecutor;
 
   public PipelineRebalanceListener(
       OffsetTracker offsetTracker,
@@ -63,6 +66,9 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     this.consumer = consumer;
     this.drainTimeout = drainTimeout;
     this.metricsCollector = metricsCollector;
+    this.drainExecutor =
+        Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("kafka-pipeline-drain-", 0).factory());
   }
 
   @Override
@@ -91,14 +97,23 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
                 tp ->
                     CompletableFuture.runAsync(
                         () -> {
-                          PartitionDrainResult result =
-                              offsetTracker.drainPartition(tp, drainTimeout);
-                          if (!result.allCompleted()) {
-                            metricsCollector.recordDrainTimeout();
-                            metricsCollector.recordAbandoned(result.abandonedCount());
+                          try {
+                            PartitionDrainResult result =
+                                offsetTracker.drainPartition(tp, drainTimeout);
+                            if (!result.allCompleted()) {
+                              metricsCollector.recordDrainTimeout();
+                              metricsCollector.recordAbandoned(result.abandonedCount());
+                            }
+                            logger.log(System.Logger.Level.INFO, "Drained {0}: {1}", tp, result);
+                          } catch (Exception e) {
+                            logger.log(
+                                System.Logger.Level.ERROR,
+                                "Error draining partition {0}: {1}",
+                                tp,
+                                e.getMessage());
                           }
-                          logger.log(System.Logger.Level.INFO, "Drained {0}: {1}", tp, result);
-                        }))
+                        },
+                        drainExecutor))
             .toArray(CompletableFuture<?>[]::new);
 
     CompletableFuture.allOf(drainFutures).join();
@@ -124,5 +139,9 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
 
       logger.log(System.Logger.Level.DEBUG, "Initialized {0} at offset {1}", tp, position);
     }
+  }
+
+  public void shutdown() {
+    drainExecutor.shutdownNow();
   }
 }

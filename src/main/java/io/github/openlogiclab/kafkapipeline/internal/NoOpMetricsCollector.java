@@ -60,10 +60,10 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
   public void recordProcessed(long count) {}
 
   @Override
-  public void recordFailed() {}
+  public void recordFailed(int count) {}
 
   @Override
-  public void recordSkipped() {}
+  public void recordSkipped(int count) {}
 
   @Override
   public void recordPoll() {}
@@ -78,10 +78,10 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
   public void recordRetry() {}
 
   @Override
-  public void recordDlqSuccess() {}
+  public void recordDlqSuccess(int count) {}
 
   @Override
-  public void recordDlqFailure() {}
+  public void recordDlqFailure(int count) {}
 
   @Override
   public void recordPartitionFailure() {}

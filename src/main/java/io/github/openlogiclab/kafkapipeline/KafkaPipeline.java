@@ -142,6 +142,8 @@ public final class KafkaPipeline<K, V> {
 
   private Consumer<K, V> consumer;
   private PeriodicCommitter committer;
+  private PipelineRebalanceListener rebalanceListener;
+  private Thread shutdownHook;
 
   public KafkaPipeline(PipelineConfig<K, V> config) {
     this.config = config;
@@ -319,7 +321,7 @@ public final class KafkaPipeline<K, V> {
     committer =
         new PeriodicCommitter(offsetTracker, consumer, config.commitInterval(), metricsCollector);
 
-    PipelineRebalanceListener rebalanceListener =
+    rebalanceListener =
         new PipelineRebalanceListener(
             offsetTracker,
             dispatcher,
@@ -337,6 +339,9 @@ public final class KafkaPipeline<K, V> {
 
     while (running.get()) {
       try {
+        // Perform any pending periodic commits on the poll thread (thread-safe)
+        committer.maybeCommitAsync();
+
         if (backpressure.shouldThrottle()) {
           if (!paused) {
             consumer.pause(consumer.assignment());
@@ -401,6 +406,14 @@ public final class KafkaPipeline<K, V> {
       logger.log(System.Logger.Level.WARNING, "Error during final commit", e);
     }
 
+    if (rebalanceListener != null) {
+      try {
+        rebalanceListener.shutdown();
+      } catch (Exception e) {
+        logger.log(System.Logger.Level.WARNING, "Error shutting down rebalance listener", e);
+      }
+    }
+
     if (ownsConsumer) {
       try {
         consumer.close(
@@ -410,22 +423,34 @@ public final class KafkaPipeline<K, V> {
       }
     }
 
+    removeShutdownHook();
+
     logger.log(System.Logger.Level.INFO, "Pipeline shut down complete");
   }
 
   private void registerShutdownHook() {
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(
-                () -> {
-                  logger.log(System.Logger.Level.INFO, "Shutdown hook triggered");
-                  stop();
-                  try {
-                    awaitShutdown();
-                  } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                  }
-                },
-                "kafka-pipeline-shutdown"));
+    shutdownHook =
+        new Thread(
+            () -> {
+              logger.log(System.Logger.Level.INFO, "Shutdown hook triggered");
+              stop();
+              try {
+                awaitShutdown();
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              }
+            },
+            "kafka-pipeline-shutdown");
+    Runtime.getRuntime().addShutdownHook(shutdownHook);
+  }
+
+  private void removeShutdownHook() {
+    if (shutdownHook != null) {
+      try {
+        Runtime.getRuntime().removeShutdownHook(shutdownHook);
+      } catch (IllegalStateException e) {
+        // JVM is already shutting down, ignore
+      }
+    }
   }
 }
