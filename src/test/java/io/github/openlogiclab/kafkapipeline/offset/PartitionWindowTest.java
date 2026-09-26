@@ -106,6 +106,15 @@ class PartitionWindowTest {
     }
 
     @Test
+    void lag_afterArrayBatchRegistration() {
+      long[] offsets = {100, 200, 300};
+      window.registerBatch(offsets);
+      // highestRegistered should be 300, committableOffset is 100
+      // lag = 300 + 1 - 100 = 201
+      assertEquals(201, window.lag());
+    }
+
+    @Test
     void pendingAndInProgressCounts() {
       window.register(100);
       window.register(101);
@@ -383,6 +392,241 @@ class PartitionWindowTest {
       window.ackBatch(0, batchSize - 1);
 
       assertEquals(OptionalLong.of(batchSize), window.getCommittableOffset());
+      assertEquals(0, window.windowSize());
+    }
+  }
+
+  @Nested
+  class BatchFailureOperations {
+
+    @Test
+    void failBatch_marksAllOffsetsAsFailed() {
+      long[] offsets = {100, 105, 110};
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+
+      window.failBatch(offsets);
+
+      assertTrue(window.isFailed());
+      assertEquals(0, window.inProgressCount());
+    }
+
+    @Test
+    void failBatch_nonInProgressOffset_throws() {
+      long[] offsets = {100, 105, 110};
+      window.registerBatch(offsets);
+      // Not marked in-progress
+
+      assertThrows(IllegalStateException.class, () -> window.failBatch(offsets));
+    }
+
+    @Test
+    void resolveBatchFailure_marksAllOffsetsAsDone() {
+      long[] offsets = {100, 105, 110};
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+      window.failBatch(offsets);
+
+      window.resolveBatchFailure(offsets);
+
+      assertFalse(window.isFailed());
+      assertEquals(OptionalLong.of(111), window.getCommittableOffset());
+      assertEquals(0, window.windowSize());
+    }
+
+    @Test
+    void resolveBatchFailure_nonFailedOffset_throws() {
+      long[] offsets = {100, 105};
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+      // Not failed
+
+      assertThrows(IllegalStateException.class, () -> window.resolveBatchFailure(offsets));
+    }
+
+    @Test
+    void failBatch_thenResolveBatch_fullLifecycle() {
+      long[] offsets = {100, 200, 300};
+      window = new PartitionWindow(100, 100);
+
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+
+      // All offsets fail together
+      window.failBatch(offsets);
+      assertTrue(window.isFailed());
+      assertEquals(0, window.inProgressCount());
+
+      // After DLQ/skip, resolve all
+      window.resolveBatchFailure(offsets);
+      assertFalse(window.isFailed());
+      assertEquals(OptionalLong.of(301), window.getCommittableOffset());
+    }
+
+    @Test
+    void failBatch_partialBatch_blocksRemainingOffsets() {
+      // Register two batches
+      long[] batch1 = {100, 105};
+      long[] batch2 = {110, 115};
+      window.registerBatch(batch1);
+      window.registerBatch(batch2);
+      window.markBatchInProgress(batch1);
+      window.markBatchInProgress(batch2);
+
+      // First batch fails, second completes
+      window.failBatch(batch1);
+      window.ackBatch(batch2);
+
+      // Window cannot advance past failed offsets
+      assertTrue(window.isFailed());
+      assertEquals(OptionalLong.empty(), window.getCommittableOffset());
+
+      // Resolve batch1 to unblock
+      window.resolveBatchFailure(batch1);
+      assertEquals(OptionalLong.of(116), window.getCommittableOffset());
+    }
+  }
+
+  @Nested
+  class ArrayBasedBatchOperations {
+
+    @Test
+    void registerBatchWithArray_tracksOnlySpecifiedOffsets() {
+      long[] offsets = {100, 105, 110};
+      window.registerBatch(offsets);
+
+      assertEquals(3, window.pendingCount());
+      assertEquals(3, window.windowSize());
+    }
+
+    @Test
+    void registerBatchWithArray_nonConsecutiveOffsets_usesMinimalCapacity() {
+      // This is the key bug fix: range-based would create 10001 entries
+      // Array-based only creates 3 entries
+      PartitionWindow small = new PartitionWindow(0, 100);
+      long[] offsets = {100, 5100, 10100};
+
+      // Should succeed because we only track 3 offsets, not 10001
+      assertDoesNotThrow(() -> small.registerBatch(offsets));
+      assertEquals(3, small.windowSize());
+    }
+
+    @Test
+    void markBatchInProgressWithArray_worksWithNonConsecutiveOffsets() {
+      long[] offsets = {100, 105, 110};
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+
+      assertEquals(0, window.pendingCount());
+      assertEquals(3, window.inProgressCount());
+    }
+
+    @Test
+    void ackBatchWithArray_worksWithNonConsecutiveOffsets() {
+      long[] offsets = {100, 105, 110};
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+      window.ackBatch(offsets);
+
+      assertEquals(0, window.inProgressCount());
+      // shrinkWindow removes ALL consecutive DONE entries from the left edge
+      // Since the window only contains 100, 105, 110 (no gaps in the TreeMap),
+      // all are DONE so it shrinks all the way through: committable = 110 + 1 = 111
+      assertEquals(OptionalLong.of(111), window.getCommittableOffset());
+      assertEquals(0, window.windowSize());
+    }
+
+    @Test
+    void ackBatchWithArray_contiguousFromStart_shrinksCompletely() {
+      long[] offsets = {100, 101, 102};
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+      window.ackBatch(offsets);
+
+      assertEquals(OptionalLong.of(103), window.getCommittableOffset());
+      assertEquals(0, window.windowSize());
+    }
+
+    @Test
+    void arrayBatch_duplicateOffset_rollsBackAllPreviousEntries() {
+      window.register(105);
+      long[] offsets = {100, 105, 110}; // 105 already exists
+
+      assertThrows(IllegalStateException.class, () -> window.registerBatch(offsets));
+      // Only the original 105 should remain
+      assertEquals(1, window.pendingCount());
+    }
+
+    @Test
+    void markBatchInProgressWithArray_unregisteredOffset_throws() {
+      long[] registered = {100, 102};
+      window.registerBatch(registered);
+
+      long[] toMark = {100, 101, 102}; // 101 not registered
+      assertThrows(IllegalStateException.class, () -> window.markBatchInProgress(toMark));
+    }
+
+    @Test
+    void ackBatchWithArray_notInProgress_throws() {
+      long[] offsets = {100, 105};
+      window.registerBatch(offsets);
+      // Not marked in-progress
+
+      assertThrows(IllegalStateException.class, () -> window.ackBatch(offsets));
+    }
+
+    @Test
+    void mixedArrayAndRangeOperations() {
+      // Register using array (non-consecutive)
+      long[] offsets1 = {100, 105};
+      window.registerBatch(offsets1);
+
+      // Register using range (consecutive)
+      window.registerBatch(110, 112);
+
+      assertEquals(5, window.windowSize()); // 100, 105, 110, 111, 112
+
+      // Mark array batch in progress
+      window.markBatchInProgress(offsets1);
+      assertEquals(2, window.inProgressCount());
+
+      // Mark range batch in progress
+      window.markBatchInProgress(110, 112);
+      assertEquals(5, window.inProgressCount());
+
+      // Ack array batch - all entries are DONE, shrinks through 100, 105
+      window.ackBatch(offsets1);
+      // After acking 100 and 105, shrinkWindow removes them
+      // But 110, 111, 112 are still IN_PROGRESS, so shrink stops at 106
+      assertEquals(OptionalLong.of(106), window.getCommittableOffset());
+      assertEquals(3, window.windowSize());
+
+      // Ack range batch
+      window.ackBatch(110, 112);
+      // Now 110, 111, 112 are DONE, shrinks through all
+      assertEquals(OptionalLong.of(113), window.getCommittableOffset());
+      assertEquals(0, window.windowSize());
+    }
+
+    @Test
+    void widelySpacedOffsets_fullLifecycle() {
+      // Simulate a Kafka batch with compacted/gapped offsets
+      long[] offsets = {1000, 2000, 3000, 4000, 5000};
+      window = new PartitionWindow(1000, 100); // Small window capacity
+
+      window.registerBatch(offsets);
+      assertEquals(5, window.windowSize());
+
+      window.markBatchInProgress(offsets);
+      assertEquals(5, window.inProgressCount());
+
+      window.ackBatch(offsets);
+      // All offsets are DONE. shrinkWindow iterates through TreeMap in order:
+      // 1000 DONE -> remove, committable=1001
+      // 2000 DONE -> remove, committable=2001
+      // ... all the way to 5000
+      // Final committable = 5000 + 1 = 5001
+      assertEquals(OptionalLong.of(5001), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
     }
   }

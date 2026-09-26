@@ -85,29 +85,31 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   public void dispatch(ConsumerRecords<K, V> records) {
     for (TopicPartition tp : records.partitions()) {
       List<ConsumerRecord<K, V>> batch = records.records(tp);
-      long firstOffset = batch.getFirst().offset();
-      long lastOffset = batch.getLast().offset();
 
-      offsetTracker.registerBatch(tp, firstOffset, lastOffset);
+      // Extract actual offsets from batch - don't assume consecutive offsets
+      long[] offsets = new long[batch.size()];
       long batchBytes = 0;
-      for (ConsumerRecord<K, V> record : batch) {
+      for (int i = 0; i < batch.size(); i++) {
+        ConsumerRecord<K, V> record = batch.get(i);
+        offsets[i] = record.offset();
         batchBytes += RecordSize.estimateBytes(record);
       }
+
+      offsetTracker.registerBatch(tp, offsets);
       counter.registered(batch.size(), batchBytes);
 
       long totalBytes = batchBytes;
-      executor.submit(() -> processBatch(tp, batch, firstOffset, lastOffset, totalBytes));
+      executor.submit(() -> processBatch(tp, batch, offsets, totalBytes));
     }
   }
 
   private void processBatch(
-      TopicPartition tp,
-      List<ConsumerRecord<K, V>> batch,
-      long firstOffset,
-      long lastOffset,
-      long totalBytes) {
+      TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets, long totalBytes) {
+    long firstOffset = offsets[0];
+    long lastOffset = offsets[offsets.length - 1];
+
     try {
-      offsetTracker.markBatchInProgress(tp, firstOffset, lastOffset);
+      offsetTracker.markBatchInProgress(tp, offsets);
     } catch (IllegalStateException e) {
       logger.log(
           System.Logger.Level.WARNING,
@@ -126,7 +128,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         retryExecutor.executeWithRetries(attempt -> handler.handleBatch(tp, batch), tp, desc);
 
     if (lastError == null) {
-      offsetTracker.ackBatch(tp, firstOffset, lastOffset);
+      offsetTracker.ackBatch(tp, offsets);
       counter.completed(batch.size(), totalBytes);
       metricsCollector.recordProcessed(batch.size());
       return;
@@ -136,10 +138,10 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         retryExecutor.handleFailure(batch, tp, lastError, desc);
 
     switch (resolution) {
-      case DLQ_SUCCESS, SKIP -> offsetTracker.ackBatch(tp, firstOffset, lastOffset);
+      case DLQ_SUCCESS, SKIP -> offsetTracker.ackBatch(tp, offsets);
       case FAIL_PARTITION -> {
-        offsetTracker.fail(tp, firstOffset);
-        metricsCollector.recordFailed();
+        offsetTracker.failBatch(tp, offsets);
+        metricsCollector.recordFailed(batch.size());
       }
     }
     counter.completed(batch.size(), totalBytes);

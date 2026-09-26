@@ -86,12 +86,12 @@ public class PipelineMetricsCollector {
     recordsProcessed.add(count);
   }
 
-  public void recordFailed() {
-    recordsFailed.increment();
+  public void recordFailed(int count) {
+    recordsFailed.add(count);
   }
 
-  public void recordSkipped() {
-    recordsSkipped.increment();
+  public void recordSkipped(int count) {
+    recordsSkipped.add(count);
   }
 
   public void recordPoll() {
@@ -110,12 +110,12 @@ public class PipelineMetricsCollector {
     retryAttempts.increment();
   }
 
-  public void recordDlqSuccess() {
-    dlqSuccesses.increment();
+  public void recordDlqSuccess(int count) {
+    dlqSuccesses.add(count);
   }
 
-  public void recordDlqFailure() {
-    dlqFailures.increment();
+  public void recordDlqFailure(int count) {
+    dlqFailures.add(count);
   }
 
   public void recordPartitionFailure() {

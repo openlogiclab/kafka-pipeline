@@ -145,7 +145,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     if (shouldSkipViaHook) {
       offsetTracker.ack(tp, offset);
       counter.completed(1, recordBytes);
-      metricsCollector.recordSkipped();
+      metricsCollector.recordSkipped(1);
       return;
     }
 
@@ -179,7 +179,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       case DLQ_SUCCESS, SKIP -> offsetTracker.ack(tp, offset);
       case FAIL_PARTITION -> {
         offsetTracker.fail(tp, offset);
-        metricsCollector.recordFailed();
+        metricsCollector.recordFailed(1);
       }
     }
     counter.completed(1, recordBytes);

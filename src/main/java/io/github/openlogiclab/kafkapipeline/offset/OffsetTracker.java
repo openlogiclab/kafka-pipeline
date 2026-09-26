@@ -27,17 +27,12 @@ import org.apache.kafka.common.TopicPartition;
  * that {@link #getCommittableOffset} never returns an offset beyond contiguous completed records,
  * preventing silent data loss on crash/rebalance.
  *
- * <p>Two implementations exist:
- *
- * <ul>
- *   <li>{@link SequentialOffsetTracker} — one record in-progress per partition (ordered)
- *   <li>{@link UnorderedOffsetTracker} — concurrent processing per partition (sliding window)
- * </ul>
+ * <p>Uses a sliding window approach that supports concurrent out-of-order processing per partition.
  *
  * <p>All methods are thread-safe. Offset values follow Kafka commit semantics: committing N means
  * "next poll starts from offset N".
  */
-public sealed interface OffsetTracker permits SequentialOffsetTracker, UnorderedOffsetTracker {
+public sealed interface OffsetTracker permits UnorderedOffsetTracker {
 
   // ── Poller calls ──────────────────────────────────────────────
 
@@ -57,6 +52,14 @@ public sealed interface OffsetTracker permits SequentialOffsetTracker, Unordered
    */
   void registerBatch(TopicPartition tp, long fromOffset, long toOffset);
 
+  /**
+   * Registers a batch offsets.
+   *
+   * @throws IllegalArgumentException if offsets is empty or null
+   * @throws IllegalStateException if any offset in the range overlaps with existing entries
+   */
+  void registerBatch(TopicPartition tp, long[] offsets);
+
   // ── Worker calls ──────────────────────────────────────────────
 
   /**
@@ -75,6 +78,14 @@ public sealed interface OffsetTracker permits SequentialOffsetTracker, Unordered
   void markBatchInProgress(TopicPartition tp, long fromOffset, long toOffset);
 
   /**
+   * Marks a batch of specific offsets as IN_PROGRESS under a single lock acquisition. Used by batch
+   * processing mode when offsets are non-contiguous.
+   *
+   * @throws IllegalStateException if any offset is not in REGISTERED state
+   */
+  void markBatchInProgress(TopicPartition tp, long[] offsets);
+
+  /**
    * Marks an offset as DONE (processing succeeded, DLQ succeeded, or skipped). This advances the
    * committable offset if the acked record is contiguous with previously completed records.
    *
@@ -91,6 +102,14 @@ public sealed interface OffsetTracker permits SequentialOffsetTracker, Unordered
   void ackBatch(TopicPartition tp, long fromOffset, long toOffset);
 
   /**
+   * Marks a batch of specific offsets as DONE under a single lock acquisition. Used by batch
+   * processing mode when offsets are non-contiguous.
+   *
+   * @throws IllegalStateException if any offset is not in IN_PROGRESS state
+   */
+  void ackBatch(TopicPartition tp, long[] offsets);
+
+  /**
    * Marks an offset as FAILED and puts the partition into failed state. No further records will be
    * accepted for this partition until it is cleared or the failure is resolved via {@link
    * #resolveFailure}.
@@ -100,12 +119,28 @@ public sealed interface OffsetTracker permits SequentialOffsetTracker, Unordered
   void fail(TopicPartition tp, long offset);
 
   /**
+   * Marks a batch of offsets as FAILED and puts the partition into failed state. Used by batch
+   * processing mode when all offsets in a batch fail together.
+   *
+   * @throws IllegalStateException if any offset is not in IN_PROGRESS state
+   */
+  void failBatch(TopicPartition tp, long[] offsets);
+
+  /**
    * Resolves a previously failed offset by treating it as DONE (e.g., after sending to DLQ or
    * deciding to skip). Clears the partition's failed state so processing can resume.
    *
    * @throws IllegalStateException if the offset is not in FAILED state
    */
   void resolveFailure(TopicPartition tp, long offset);
+
+  /**
+   * Resolves a batch of previously failed offsets by treating them as DONE. Clears the partition's
+   * failed state so processing can resume.
+   *
+   * @throws IllegalStateException if any offset is not in FAILED state
+   */
+  void resolveBatchFailure(TopicPartition tp, long[] offsets);
 
   // ── Committer calls ───────────────────────────────────────────
 
