@@ -145,7 +145,6 @@ class RetryExecutorTest {
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
               .dlqHandler((record, error) -> dlqCalls.incrementAndGet())
-              .fallback(Fallback.SKIP)
               .build();
       executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
 
@@ -156,8 +155,9 @@ class RetryExecutorTest {
     }
 
     @Test
-    void partialDlqFailure_firstRecordSent_thenFailure() {
+    void partialDlqFailure_firstRecordSent_thenSkip() {
       AtomicInteger dlqCalls = new AtomicInteger();
+      AtomicInteger finalFailureCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
               .dlqHandler(
@@ -167,70 +167,102 @@ class RetryExecutorTest {
                       throw new RuntimeException("DLQ failed");
                     }
                   })
-              .fallback(Fallback.SKIP)
+              .onFinalFailure((record, error) -> finalFailureCalls.incrementAndGet())
               .build();
       executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.SKIP, result);
+      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
       assertEquals(2, dlqCalls.get());
+      assertEquals(2, finalFailureCalls.get());
     }
 
     @Test
-    void dlqFailure_allRecordsFail_fallbackToSkip() {
+    void dlqFailure_allRecordsFail_skipped() {
+      AtomicInteger finalFailureCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
               .dlqHandler(
                   (record, error) -> {
                     throw new RuntimeException("DLQ failed");
                   })
-              .fallback(Fallback.SKIP)
+              .onFinalFailure((record, error) -> finalFailureCalls.incrementAndGet())
               .build();
       executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.SKIP, result);
+      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+      assertEquals(3, finalFailureCalls.get());
     }
 
     @Test
-    void dlqFailure_fallbackToFailPartition() {
+    void noDlq_callsFinalFailureHandler() {
+      AtomicInteger finalFailureCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
-              .dlqHandler(
-                  (record, error) -> {
-                    throw new RuntimeException("DLQ failed");
-                  })
-              .fallback(Fallback.FAIL_PARTITION)
+              .onFinalFailure((record, error) -> finalFailureCalls.incrementAndGet())
               .build();
       executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.FAIL_PARTITION, result);
+      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+      assertEquals(3, finalFailureCalls.get());
     }
 
     @Test
-    void noDlq_fallbackToSkip() {
+    void finalFailureHandlerException_logsButDoesNotThrow() {
       ErrorStrategy<String, String> strategy =
-          ErrorStrategy.<String, String>builder().fallback(Fallback.SKIP).build();
+          ErrorStrategy.<String, String>builder()
+              .onFinalFailure(
+                  (record, error) -> {
+                    throw new RuntimeException("Handler failed");
+                  })
+              .build();
+      executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
+
+      var result =
+          assertDoesNotThrow(
+              () -> executor.handleFailure(records, TP0, new RuntimeException("test"), "batch"));
+
+      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+    }
+
+    @Test
+    void fallbackSkip_skipsDlqEvenWhenConfigured() {
+      AtomicInteger dlqCalls = new AtomicInteger();
+      AtomicInteger finalFailureCalls = new AtomicInteger();
+      ErrorStrategy<String, String> strategy =
+          ErrorStrategy.<String, String>builder()
+              .dlqHandler((record, error) -> dlqCalls.incrementAndGet())
+              .fallback(Fallback.SKIP) // explicit SKIP should bypass DLQ
+              .onFinalFailure((record, error) -> finalFailureCalls.incrementAndGet())
+              .build();
       executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.SKIP, result);
+      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+      assertEquals(0, dlqCalls.get()); // DLQ should NOT be called
+      assertEquals(3, finalFailureCalls.get()); // FinalFailureHandler called for all records
     }
 
     @Test
-    void noDlq_fallbackToFailPartition() {
+    void fallbackDlqThenSkip_usesDlqWhenConfigured() {
+      AtomicInteger dlqCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
-          ErrorStrategy.<String, String>builder().fallback(Fallback.FAIL_PARTITION).build();
+          ErrorStrategy.<String, String>builder()
+              .dlqHandler((record, error) -> dlqCalls.incrementAndGet())
+              .fallback(Fallback.DLQ_THEN_SKIP)
+              .build();
       executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.FAIL_PARTITION, result);
+      assertEquals(RetryExecutor.FailureResolution.DLQ_SUCCESS, result);
+      assertEquals(3, dlqCalls.get()); // DLQ called for all records
     }
   }
 }

@@ -59,7 +59,7 @@ public class PipelineMetricsCollector {
   private final LongAdder retryAttempts = new LongAdder();
   private final LongAdder dlqSuccesses = new LongAdder();
   private final LongAdder dlqFailures = new LongAdder();
-  private final LongAdder partitionFailures = new LongAdder();
+  private final LongAdder finalFailures = new LongAdder();
   private final LongAdder commitSuccesses = new LongAdder();
   private final LongAdder commitFailures = new LongAdder();
 
@@ -118,8 +118,8 @@ public class PipelineMetricsCollector {
     dlqFailures.add(count);
   }
 
-  public void recordPartitionFailure() {
-    partitionFailures.increment();
+  public void recordFinalFailure() {
+    finalFailures.increment();
   }
 
   public void recordCommitSuccess() {
@@ -154,8 +154,13 @@ public class PipelineMetricsCollector {
 
   public PipelineMetrics snapshot() {
     Map<TopicPartition, Long> lags = new HashMap<>();
+    Map<TopicPartition, Integer> failures = new HashMap<>();
     for (TopicPartition tp : Set.copyOf(assignedPartitions)) {
       lags.put(tp, offsetTracker.lag(tp));
+      int failureCount = offsetTracker.failureCount(tp);
+      if (failureCount > 0) {
+        failures.put(tp, failureCount);
+      }
     }
 
     return new PipelineMetrics(
@@ -169,10 +174,11 @@ public class PipelineMetricsCollector {
         backpressureController.evaluate(),
         throttleCount.sum(),
         Map.copyOf(lags),
+        Map.copyOf(failures),
         retryAttempts.sum(),
         dlqSuccesses.sum(),
         dlqFailures.sum(),
-        partitionFailures.sum(),
+        finalFailures.sum(),
         commitSuccesses.sum(),
         commitFailures.sum(),
         rebalanceCount.sum(),

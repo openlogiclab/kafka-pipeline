@@ -70,8 +70,8 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  *       io.github.openlogiclab.kafkapipeline.ThreadMode#VIRTUAL VIRTUAL} threads
  *   <li><b>Backpressure</b> — record-count hysteresis (high/low watermark) pauses the consumer when
  *       workers fall behind
- *   <li><b>Error handling</b> — retry with exponential backoff, optional DLQ hook, then skip or
- *       fail-partition as a final fallback
+ *   <li><b>Error handling</b> — retry with exponential backoff, optional DLQ, then {@link
+ *       io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler} and skip
  *   <li><b>Offset management</b> — unordered sliding-window tracker with monotonic commit
  *       guarantees and periodic async commits
  *   <li><b>Lifecycle hooks</b> — {@link
@@ -95,7 +95,6 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  *             .retryBackoff(Duration.ofSeconds(1))
  *             .exponentialBackoff(true)
  *             .dlqHandler((record, error) -> dlqProducer.send(record))
- *             .fallback(Fallback.SKIP)
  *             .build())
  *         .build());
  *

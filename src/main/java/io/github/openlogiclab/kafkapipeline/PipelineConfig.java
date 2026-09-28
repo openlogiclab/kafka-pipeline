@@ -101,7 +101,7 @@ public record PipelineConfig<K, V>(
     private ByteBackpressureConfig byteBackpressure = ByteBackpressureConfig.disabled();
     private HeapBackpressureConfig heapBackpressure = HeapBackpressureConfig.disabled();
     private List<BackpressureSensor> customSensors = new ArrayList<>();
-    private ErrorStrategy<K, V> errorStrategy = ErrorStrategy.failFast();
+    private ErrorStrategy<K, V> errorStrategy = ErrorStrategy.skipOnError();
     private ProcessingLifecycleHook<K, V> lifecycleHook = ProcessingLifecycleHook.noOp();
     private Duration commitInterval = Duration.ofSeconds(5);
     private Duration drainTimeout = Duration.ofSeconds(30);
@@ -219,11 +219,11 @@ public record PipelineConfig<K, V>(
 
     /**
      * Error handling chain applied when {@code handler.handle()} or {@code batchHandler} throws.
-     * The chain is: retry → DLQ → fallback. Defaults to {@link ErrorStrategy#failFast()} (no
-     * retries, halt partition on error).
+     * The chain is: retry → DLQ → skip. Defaults to {@link ErrorStrategy#skipOnError()} (no
+     * retries, skip failed records with logging).
      *
      * @see ErrorStrategy#builder()
-     * @see ErrorStrategy#skipOnError()
+     * @see ErrorStrategy#withDlq(io.github.openlogiclab.kafkapipeline.error.DLQHandler, int)
      */
     public Builder<K, V> errorStrategy(ErrorStrategy<K, V> errorStrategy) {
       this.errorStrategy = errorStrategy;

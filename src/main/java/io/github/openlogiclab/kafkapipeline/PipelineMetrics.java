@@ -66,7 +66,7 @@ import org.apache.kafka.common.TopicPartition;
  *   <tr>
  *     <td>Data loss suspected</td>
  *     <td>{@code recordsSkipped}, {@code dlqSuccesses}</td>
- *     <td>Fallback=SKIP is dropping records; check DLQ topic</td>
+ *     <td>Failed records being skipped; check DLQ topic and final failure logs</td>
  *   </tr>
  *   <tr>
  *     <td>Memory pressure / OOM</td>
@@ -115,15 +115,21 @@ public record PipelineMetrics(
      */
     long recordsProcessed,
 
-    /** Total records that triggered a partition failure since pipeline start. (Counter) */
+    /**
+     * Total records that experienced unrecoverable failures and were skipped since pipeline start.
+     * (Counter)
+     *
+     * <p>These are records where all retries were exhausted and DLQ (if configured) also failed.
+     * The {@link io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler} was invoked for
+     * each of these records before skipping.
+     */
     long recordsFailed,
 
     /**
      * Total records skipped since pipeline start. (Counter)
      *
      * <p>Includes records skipped by the lifecycle hook ({@code beforeProcess} returning {@code
-     * false}) and records skipped by the {@link io.github.openlogiclab.kafkapipeline.error.Fallback
-     * SKIP} fallback.
+     * false}) and records skipped after DLQ failure.
      */
     long recordsSkipped,
 
@@ -179,6 +185,14 @@ public record PipelineMetrics(
      */
     Map<TopicPartition, Long> partitionLags,
 
+    /**
+     * Per-partition count of unrecoverable failures since pipeline start. (Gauge)
+     *
+     * <p>Partitions with zero failures are omitted. Use this to identify which partitions are
+     * experiencing bad data or downstream issues. The returned map is an unmodifiable snapshot.
+     */
+    Map<TopicPartition, Integer> partitionFailures,
+
     // ── Errors ──────────────────────────────────────────────────
 
     /**
@@ -196,11 +210,12 @@ public record PipelineMetrics(
     long dlqFailures,
 
     /**
-     * Total times a partition entered failed state due to {@link
-     * io.github.openlogiclab.kafkapipeline.error.Fallback#FAIL_PARTITION FAIL_PARTITION} since
-     * pipeline start. (Counter)
+     * Total times a final failure handler was invoked (DLQ failed or not configured) since pipeline
+     * start. (Counter)
+     *
+     * <p>High values indicate poison data or DLQ issues. Check final failure handler logs.
      */
-    long partitionFailures,
+    long finalFailures,
 
     /** Total successful offset commits (async + sync) since pipeline start. (Counter) */
     long commitSuccesses,

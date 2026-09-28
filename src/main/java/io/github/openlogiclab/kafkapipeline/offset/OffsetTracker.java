@@ -23,9 +23,9 @@ import org.apache.kafka.common.TopicPartition;
 /**
  * Central source of truth for record lifecycle and offset commit safety.
  *
- * <p>Every record flows through: REGISTERED → IN_PROGRESS → DONE (or FAILED). The tracker ensures
- * that {@link #getCommittableOffset} never returns an offset beyond contiguous completed records,
- * preventing silent data loss on crash/rebalance.
+ * <p>Every record flows through: REGISTERED → IN_PROGRESS → DONE. The tracker ensures that {@link
+ * #getCommittableOffset} never returns an offset beyond contiguous completed records, preventing
+ * silent data loss on crash/rebalance.
  *
  * <p>Uses a sliding window approach that supports concurrent out-of-order processing per partition.
  *
@@ -62,14 +62,14 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
   void markInProgress(TopicPartition tp, long offset);
 
   /**
-   * Marks a batch of offsets as IN_PROGRESS. Used by batch processing mode.
+   * Marks a batch of offsets as IN_PROGRESS. Lenient: skips offsets not in REGISTERED state.
    *
-   * @throws IllegalStateException if any offset is not in REGISTERED state
+   * @return number of offsets actually transitioned
    */
-  void markBatchInProgress(TopicPartition tp, long[] offsets);
+  int markBatchInProgress(TopicPartition tp, long[] offsets);
 
   /**
-   * Marks an offset as DONE (processing succeeded, DLQ succeeded, or skipped). This advances the
+   * Marks an offset as DONE (processing succeeded, sent to DLQ, or skipped). This advances the
    * committable offset if the acked record is contiguous with previously completed records.
    *
    * @throws IllegalStateException if the offset is not in IN_PROGRESS state
@@ -77,44 +77,11 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
   void ack(TopicPartition tp, long offset);
 
   /**
-   * Marks a batch of offsets as DONE. Used by batch processing mode.
+   * Marks a batch of offsets as DONE. Lenient: skips offsets not in IN_PROGRESS state.
    *
-   * @throws IllegalStateException if any offset is not in IN_PROGRESS state
+   * @return number of offsets actually acked
    */
-  void ackBatch(TopicPartition tp, long[] offsets);
-
-  /**
-   * Marks an offset as FAILED and puts the partition into failed state. No further records will be
-   * accepted for this partition until it is cleared or the failure is resolved via {@link
-   * #resolveFailure}.
-   *
-   * @throws IllegalStateException if the offset is not in IN_PROGRESS state
-   */
-  void fail(TopicPartition tp, long offset);
-
-  /**
-   * Marks a batch of offsets as FAILED and puts the partition into failed state. Used by batch
-   * processing mode when all offsets in a batch fail together.
-   *
-   * @throws IllegalStateException if any offset is not in IN_PROGRESS state
-   */
-  void failBatch(TopicPartition tp, long[] offsets);
-
-  /**
-   * Resolves a previously failed offset by treating it as DONE (e.g., after sending to DLQ or
-   * deciding to skip). Clears the partition's failed state so processing can resume.
-   *
-   * @throws IllegalStateException if the offset is not in FAILED state
-   */
-  void resolveFailure(TopicPartition tp, long offset);
-
-  /**
-   * Resolves a batch of previously failed offsets by treating them as DONE. Clears the partition's
-   * failed state so processing can resume.
-   *
-   * @throws IllegalStateException if any offset is not in FAILED state
-   */
-  void resolveBatchFailure(TopicPartition tp, long[] offsets);
+  int ackBatch(TopicPartition tp, long[] offsets);
 
   // ── Committer calls ───────────────────────────────────────────
 
@@ -169,4 +136,13 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
    * monitoring how far behind processing is from polling.
    */
   long lag(TopicPartition tp);
+
+  /** Returns true if any unrecoverable failure has occurred on this partition. */
+  boolean isFailed(TopicPartition tp);
+
+  /** Records that an unrecoverable failure occurred on this partition. */
+  void markFailed(TopicPartition tp);
+
+  /** Number of unrecoverable failures that have occurred on this partition. */
+  int failureCount(TopicPartition tp);
 }

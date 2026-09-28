@@ -19,7 +19,6 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
-import io.github.openlogiclab.kafkapipeline.error.Fallback;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import java.time.Duration;
 import java.util.List;
@@ -210,10 +209,10 @@ class PipelineConfigTest {
     }
 
     @Test
-    void defaultErrorStrategy_isFailFast() {
+    void defaultErrorStrategy_isSkipOnError() {
       PipelineConfig<String, String> config = minimalBuilder().build();
       assertEquals(0, config.errorStrategy().maxRetries());
-      assertEquals(Fallback.FAIL_PARTITION, config.errorStrategy().fallback());
+      assertNotNull(config.errorStrategy().finalFailureHandler());
     }
 
     @Test
@@ -286,11 +285,11 @@ class PipelineConfigTest {
     @Test
     void customErrorStrategy() {
       ErrorStrategy<String, String> es =
-          ErrorStrategy.<String, String>builder().maxRetries(5).fallback(Fallback.SKIP).build();
+          ErrorStrategy.<String, String>builder().maxRetries(5).build();
 
       PipelineConfig<String, String> config = minimalBuilder().errorStrategy(es).build();
       assertEquals(5, config.errorStrategy().maxRetries());
-      assertEquals(Fallback.SKIP, config.errorStrategy().fallback());
+      assertNotNull(config.errorStrategy().finalFailureHandler());
     }
 
     @Test

@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.apache.kafka.common.TopicPartition;
 
 /**
- * Offset tracker for unordered processing (Mode B).
+ * Offset tracker for unordered processing.
  *
  * <p>Records within a partition can be processed concurrently and acked in any order. Uses a
  * per-partition {@link PartitionWindow} (sliding window) to track individual offset states. The
@@ -58,8 +58,8 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
-  public void markBatchInProgress(TopicPartition tp, long[] offsets) {
-    getOrThrow(tp).markBatchInProgress(offsets);
+  public int markBatchInProgress(TopicPartition tp, long[] offsets) {
+    return getOrThrow(tp).markBatchInProgress(offsets);
   }
 
   @Override
@@ -68,28 +68,8 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
-  public void ackBatch(TopicPartition tp, long[] offsets) {
-    getOrThrow(tp).ackBatch(offsets);
-  }
-
-  @Override
-  public void fail(TopicPartition tp, long offset) {
-    getOrThrow(tp).fail(offset);
-  }
-
-  @Override
-  public void failBatch(TopicPartition tp, long[] offsets) {
-    getOrThrow(tp).failBatch(offsets);
-  }
-
-  @Override
-  public void resolveFailure(TopicPartition tp, long offset) {
-    getOrThrow(tp).resolveFailure(offset);
-  }
-
-  @Override
-  public void resolveBatchFailure(TopicPartition tp, long[] offsets) {
-    getOrThrow(tp).resolveBatchFailure(offsets);
+  public int ackBatch(TopicPartition tp, long[] offsets) {
+    return getOrThrow(tp).ackBatch(offsets);
   }
 
   @Override
@@ -168,6 +148,23 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   public long lag(TopicPartition tp) {
     PartitionWindow window = partitions.get(tp);
     return window != null ? window.lag() : 0;
+  }
+
+  @Override
+  public boolean isFailed(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null && window.isFailed();
+  }
+
+  @Override
+  public void markFailed(TopicPartition tp) {
+    getOrThrow(tp).markFailed();
+  }
+
+  @Override
+  public int failureCount(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.failureCount() : 0;
   }
 
   private PartitionWindow getOrThrow(TopicPartition tp) {

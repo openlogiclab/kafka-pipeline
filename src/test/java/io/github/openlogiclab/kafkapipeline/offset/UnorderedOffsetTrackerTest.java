@@ -420,194 +420,6 @@ class UnorderedOffsetTrackerTest {
     }
   }
 
-  // ── Failed State ─────────────────────────────────────────────
-
-  @Nested
-  class FailedState {
-
-    @BeforeEach
-    void init() {
-      tracker.initPartition(TP0, 100);
-    }
-
-    @Test
-    void fail_blocksSubsequentRegister() {
-      tracker.register(TP0, 100);
-      tracker.markInProgress(TP0, 100);
-      tracker.fail(TP0, 100);
-
-      assertThrows(IllegalStateException.class, () -> tracker.register(TP0, 101));
-    }
-
-    @Test
-    void fail_blocksSubsequentMarkInProgress() {
-      tracker.registerBatch(TP0, range(100, 101));
-      tracker.markInProgress(TP0, 100);
-      tracker.fail(TP0, 100);
-
-      assertThrows(IllegalStateException.class, () -> tracker.markInProgress(TP0, 101));
-    }
-
-    @Test
-    void fail_doesNotAdvanceCommittableOffset() {
-      tracker.registerBatch(TP0, range(100, 102));
-      tracker.markInProgress(TP0, 100);
-      tracker.ack(TP0, 100);
-
-      tracker.markInProgress(TP0, 101);
-      tracker.fail(TP0, 101);
-
-      assertEquals(
-          OptionalLong.of(101),
-          tracker.getCommittableOffset(TP0),
-          "FAILED entry at 101 blocks window advance");
-    }
-
-    @Test
-    void fail_withCompletedRecordsBehind_preservesCommittable() {
-      tracker.registerBatch(TP0, range(100, 103));
-      tracker.markInProgress(TP0, 100);
-      tracker.markInProgress(TP0, 101);
-      tracker.markInProgress(TP0, 102);
-
-      tracker.ack(TP0, 100);
-      tracker.ack(TP0, 101);
-      tracker.fail(TP0, 102);
-
-      assertEquals(
-          OptionalLong.of(102),
-          tracker.getCommittableOffset(TP0),
-          "100 and 101 are done, 102 is failed, so committable = 102");
-    }
-
-    @Test
-    void fail_onRegisteredOffset_throws() {
-      tracker.register(TP0, 100);
-      assertThrows(IllegalStateException.class, () -> tracker.fail(TP0, 100));
-    }
-  }
-
-  // ── Resolve Failure ──────────────────────────────────────────
-
-  @Nested
-  class ResolveFailure {
-
-    @BeforeEach
-    void init() {
-      tracker.initPartition(TP0, 100);
-    }
-
-    @Test
-    void resolveFailure_allowsWindowToAdvance() {
-      tracker.registerBatch(TP0, range(100, 102));
-      tracker.markInProgress(TP0, 100);
-      tracker.markInProgress(TP0, 101);
-      tracker.markInProgress(TP0, 102);
-
-      tracker.ack(TP0, 100);
-      tracker.fail(TP0, 101);
-
-      assertEquals(OptionalLong.of(101), tracker.getCommittableOffset(TP0));
-
-      tracker.resolveFailure(TP0, 101);
-
-      tracker.ack(TP0, 102);
-      assertEquals(OptionalLong.of(103), tracker.getCommittableOffset(TP0));
-    }
-
-    @Test
-    void resolveFailure_whenNotFailed_throws() {
-      tracker.register(TP0, 100);
-      tracker.markInProgress(TP0, 100);
-      assertThrows(IllegalStateException.class, () -> tracker.resolveFailure(TP0, 100));
-    }
-
-    @Test
-    void resolveFailure_resumesRegistration() {
-      tracker.register(TP0, 100);
-      tracker.markInProgress(TP0, 100);
-      tracker.fail(TP0, 100);
-
-      assertThrows(IllegalStateException.class, () -> tracker.register(TP0, 101));
-
-      tracker.resolveFailure(TP0, 100);
-
-      assertDoesNotThrow(() -> tracker.register(TP0, 101));
-    }
-
-    @Test
-    void resolveFailure_atLeftEdge_shrinksWindow() {
-      tracker.registerBatch(TP0, range(100, 102));
-      tracker.markInProgress(TP0, 100);
-      tracker.fail(TP0, 100);
-
-      tracker.resolveFailure(TP0, 100);
-      assertEquals(OptionalLong.of(101), tracker.getCommittableOffset(TP0));
-    }
-  }
-
-  // ── Batch Failure ────────────────────────────────────────────
-
-  @Nested
-  class BatchFailure {
-
-    @BeforeEach
-    void init() {
-      tracker.initPartition(TP0, 100);
-    }
-
-    @Test
-    void failBatch_marksAllOffsetsAsFailed() {
-      long[] offsets = {100, 105, 110};
-      tracker.registerBatch(TP0, offsets);
-      tracker.markBatchInProgress(TP0, offsets);
-
-      tracker.failBatch(TP0, offsets);
-
-      assertThrows(IllegalStateException.class, () -> tracker.register(TP0, 200));
-    }
-
-    @Test
-    void failBatch_uninitializedPartition_throws() {
-      long[] offsets = {100, 105};
-      assertThrows(IllegalStateException.class, () -> tracker.failBatch(TP_UNKNOWN, offsets));
-    }
-
-    @Test
-    void resolveBatchFailure_clearsFailedState() {
-      long[] offsets = {100, 105, 110};
-      tracker.registerBatch(TP0, offsets);
-      tracker.markBatchInProgress(TP0, offsets);
-      tracker.failBatch(TP0, offsets);
-
-      tracker.resolveBatchFailure(TP0, offsets);
-
-      assertDoesNotThrow(() -> tracker.register(TP0, 200));
-      assertEquals(OptionalLong.of(111), tracker.getCommittableOffset(TP0));
-    }
-
-    @Test
-    void resolveBatchFailure_uninitializedPartition_throws() {
-      long[] offsets = {100, 105};
-      assertThrows(
-          IllegalStateException.class, () -> tracker.resolveBatchFailure(TP_UNKNOWN, offsets));
-    }
-
-    @Test
-    void failBatch_thenResolveBatch_fullLifecycle() {
-      long[] offsets = {100, 200, 300};
-      tracker.registerBatch(TP0, offsets);
-      tracker.markBatchInProgress(TP0, offsets);
-
-      tracker.failBatch(TP0, offsets);
-      assertThrows(IllegalStateException.class, () -> tracker.register(TP0, 400));
-
-      tracker.resolveBatchFailure(TP0, offsets);
-      assertDoesNotThrow(() -> tracker.register(TP0, 400));
-      assertEquals(OptionalLong.of(301), tracker.getCommittableOffset(TP0));
-    }
-  }
-
   // ── Window Max Size ──────────────────────────────────────────
 
   @Nested
@@ -742,21 +554,6 @@ class UnorderedOffsetTrackerTest {
       assertEquals(201L, offsets.get(TP1));
       assertNull(offsets.get(TP2));
     }
-
-    @Test
-    void failOnePartition_doesNotAffectOthers() {
-      tracker.register(TP0, 100);
-      tracker.markInProgress(TP0, 100);
-      tracker.fail(TP0, 100);
-
-      assertDoesNotThrow(
-          () -> {
-            tracker.register(TP1, 200);
-            tracker.markInProgress(TP1, 200);
-            tracker.ack(TP1, 200);
-          });
-      assertEquals(OptionalLong.of(201), tracker.getCommittableOffset(TP1));
-    }
   }
 
   // ── Drain ────────────────────────────────────────────────────
@@ -808,20 +605,6 @@ class UnorderedOffsetTrackerTest {
       assertFalse(result.allCompleted());
       assertEquals(1, result.completedCount());
       assertEquals(4, result.abandonedCount());
-    }
-
-    @Test
-    void drain_withFailedPartition_returnsImmediately() {
-      tracker.register(TP0, 100);
-      tracker.markInProgress(TP0, 100);
-      tracker.fail(TP0, 100);
-
-      long start = System.nanoTime();
-      PartitionDrainResult result = tracker.drainPartition(TP0, Duration.ofSeconds(5));
-      long elapsed = System.nanoTime() - start;
-
-      assertFalse(result.allCompleted());
-      assertTrue(elapsed < Duration.ofSeconds(1).toNanos());
     }
 
     @Test
@@ -999,6 +782,61 @@ class UnorderedOffsetTrackerTest {
       tracker.initPartition(TP1, 201);
       assertEquals(OptionalLong.empty(), tracker.getCommittableOffset(TP0));
       assertEquals(OptionalLong.empty(), tracker.getCommittableOffset(TP1));
+    }
+  }
+
+  @Nested
+  class FailedStateTracking {
+
+    @Test
+    void isFailed_uninitializedPartition_returnsFalse() {
+      assertFalse(tracker.isFailed(TP0));
+    }
+
+    @Test
+    void isFailed_initializedPartition_initiallyFalse() {
+      tracker.initPartition(TP0, 0);
+      assertFalse(tracker.isFailed(TP0));
+    }
+
+    @Test
+    void markFailed_setsFlag() {
+      tracker.initPartition(TP0, 0);
+      tracker.markFailed(TP0);
+      assertTrue(tracker.isFailed(TP0));
+    }
+
+    @Test
+    void markFailed_uninitializedPartition_throws() {
+      assertThrows(IllegalStateException.class, () -> tracker.markFailed(TP0));
+    }
+
+    @Test
+    void failureCount_uninitializedPartition_returnsZero() {
+      assertEquals(0, tracker.failureCount(TP0));
+    }
+
+    @Test
+    void failureCount_incrementsWithEachMarkFailed() {
+      tracker.initPartition(TP0, 0);
+      assertEquals(0, tracker.failureCount(TP0));
+      tracker.markFailed(TP0);
+      assertEquals(1, tracker.failureCount(TP0));
+      tracker.markFailed(TP0);
+      assertEquals(2, tracker.failureCount(TP0));
+    }
+
+    @Test
+    void failedState_perPartition() {
+      tracker.initPartition(TP0, 0);
+      tracker.initPartition(TP1, 0);
+
+      tracker.markFailed(TP0);
+
+      assertTrue(tracker.isFailed(TP0));
+      assertFalse(tracker.isFailed(TP1));
+      assertEquals(1, tracker.failureCount(TP0));
+      assertEquals(0, tracker.failureCount(TP1));
     }
   }
 }
