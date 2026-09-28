@@ -38,7 +38,7 @@ import org.apache.kafka.common.TopicPartition;
  *   markInProgress → hook.beforeProcess
  *       → handler.handle (with retry)
  *       → success: hook.afterProcess → ack
- *       → failure: DLQ → skip / fail partition
+ *       → failure: DLQ → FinalFailureHandler → skip
  * </pre>
  */
 public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
@@ -172,16 +172,14 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       return;
     }
 
+    // Best-effort: DLQ or skip, always ack and continue
     RetryExecutor.FailureResolution resolution =
         retryExecutor.handleFailure(List.of(record), tp, lastError, desc);
-
-    switch (resolution) {
-      case DLQ_SUCCESS, SKIP -> offsetTracker.ack(tp, offset);
-      case FAIL_PARTITION -> {
-        offsetTracker.fail(tp, offset);
-        metricsCollector.recordFailed(1);
-      }
+    if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
+      offsetTracker.markFailed(tp);
+      metricsCollector.recordFailed(1);
     }
+    offsetTracker.ack(tp, offset);
     counter.completed(1, recordBytes);
   }
 }

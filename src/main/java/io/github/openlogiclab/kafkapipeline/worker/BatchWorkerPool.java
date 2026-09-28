@@ -134,16 +134,14 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       return;
     }
 
+    // Best-effort: DLQ or skip, always ack and continue
     RetryExecutor.FailureResolution resolution =
         retryExecutor.handleFailure(batch, tp, lastError, desc);
-
-    switch (resolution) {
-      case DLQ_SUCCESS, SKIP -> offsetTracker.ackBatch(tp, offsets);
-      case FAIL_PARTITION -> {
-        offsetTracker.failBatch(tp, offsets);
-        metricsCollector.recordFailed(batch.size());
-      }
+    if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
+      offsetTracker.markFailed(tp);
+      metricsCollector.recordFailed(batch.size());
     }
+    offsetTracker.ackBatch(tp, offsets);
     counter.completed(batch.size(), totalBytes);
   }
 }

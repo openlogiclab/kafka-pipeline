@@ -24,7 +24,10 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
 
 /**
- * Unified retry → DLQ → fallback engine shared by both per-record and batch processing paths.
+ * Unified retry → DLQ → skip engine shared by both per-record and batch processing paths.
+ *
+ * <p>Best-effort strategy: retries first, then DLQ, then final failure handler + skip. The system
+ * never halts — failed records are always skipped after exhausting all recovery options.
  *
  * <p>Stateless — all state lives in the caller or in {@link ErrorStrategy}. Thread-safe as long as
  * the {@link ErrorStrategy} and its {@link DLQHandler} are thread-safe.
@@ -48,8 +51,7 @@ public final class RetryExecutor<K, V> {
 
   public enum FailureResolution {
     DLQ_SUCCESS,
-    SKIP,
-    FAIL_PARTITION
+    SKIPPED
   }
 
   public Exception executeWithRetries(RetryableTask task, TopicPartition tp, String description) {
@@ -83,12 +85,23 @@ public final class RetryExecutor<K, V> {
     return lastError;
   }
 
+  /**
+   * Handles a failure after retries are exhausted. Based on the fallback strategy:
+   *
+   * <ul>
+   *   <li>{@code SKIP}: skip directly, no DLQ attempt
+   *   <li>{@code DLQ_THEN_SKIP}: try DLQ if configured, skip if DLQ fails
+   * </ul>
+   *
+   * @return DLQ_SUCCESS if all records were sent to DLQ, SKIPPED otherwise
+   */
   public FailureResolution handleFailure(
       List<ConsumerRecord<K, V>> records, TopicPartition tp, Exception error, String description) {
 
     int recordCount = records.size();
 
-    if (strategy.hasDlq()) {
+    // DLQ_THEN_SKIP: try DLQ if configured; SKIP: skip directly
+    if (strategy.fallback() == Fallback.DLQ_THEN_SKIP && strategy.hasDlq()) {
       int sentToDlq = 0;
       try {
         DLQHandler<K, V> dlq = strategy.dlqHandler();
@@ -118,27 +131,35 @@ public final class RetryExecutor<K, V> {
             tp,
             description,
             dlqError.getMessage());
+
+        // Call final failure handler for records that couldn't be sent to DLQ
+        for (int i = sentToDlq; i < recordCount; i++) {
+          invokeFinalFailureHandler(records.get(i), dlqError);
+        }
+      }
+    } else {
+      // No DLQ configured, call final failure handler for all records
+      for (ConsumerRecord<K, V> record : records) {
+        invokeFinalFailureHandler(record, error);
       }
     }
 
-    if (strategy.fallback() == Fallback.SKIP) {
-      metricsCollector.recordSkipped(recordCount);
+    metricsCollector.recordSkipped(recordCount);
+    return FailureResolution.SKIPPED;
+  }
+
+  private void invokeFinalFailureHandler(ConsumerRecord<K, V> record, Exception error) {
+    metricsCollector.recordFinalFailure();
+    try {
+      strategy.finalFailureHandler().handle(record, error);
+    } catch (Exception handlerError) {
       logger.log(
           System.Logger.Level.WARNING,
-          "Skipping failed {0} ({1}): {2}",
-          tp,
-          description,
-          error.getMessage());
-      return FailureResolution.SKIP;
+          "FinalFailureHandler threw exception for {0}:{1}:{2}: {3}",
+          record.topic(),
+          record.partition(),
+          record.offset(),
+          handlerError.getMessage());
     }
-
-    metricsCollector.recordPartitionFailure();
-    logger.log(
-        System.Logger.Level.ERROR,
-        "Failing partition {0} due to {1}: {2}",
-        tp,
-        description,
-        error.getMessage());
-    return FailureResolution.FAIL_PARTITION;
   }
 }

@@ -41,6 +41,7 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
           BackpressureStatus.OK,
           0,
           Map.of(),
+          Map.of(),
           0,
           0,
           0,
@@ -84,7 +85,7 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
   public void recordDlqFailure(int count) {}
 
   @Override
-  public void recordPartitionFailure() {}
+  public void recordFinalFailure() {}
 
   @Override
   public void recordCommitSuccess() {}

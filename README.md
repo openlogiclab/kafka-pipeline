@@ -113,7 +113,7 @@ flowchart TB
     WorkerPool -->|"throws"| RetryExecutor
     subgraph ErrorHandling["Error Handling"]
       RetryExecutor -->|"exhausted"| DlqHandler["DLQ Handler"]
-      DlqHandler -->|"fails"| Fallback["Fallback\n(SKIP / FAIL_PARTITION)"]
+      DlqHandler -->|"fails"| FinalHandler["FinalFailureHandler\n→ SKIP"]
     end
 
     RebalanceListener -->|"drain + commit"| OffsetTracker
@@ -223,11 +223,9 @@ DLQ handler (if configured)
      ├── DLQ send succeeds → ack, done (offset advances, record is "handled")
      │
      ▼  DLQ fails or not configured
-Fallback
+FinalFailureHandler (log, file, alert, etc.)
      │
-     ├── SKIP          → ack anyway, log warning, move on
-     │
-     └── FAIL_PARTITION → mark offset FAILED, halt partition processing
+     └── SKIP → ack anyway, move on (system never halts)
 ```
 
 ### Rebalance Flow
@@ -314,7 +312,12 @@ Two options, set explicitly when you configure concurrency:
 
 ### Error Handling
 
-The pipeline runs a full error chain on every failure: **retry → DLQ → fallback**.
+The pipeline supports two error handling strategies via `Fallback`:
+
+| Option | Behavior |
+|--------|----------|
+| `Fallback.SKIP` | Direct skip — no DLQ, skip failed records immediately |
+| `Fallback.DLQ_THEN_SKIP` | Try DLQ first, skip if DLQ also fails |
 
 ```java
 .errorStrategy(ErrorStrategy.<String, String>builder()
@@ -323,17 +326,20 @@ The pipeline runs a full error chain on every failure: **retry → DLQ → fallb
     .exponentialBackoff(true)
     .maxBackoff(Duration.ofSeconds(30))
     .dlqHandler((record, error) -> dlqProducer.send(toDlqRecord(record, error)))
-    .fallback(Fallback.SKIP)     // or Fallback.FAIL_PARTITION
+    .fallback(Fallback.DLQ_THEN_SKIP)  // try DLQ, skip if fails
+    .onFinalFailure((record, error) -> log.error("Unrecoverable: {}", record.offset(), error))
     .build())
 ```
 
-If all retries fail, the DLQ handler gets a shot. If that also fails (or isn't configured), the `fallback` decides: skip the record and move on, or halt processing for that partition.
+The `FinalFailureHandler` is the **final preservation** mechanism — invoked only when all retries AND DLQ fail. After it returns, the record is **permanently dropped** and the offset is committed.
+
+**Trade-off:** The system prioritizes throughput over blocking on unprocessable data. Records that cannot be processed (after retries and DLQ) are skipped, and the offset advances immediately so the pipeline keeps moving. If `FinalFailureHandler` doesn't preserve the data, it's lost forever. The default handler only logs metadata — implement your own to save raw data (PVC, S3, database) if preservation is critical.
 
 For simple cases there are factory methods:
 
 ```java
-ErrorStrategy.failFast()    // no retries, fail partition immediately
-ErrorStrategy.skipOnError() // no retries, skip and move on
+ErrorStrategy.skipOnError()          // Fallback.SKIP — no retries, skip immediately
+ErrorStrategy.withDlq(dlqHandler, 3) // Fallback.DLQ_THEN_SKIP — 3 retries, then DLQ, then skip
 ```
 
 ### Batch Mode
@@ -490,8 +496,8 @@ The returned `PipelineMetrics` record is immutable and safe to pass across threa
 | Category | Metric | Type | Description |
 |---|---|---|---|
 | Throughput | `recordsProcessed` | Counter | Records successfully handled |
-| | `recordsFailed` | Counter | Records that triggered partition failure |
-| | `recordsSkipped` | Counter | Records skipped by hook or fallback |
+| | `recordsFailed` | Counter | Records with unrecoverable failures (skipped after FinalFailureHandler) |
+| | `recordsSkipped` | Counter | Records skipped by hook or after failure |
 | | `pollCount` | Counter | Total `consumer.poll()` calls |
 | | `emptyPollCount` | Counter | Polls that returned zero records |
 | Pressure | `inFlightRecords` | Gauge | Records between poll and ack |
@@ -499,6 +505,7 @@ The returned `PipelineMetrics` record is immutable and safe to pass across threa
 | | `backpressureStatus` | Gauge | Current backpressure level (OK / THROTTLE / CRITICAL) |
 | | `throttleCount` | Counter | Times backpressure activated |
 | | `partitionLags` | Gauge | Per-partition processing lag (Map) |
+| | `partitionFailures` | Gauge | Per-partition failure count (Map) |
 | Errors | `retryAttempts` | Counter | Total retry attempts across all records |
 | | `dlqSuccesses` | Counter | Records sent to DLQ successfully |
 | | `dlqFailures` | Counter | DLQ send failures |
