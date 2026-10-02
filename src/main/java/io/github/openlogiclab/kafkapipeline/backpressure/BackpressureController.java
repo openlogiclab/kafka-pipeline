@@ -31,15 +31,32 @@ public final class BackpressureController {
   private final List<BackpressureSensor> sensors;
   private final boolean enabled;
 
+  /**
+   * Creates a controller with multiple sensors.
+   *
+   * @param config the backpressure configuration
+   * @param sensors the sensors to aggregate
+   */
   public BackpressureController(BackpressureConfig config, List<BackpressureSensor> sensors) {
     this.enabled = config.enabled();
     this.sensors = List.copyOf(sensors);
   }
 
+  /**
+   * Creates a controller with a single sensor.
+   *
+   * @param config the backpressure configuration
+   * @param sensor the sensor to use
+   */
   public BackpressureController(BackpressureConfig config, BackpressureSensor sensor) {
     this(config, List.of(sensor));
   }
 
+  /**
+   * Evaluates all sensors and returns the worst status.
+   *
+   * @return the worst status across all sensors
+   */
   public BackpressureStatus evaluate() {
     if (!enabled) {
       return BackpressureStatus.OK;
@@ -58,10 +75,20 @@ public final class BackpressureController {
     return worst;
   }
 
+  /**
+   * Returns whether the poll loop should pause.
+   *
+   * @return true if any sensor indicates THROTTLE or CRITICAL
+   */
   public boolean shouldThrottle() {
     return evaluate() != BackpressureStatus.OK;
   }
 
+  /**
+   * Returns a summary of all sensor statuses.
+   *
+   * @return human-readable status string
+   */
   public String statusSummary() {
     if (!enabled) {
       return "backpressure=disabled";
@@ -75,10 +102,20 @@ public final class BackpressureController {
     return sb.append('}').toString();
   }
 
+  /**
+   * Returns whether backpressure is enabled.
+   *
+   * @return true if backpressure is active
+   */
   public boolean isEnabled() {
     return enabled;
   }
 
+  /**
+   * Returns the list of sensors being aggregated.
+   *
+   * @return immutable list of sensors
+   */
   public List<BackpressureSensor> sensors() {
     return sensors;
   }

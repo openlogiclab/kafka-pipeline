@@ -36,10 +36,21 @@ public final class HeapSensor implements BackpressureSensor {
 
   private volatile boolean throttled = false;
 
+  /**
+   * Creates a heap backpressure sensor using the default JVM memory bean.
+   *
+   * @param config the heap backpressure configuration
+   */
   public HeapSensor(HeapBackpressureConfig config) {
     this(config, ManagementFactory.getMemoryMXBean());
   }
 
+  /**
+   * Creates a heap backpressure sensor with a custom memory bean (for testing).
+   *
+   * @param config the heap backpressure configuration
+   * @param memoryMxBean the memory bean to read heap usage from
+   */
   HeapSensor(HeapBackpressureConfig config, MemoryMXBean memoryMxBean) {
     this.config = config;
     this.memoryMxBean = memoryMxBean;

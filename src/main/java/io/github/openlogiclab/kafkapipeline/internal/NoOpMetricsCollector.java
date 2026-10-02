@@ -27,6 +27,7 @@ import org.apache.kafka.common.TopicPartition;
  */
 public final class NoOpMetricsCollector extends PipelineMetricsCollector {
 
+  /** Singleton instance. */
   public static final NoOpMetricsCollector INSTANCE = new NoOpMetricsCollector();
 
   private static final PipelineMetrics EMPTY =

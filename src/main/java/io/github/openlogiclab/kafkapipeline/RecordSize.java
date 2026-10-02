@@ -28,6 +28,12 @@ public final class RecordSize {
 
   private RecordSize() {}
 
+  /**
+   * Estimates the serialized byte size of a record.
+   *
+   * @param record the consumer record
+   * @return the estimated byte size
+   */
   public static long estimateBytes(ConsumerRecord<?, ?> record) {
     return Math.max(0, record.serializedKeySize()) + Math.max(0, record.serializedValueSize());
   }

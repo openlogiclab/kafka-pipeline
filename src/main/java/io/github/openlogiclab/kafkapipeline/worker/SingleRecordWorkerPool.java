@@ -40,6 +40,9 @@ import org.apache.kafka.common.TopicPartition;
  *       → success: hook.afterProcess → ack
  *       → failure: DLQ → FinalFailureHandler → skip
  * </pre>
+ *
+ * @param <K> record key type
+ * @param <V> record value type
  */
 public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
 
@@ -54,6 +57,19 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private final InFlightCounter counter;
   private final PipelineMetricsCollector metricsCollector;
 
+  /**
+   * Creates a single-record worker pool.
+   *
+   * @param concurrency number of worker threads
+   * @param threadMode platform or virtual threads
+   * @param handler the record handler
+   * @param hook the lifecycle hook
+   * @param retryExecutor the retry executor
+   * @param offsetTracker the offset tracker
+   * @param dispatcher the record dispatcher
+   * @param counter the in-flight counter
+   * @param metricsCollector the metrics collector
+   */
   public SingleRecordWorkerPool(
       int concurrency,
       ThreadMode threadMode,

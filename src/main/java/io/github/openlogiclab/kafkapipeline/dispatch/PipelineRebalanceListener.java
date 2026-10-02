@@ -51,6 +51,17 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
   private final PipelineMetricsCollector metricsCollector;
   private final ExecutorService drainExecutor;
 
+  /**
+   * Creates a rebalance listener.
+   *
+   * @param offsetTracker the offset tracker
+   * @param dispatcher the record dispatcher
+   * @param commitSync callback to perform sync commit
+   * @param counter the in-flight counter
+   * @param consumer the Kafka consumer
+   * @param drainTimeout timeout for draining in-flight records
+   * @param metricsCollector the metrics collector
+   */
   public PipelineRebalanceListener(
       OffsetTracker offsetTracker,
       RecordDispatcher<?, ?> dispatcher,
@@ -141,6 +152,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     }
   }
 
+  /** Shuts down the drain executor. */
   public void shutdown() {
     drainExecutor.shutdownNow();
   }

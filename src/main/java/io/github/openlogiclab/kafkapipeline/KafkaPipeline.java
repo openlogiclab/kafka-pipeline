@@ -144,6 +144,11 @@ public final class KafkaPipeline<K, V> {
   private PipelineRebalanceListener rebalanceListener;
   private Thread shutdownHook;
 
+  /**
+   * Creates a new pipeline with the given configuration.
+   *
+   * @param config the pipeline configuration
+   */
   public KafkaPipeline(PipelineConfig<K, V> config) {
     this.config = config;
     this.consumer = null;
@@ -189,11 +194,18 @@ public final class KafkaPipeline<K, V> {
             config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
   }
 
+  /**
+   * Returns a new configuration builder.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   * @return new builder instance
+   */
   public static <K, V> PipelineConfig.Builder<K, V> builder() {
     return PipelineConfig.builder();
   }
 
-  /** Start the pipeline. Blocks the calling thread until {@link #stop()} is called. */
+  /** Starts the pipeline. Blocks the calling thread until {@link #stop()} is called. */
   public void start() {
     if (!running.compareAndSet(false, true)) {
       throw new IllegalStateException("Pipeline already started");
@@ -222,7 +234,11 @@ public final class KafkaPipeline<K, V> {
     }
   }
 
-  /** Start the pipeline on a daemon thread. Returns immediately. */
+  /**
+   * Starts the pipeline on a daemon thread. Returns immediately.
+   *
+   * @return the daemon thread running the pipeline
+   */
   public Thread startAsync() {
     Thread thread = new Thread(this::start);
     thread.setName("kafka-pipeline-main");
@@ -232,7 +248,7 @@ public final class KafkaPipeline<K, V> {
   }
 
   /**
-   * Signal the pipeline to stop gracefully. The poll loop will exit, workers will drain, and
+   * Signals the pipeline to stop gracefully. The poll loop will exit, workers will drain, and
    * offsets will be committed.
    */
   public void stop() {
@@ -244,11 +260,20 @@ public final class KafkaPipeline<K, V> {
     }
   }
 
-  /** Block until the pipeline has fully shut down. */
+  /**
+   * Blocks until the pipeline has fully shut down.
+   *
+   * @throws InterruptedException if the current thread is interrupted while waiting
+   */
   public void awaitShutdown() throws InterruptedException {
     shutdownLatch.await();
   }
 
+  /**
+   * Returns whether the pipeline is running.
+   *
+   * @return true if the pipeline is running
+   */
   public boolean isRunning() {
     return running.get();
   }
@@ -259,6 +284,7 @@ public final class KafkaPipeline<K, V> {
    * <p>This method is safe to call from any thread at any time, including before {@link #start()}.
    * Each call reads the current counter values — no background threads or timers involved.
    *
+   * @return current metrics snapshot
    * @see PipelineMetrics
    */
   public PipelineMetrics metrics() {

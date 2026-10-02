@@ -35,6 +35,9 @@ import org.apache.kafka.common.TopicPartition;
  *
  * <p>Thread-safe: the Poller thread dispatches, worker threads poll, and rebalance callbacks
  * add/remove queues.
+ *
+ * @param <K> the record key type
+ * @param <V> the record value type
  */
 public final class RecordDispatcher<K, V> {
 
@@ -55,9 +58,19 @@ public final class RecordDispatcher<K, V> {
   /**
    * Value returned by {@link #poll}. Carries the pre-resolved {@link TopicPartition} so callers
    * avoid allocating a new one from the record's topic/partition fields.
+   *
+   * @param <K> the record key type
+   * @param <V> the record value type
+   * @param partition the topic-partition the record belongs to
+   * @param record the consumer record
    */
   public record PollResult<K, V>(TopicPartition partition, ConsumerRecord<K, V> record) {}
 
+  /**
+   * Creates a record dispatcher.
+   *
+   * @param queueCapacity capacity of each per-partition queue
+   */
   public RecordDispatcher(int queueCapacity) {
     if (queueCapacity <= 0) {
       throw new IllegalArgumentException("queueCapacity must be positive, got " + queueCapacity);
@@ -65,12 +78,23 @@ public final class RecordDispatcher<K, V> {
     this.queueCapacity = queueCapacity;
   }
 
+  /**
+   * Adds a partition for dispatching.
+   *
+   * @param tp the partition to add
+   */
   public void addPartition(TopicPartition tp) {
     queues.putIfAbsent(tp, new LinkedBlockingQueue<>(queueCapacity));
     rebuildSnapshot();
     logger.log(System.Logger.Level.DEBUG, "Added dispatch queue for {0}", tp);
   }
 
+  /**
+   * Removes a partition and drains its queue.
+   *
+   * @param tp the partition to remove
+   * @return the drained records
+   */
   public List<ConsumerRecord<K, V>> removePartition(TopicPartition tp) {
     BlockingQueue<ConsumerRecord<K, V>> queue = queues.remove(tp);
     rebuildSnapshot();
@@ -93,6 +117,9 @@ public final class RecordDispatcher<K, V> {
   /**
    * Enqueues a record into the partition's dispatch queue. The caller provides the pre-built {@link
    * TopicPartition} to avoid redundant object allocation on the hot path.
+   *
+   * @param tp the partition
+   * @param record the record to dispatch
    */
   public void dispatch(TopicPartition tp, ConsumerRecord<K, V> record) {
     BlockingQueue<ConsumerRecord<K, V>> queue = queues.get(tp);
@@ -129,6 +156,10 @@ public final class RecordDispatcher<K, V> {
    * Polls across all partition queues for the next available record. Returns a {@link PollResult}
    * containing both the record and its pre-resolved {@link TopicPartition}, or {@code null} if no
    * record is available within the timeout.
+   *
+   * @param timeout the max time to wait
+   * @param unit the time unit
+   * @return poll result, or null if timeout
    */
   public PollResult<K, V> poll(long timeout, TimeUnit unit) {
     PollResult<K, V> result = tryPollAll();
@@ -161,6 +192,11 @@ public final class RecordDispatcher<K, V> {
     return null;
   }
 
+  /**
+   * Returns total queued records across all partitions.
+   *
+   * @return total queued count
+   */
   public int totalQueuedRecords() {
     int total = 0;
     for (BlockingQueue<ConsumerRecord<K, V>> queue : queues.values()) {
@@ -169,15 +205,31 @@ public final class RecordDispatcher<K, V> {
     return total;
   }
 
+  /**
+   * Returns queued records for a partition.
+   *
+   * @param tp the partition
+   * @return queued count
+   */
   public int queuedRecords(TopicPartition tp) {
     BlockingQueue<ConsumerRecord<K, V>> queue = queues.get(tp);
     return queue != null ? queue.size() : 0;
   }
 
+  /**
+   * Returns all partitions.
+   *
+   * @return set of partitions
+   */
   public Set<TopicPartition> partitions() {
     return Set.copyOf(queues.keySet());
   }
 
+  /**
+   * Removes all partitions not in the given set.
+   *
+   * @param partitions the partitions to retain
+   */
   public void retainOnly(Collection<TopicPartition> partitions) {
     queues.keySet().retainAll(partitions);
   }

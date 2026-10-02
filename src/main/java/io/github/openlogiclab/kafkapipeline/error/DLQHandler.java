@@ -30,6 +30,8 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 public interface DLQHandler<K, V> {
 
   /**
+   * Sends a failed record to the dead letter queue.
+   *
    * @param record the record that failed processing
    * @param lastError the last exception thrown by the handler (after all retries)
    * @throws Exception if sending to DLQ fails
