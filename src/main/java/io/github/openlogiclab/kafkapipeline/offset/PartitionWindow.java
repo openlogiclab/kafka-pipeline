@@ -208,8 +208,14 @@ final class PartitionWindow {
   }
 
   OptionalLong getCommittableOffset() {
-    long current = committableOffset.get();
-    return current > baseOffset ? OptionalLong.of(current) : OptionalLong.empty();
+    shrinkLock.lock();
+    try {
+      shrinkWindow();
+      long current = committableOffset.get();
+      return current > baseOffset ? OptionalLong.of(current) : OptionalLong.empty();
+    } finally {
+      shrinkLock.unlock();
+    }
   }
 
   PartitionDrainResult drain(Duration timeout) {

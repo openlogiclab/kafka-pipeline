@@ -29,6 +29,9 @@ import org.apache.kafka.common.TopicPartition;
 /**
  * Batch processing mode. Each per-partition batch from a single poll is submitted as one task to a
  * thread pool. The entire batch shares retry/DLQ/fallback semantics.
+ *
+ * @param <K> record key type
+ * @param <V> record value type
  */
 public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
 
@@ -41,6 +44,8 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   private final PipelineMetricsCollector metricsCollector;
 
   /**
+   * Creates a new batch worker pool.
+   *
    * @param concurrency number of batch processing threads
    * @param threadMode platform or virtual threads
    * @param handler user-provided batch handler

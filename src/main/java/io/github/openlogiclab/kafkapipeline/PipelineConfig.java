@@ -34,6 +34,23 @@ import java.util.Properties;
  *
  * @param <K> record key type
  * @param <V> record value type
+ * @param consumerProperties Kafka consumer configuration
+ * @param topics topics to subscribe to
+ * @param handler per-record handler (mutually exclusive with batchHandler)
+ * @param batchHandler batch handler (mutually exclusive with handler)
+ * @param concurrency number of worker threads
+ * @param threadMode platform or virtual threads
+ * @param backpressure record-count backpressure configuration
+ * @param byteBackpressure byte-level backpressure configuration
+ * @param heapBackpressure heap-based backpressure configuration
+ * @param customSensors custom backpressure sensors
+ * @param errorStrategy retry and error handling configuration
+ * @param lifecycleHook processing lifecycle callbacks
+ * @param commitInterval interval between async offset commits
+ * @param drainTimeout max wait for in-flight records during rebalance
+ * @param shutdownTimeout max wait for workers during shutdown
+ * @param pollTimeout Kafka consumer poll timeout
+ * @param dispatchQueueCapacity capacity of per-partition dispatch queues
  */
 public record PipelineConfig<K, V>(
     Properties consumerProperties,
@@ -53,6 +70,7 @@ public record PipelineConfig<K, V>(
     Duration shutdownTimeout,
     Duration pollTimeout,
     int dispatchQueueCapacity) {
+  /** Validates configuration constraints. */
   public PipelineConfig {
     Objects.requireNonNull(consumerProperties, "consumerProperties");
     Objects.requireNonNull(topics, "topics");
@@ -85,11 +103,23 @@ public record PipelineConfig<K, V>(
     return batchHandler != null;
   }
 
+  /**
+   * Creates a new builder.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   * @return new builder instance
+   */
   public static <K, V> Builder<K, V> builder() {
     return new Builder<>();
   }
 
-  /** Builder for {@link PipelineConfig}. */
+  /**
+   * Builder for {@link PipelineConfig}.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   */
   public static final class Builder<K, V> {
     private Properties consumerProperties;
     private List<String> topics;
@@ -114,19 +144,32 @@ public record PipelineConfig<K, V>(
     /**
      * Standard Kafka consumer properties ({@code bootstrap.servers}, {@code group.id},
      * deserializers, etc.). {@code enable.auto.commit} is forced to {@code false} internally.
+     *
+     * @param props the consumer properties
+     * @return this builder
      */
     public Builder<K, V> consumerProperties(Properties props) {
       this.consumerProperties = props;
       return this;
     }
 
-    /** Topics to subscribe to. At least one is required. */
+    /**
+     * Topics to subscribe to. At least one is required.
+     *
+     * @param topics the topics
+     * @return this builder
+     */
     public Builder<K, V> topics(List<String> topics) {
       this.topics = topics;
       return this;
     }
 
-    /** Topics to subscribe to. At least one is required. */
+    /**
+     * Topics to subscribe to. At least one is required.
+     *
+     * @param topics the topics
+     * @return this builder
+     */
     public Builder<K, V> topics(String... topics) {
       this.topics = List.of(topics);
       return this;
@@ -134,6 +177,9 @@ public record PipelineConfig<K, V>(
 
     /**
      * Per-record handler. Mutually exclusive with {@link #batchHandler}; exactly one must be set.
+     *
+     * @param handler the record handler
+     * @return this builder
      */
     public Builder<K, V> handler(RecordHandler<K, V> handler) {
       this.handler = handler;
@@ -144,6 +190,9 @@ public record PipelineConfig<K, V>(
      * Batch handler for high-throughput scenarios (bulk inserts, aggregations). Records from each
      * partition in a single poll are delivered as one batch. Mutually exclusive with {@link
      * #handler}; exactly one must be set.
+     *
+     * @param batchHandler the batch handler
+     * @return this builder
      */
     public Builder<K, V> batchHandler(BatchRecordHandler<K, V> batchHandler) {
       this.batchHandler = batchHandler;
@@ -162,6 +211,7 @@ public record PipelineConfig<K, V>(
      *
      * @param threadMode platform or virtual threads
      * @param concurrency number of worker threads (must be positive)
+     * @return this builder
      */
     public Builder<K, V> concurrency(ThreadMode threadMode, int concurrency) {
       this.threadMode = threadMode;
@@ -174,6 +224,8 @@ public record PipelineConfig<K, V>(
      * low=6k, critical=50k). The poll loop pauses when in-flight record count crosses the high
      * watermark and resumes when it drops below the low watermark.
      *
+     * @param backpressure the backpressure configuration
+     * @return this builder
      * @see BackpressureConfig#defaults()
      * @see BackpressureConfig#builder()
      */
@@ -187,6 +239,8 @@ public record PipelineConfig<K, V>(
      * when individual records are large (e.g. 10 MB payloads). Tracks total in-flight bytes using
      * {@code ConsumerRecord.serializedKeySize() + serializedValueSize()}.
      *
+     * @param byteBackpressure the byte backpressure configuration
+     * @return this builder
      * @see ByteBackpressureConfig#builder()
      */
     public Builder<K, V> byteBackpressure(ByteBackpressureConfig byteBackpressure) {
@@ -199,6 +253,8 @@ public record PipelineConfig<K, V>(
      * JVM heap usage via {@code MemoryMXBean}. Works regardless of pressure source — in-flight
      * records, producer buffers, caches, or any other heap-resident data.
      *
+     * @param heapBackpressure the heap backpressure configuration
+     * @return this builder
      * @see HeapBackpressureConfig#builder()
      */
     public Builder<K, V> heapBackpressure(HeapBackpressureConfig heapBackpressure) {
@@ -210,6 +266,8 @@ public record PipelineConfig<K, V>(
      * Registers a custom backpressure sensor. Multiple sensors can be added; the pipeline evaluates
      * all of them (built-in and custom) on each poll cycle and applies the worst status.
      *
+     * @param sensor the custom sensor to add
+     * @return this builder
      * @see BackpressureSensor
      */
     public Builder<K, V> addBackpressureSensor(BackpressureSensor sensor) {
@@ -222,6 +280,8 @@ public record PipelineConfig<K, V>(
      * The chain is: retry → DLQ → skip. Defaults to {@link ErrorStrategy#skipOnError()} (no
      * retries, skip failed records with logging).
      *
+     * @param errorStrategy the error strategy
+     * @return this builder
      * @see ErrorStrategy#builder()
      * @see ErrorStrategy#withDlq(io.github.openlogiclab.kafkapipeline.error.DLQHandler, int)
      */
@@ -234,6 +294,9 @@ public record PipelineConfig<K, V>(
      * Per-record lifecycle callbacks for cross-cutting concerns (dedup, metrics, tracing). Only
      * applies in per-record mode ({@link #handler}); batch mode does not invoke hooks. Defaults to
      * no-op.
+     *
+     * @param hook the lifecycle hook
+     * @return this builder
      */
     public Builder<K, V> lifecycleHook(ProcessingLifecycleHook<K, V> hook) {
       this.lifecycleHook = hook;
@@ -245,6 +308,9 @@ public record PipelineConfig<K, V>(
      * shutdown and rebalance regardless of this interval.
      *
      * <p>Default: {@code 5 seconds}.
+     *
+     * @param interval the commit interval
+     * @return this builder
      */
     public Builder<K, V> commitInterval(Duration interval) {
       this.commitInterval = interval;
@@ -257,6 +323,9 @@ public record PipelineConfig<K, V>(
      * redelivered to the new partition owner.
      *
      * <p>Default: {@code 30 seconds}.
+     *
+     * @param timeout the drain timeout
+     * @return this builder
      */
     public Builder<K, V> drainTimeout(Duration timeout) {
       this.drainTimeout = timeout;
@@ -267,6 +336,9 @@ public record PipelineConfig<K, V>(
      * Maximum time to wait for worker threads to finish during {@code stop()}.
      *
      * <p>Default: {@code 30 seconds}.
+     *
+     * @param timeout the shutdown timeout
+     * @return this builder
      */
     public Builder<K, V> shutdownTimeout(Duration timeout) {
       this.shutdownTimeout = timeout;
@@ -278,6 +350,9 @@ public record PipelineConfig<K, V>(
      * idle.
      *
      * <p>Default: {@code 100ms}.
+     *
+     * @param timeout the poll timeout
+     * @return this builder
      */
     public Builder<K, V> pollTimeout(Duration timeout) {
       this.pollTimeout = timeout;
@@ -303,6 +378,9 @@ public record PipelineConfig<K, V>(
      * frequent blocking of the poll thread, which degrades throughput.
      *
      * <p>Default: {@code 500} (matches Kafka's default {@code max.poll.records}).
+     *
+     * @param capacity the queue capacity
+     * @return this builder
      */
     public Builder<K, V> dispatchQueueCapacity(int capacity) {
       this.dispatchQueueCapacity = capacity;
@@ -312,6 +390,7 @@ public record PipelineConfig<K, V>(
     /**
      * Builds an immutable {@link PipelineConfig}.
      *
+     * @return the built configuration
      * @throws IllegalStateException if concurrency is not configured
      * @throws IllegalArgumentException if validation fails (missing handler, empty topics, etc.)
      */

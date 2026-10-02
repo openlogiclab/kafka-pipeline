@@ -99,6 +99,27 @@ import org.apache.kafka.common.TopicPartition;
  * });
  * }</pre>
  *
+ * @param recordsProcessed total records successfully processed (counter)
+ * @param recordsFailed total records with unrecoverable failures (counter)
+ * @param recordsSkipped total records skipped by hook or after failure (counter)
+ * @param pollCount total consumer poll calls (counter)
+ * @param emptyPollCount total polls returning zero records (counter)
+ * @param inFlightRecords current records between poll and ack (gauge)
+ * @param inFlightBytes current estimated bytes of in-flight records (gauge)
+ * @param backpressureStatus current backpressure level (gauge)
+ * @param throttleCount times backpressure activated (counter)
+ * @param partitionLags per-partition processing lag (gauge)
+ * @param partitionFailures per-partition failure count (gauge)
+ * @param retryAttempts total retry attempts (counter)
+ * @param dlqSuccesses records sent to DLQ successfully (counter)
+ * @param dlqFailures DLQ send failures (counter)
+ * @param finalFailures records skipped after all retries and DLQ failed (counter)
+ * @param commitSuccesses successful offset commits (counter)
+ * @param commitFailures failed offset commits (counter)
+ * @param rebalanceCount consumer group rebalances (counter)
+ * @param drainTimeouts drains that did not complete in time (counter)
+ * @param recordsAbandoned records abandoned during rebalance (counter)
+ * @param assignedPartitions currently assigned partitions (gauge)
  * @see KafkaPipeline#metrics()
  */
 public record PipelineMetrics(

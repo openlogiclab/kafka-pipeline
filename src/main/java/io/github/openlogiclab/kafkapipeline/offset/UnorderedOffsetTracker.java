@@ -36,6 +36,9 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   private final ConcurrentHashMap<TopicPartition, PartitionWindow> partitions =
       new ConcurrentHashMap<>();
 
+  /** Creates a new unordered offset tracker. */
+  public UnorderedOffsetTracker() {}
+
   @Override
   public void register(TopicPartition tp, long offset) {
     getOrThrow(tp).register(offset);
