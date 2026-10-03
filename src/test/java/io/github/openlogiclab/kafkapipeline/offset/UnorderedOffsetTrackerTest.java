@@ -556,6 +556,90 @@ class UnorderedOffsetTrackerTest {
     }
   }
 
+  // ── Uncommitted Offset Tracking ───────────────────────────────
+
+  @Nested
+  class UncommittedOffsetTracking {
+
+    @BeforeEach
+    void init() {
+      tracker.initPartition(TP0, 100);
+      tracker.initPartition(TP1, 200);
+    }
+
+    @Test
+    void getUncommittedOffsets_noProgress_empty() {
+      assertTrue(tracker.getUncommittedOffsets().isEmpty());
+    }
+
+    @Test
+    void getUncommittedOffsets_afterAck_returnsOffset() {
+      tracker.register(TP0, 100);
+      tracker.markInProgress(TP0, 100);
+      tracker.ack(TP0, 100);
+
+      Map<TopicPartition, Long> uncommitted = tracker.getUncommittedOffsets();
+      assertEquals(1, uncommitted.size());
+      assertEquals(101L, uncommitted.get(TP0));
+    }
+
+    @Test
+    void getUncommittedOffsets_afterMarkCommitted_excludesPartition() {
+      tracker.register(TP0, 100);
+      tracker.markInProgress(TP0, 100);
+      tracker.ack(TP0, 100);
+
+      tracker.markCommitted(TP0, 101);
+
+      assertTrue(tracker.getUncommittedOffsets().isEmpty());
+    }
+
+    @Test
+    void getUncommittedOffsets_multiplePartitions() {
+      tracker.register(TP0, 100);
+      tracker.markInProgress(TP0, 100);
+      tracker.ack(TP0, 100);
+
+      tracker.register(TP1, 200);
+      tracker.markInProgress(TP1, 200);
+      tracker.ack(TP1, 200);
+
+      Map<TopicPartition, Long> uncommitted = tracker.getUncommittedOffsets();
+      assertEquals(2, uncommitted.size());
+      assertEquals(101L, uncommitted.get(TP0));
+      assertEquals(201L, uncommitted.get(TP1));
+
+      tracker.markCommitted(TP0, 101);
+
+      uncommitted = tracker.getUncommittedOffsets();
+      assertEquals(1, uncommitted.size());
+      assertNull(uncommitted.get(TP0));
+      assertEquals(201L, uncommitted.get(TP1));
+    }
+
+    @Test
+    void markCommitted_unknownPartition_isNoOp() {
+      assertDoesNotThrow(() -> tracker.markCommitted(TP_UNKNOWN, 100));
+    }
+
+    @Test
+    void getUncommittedOffsets_progressAfterCommit_returnsNewOffset() {
+      tracker.registerBatch(TP0, range(100, 102));
+      tracker.markBatchInProgress(TP0, range(100, 102));
+      tracker.ackBatch(TP0, range(100, 100));
+
+      assertEquals(101L, tracker.getUncommittedOffsets().get(TP0));
+
+      tracker.markCommitted(TP0, 101);
+
+      assertTrue(tracker.getUncommittedOffsets().isEmpty());
+
+      tracker.ackBatch(TP0, range(101, 102));
+
+      assertEquals(103L, tracker.getUncommittedOffsets().get(TP0));
+    }
+  }
+
   // ── Drain ────────────────────────────────────────────────────
 
   @Nested

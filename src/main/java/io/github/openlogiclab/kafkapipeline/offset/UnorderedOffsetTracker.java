@@ -97,6 +97,26 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
+  public Map<TopicPartition, Long> getUncommittedOffsets() {
+    Map<TopicPartition, Long> result = new HashMap<>();
+    for (Map.Entry<TopicPartition, PartitionWindow> entry : partitions.entrySet()) {
+      entry
+          .getValue()
+          .getUncommittedOffset()
+          .ifPresent(offset -> result.put(entry.getKey(), offset));
+    }
+    return result;
+  }
+
+  @Override
+  public void markCommitted(TopicPartition tp, long offset) {
+    PartitionWindow window = partitions.get(tp);
+    if (window != null) {
+      window.markCommitted(offset);
+    }
+  }
+
+  @Override
   public void initPartition(TopicPartition tp, long startOffset) {
     PartitionWindow existing = partitions.putIfAbsent(tp, new PartitionWindow(startOffset));
     if (existing != null) {

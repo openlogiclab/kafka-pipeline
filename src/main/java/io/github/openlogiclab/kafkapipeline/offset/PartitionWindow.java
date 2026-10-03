@@ -50,6 +50,8 @@ final class PartitionWindow {
   private final AtomicLong highestRegistered = new AtomicLong(-1);
   private final ConcurrentSkipListMap<Long, OffsetStatus> entries = new ConcurrentSkipListMap<>();
 
+  private final AtomicLong committedOffset; // Last offset confirmed committed to Kafka
+
   private final AtomicInteger pendingCount = new AtomicInteger(0);
   private final AtomicInteger inProgressCount = new AtomicInteger(0);
   private final AtomicInteger completedCount = new AtomicInteger(0);
@@ -66,6 +68,7 @@ final class PartitionWindow {
     }
     this.baseOffset = startOffset;
     this.committableOffset = new AtomicLong(startOffset);
+    this.committedOffset = new AtomicLong(startOffset);
     this.maxWindowSize = maxWindowSize;
   }
 
@@ -207,6 +210,29 @@ final class PartitionWindow {
     return transitioned;
   }
 
+  /**
+   * Returns the committable offset if it has advanced since the last confirmed commit. Used for
+   * periodic commits to avoid redundant commits when nothing changed.
+   */
+  OptionalLong getUncommittedOffset() {
+    shrinkLock.lock();
+    try {
+      shrinkWindow();
+      long current = committableOffset.get();
+      long committed = committedOffset.get();
+      if (current > committed) {
+        return OptionalLong.of(current);
+      }
+      return OptionalLong.empty();
+    } finally {
+      shrinkLock.unlock();
+    }
+  }
+
+  /**
+   * Returns the committable offset regardless of whether it was already committed. Used for drain
+   * and shutdown where we always want to commit the final position.
+   */
   OptionalLong getCommittableOffset() {
     shrinkLock.lock();
     try {
@@ -216,6 +242,14 @@ final class PartitionWindow {
     } finally {
       shrinkLock.unlock();
     }
+  }
+
+  /**
+   * Marks an offset as confirmed committed to Kafka. Called from async commit callback. Uses max()
+   * to handle out-of-order callbacks safely.
+   */
+  void markCommitted(long offset) {
+    committedOffset.updateAndGet(current -> Math.max(current, offset));
   }
 
   PartitionDrainResult drain(Duration timeout) {
