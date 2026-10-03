@@ -20,8 +20,20 @@ import org.apache.kafka.common.TopicPartition;
 /**
  * Metadata about the record being processed, provided to lifecycle hooks. Immutable snapshot — safe
  * to log, store, or pass across threads.
+ *
+ * @param partition the topic-partition the record belongs to
+ * @param offset the record's offset within the partition
+ * @param attempt current processing attempt (0-indexed)
+ * @param topic the topic name (convenience accessor)
  */
 public record ProcessingContext(TopicPartition partition, long offset, int attempt, String topic) {
+  /**
+   * Creates a processing context with topic derived from partition.
+   *
+   * @param partition the topic-partition
+   * @param offset the record offset
+   * @param attempt the processing attempt (0-indexed)
+   */
   public ProcessingContext(TopicPartition partition, long offset, int attempt) {
     this(partition, offset, attempt, partition.topic());
   }

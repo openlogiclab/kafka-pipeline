@@ -16,12 +16,10 @@
 package io.github.openlogiclab.kafkapipeline.worker;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
-import io.github.openlogiclab.kafkapipeline.error.Fallback;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.time.Duration;
@@ -92,7 +90,7 @@ class BatchWorkerPoolTest {
                 }
                 completedBatches.incrementAndGet();
               },
-              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               1,
@@ -134,7 +132,7 @@ class BatchWorkerPoolTest {
               2,
               ThreadMode.PLATFORM,
               (tp, records) -> {},
-              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               100,
@@ -168,7 +166,7 @@ class BatchWorkerPoolTest {
                 for (var r : records) processed.add(r.value());
                 done.countDown();
               },
-              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               100,
@@ -191,7 +189,7 @@ class BatchWorkerPoolTest {
               (tp, records) -> {
                 throw new RuntimeException("always fails");
               },
-              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               100,
@@ -202,49 +200,7 @@ class BatchWorkerPoolTest {
 
       assertTrue(
           awaitCondition(() -> counter.records() == 0, Duration.ofSeconds(3)),
-          "Counter should be decremented after FAIL_PARTITION");
-    }
-
-    @Test
-    void markBatchInProgressFailure_earlyReturn() throws Exception {
-      // Put partition into failed state so markBatchInProgress throws.
-      tracker.register(TP0, 100);
-      tracker.markInProgress(TP0, 100);
-      tracker.fail(TP0, 100);
-
-      AtomicInteger handlerCalls = new AtomicInteger();
-
-      pool =
-          new BatchWorkerPool<>(
-              2,
-              ThreadMode.PLATFORM,
-              (tp, records) -> handlerCalls.incrementAndGet(),
-              new RetryExecutor<>(ErrorStrategy.failFast(), NoOpMetricsCollector.INSTANCE),
-              tracker,
-              counter,
-              100,
-              NoOpMetricsCollector.INSTANCE);
-      pool.start();
-
-      // Resolve failure so registerBatch succeeds, but immediately fail again
-      // before the async processBatch has a chance to call markBatchInProgress.
-      tracker.resolveFailure(TP0, 100);
-
-      pool.dispatch(buildRecords(TP0, 0, 2));
-
-      // Re-fail the partition; the async processBatch hasn't run yet on the pool thread.
-      tracker.register(TP0, 200);
-      tracker.markInProgress(TP0, 200);
-      tracker.fail(TP0, 200);
-
-      Thread.sleep(500);
-
-      // Race-dependent: partition must be failed before async processBatch runs.
-      // If timing didn't align, mark test as skipped rather than failed.
-      assumeTrue(
-          handlerCalls.get() == 0,
-          "Race condition: processBatch ran before partition was failed — inconclusive");
-      assertEquals(0, counter.records(), "Counter should be decremented after early return");
+          "Counter should be decremented after skip");
     }
 
     @Test
@@ -286,7 +242,6 @@ class BatchWorkerPoolTest {
               .maxRetries(0)
               .retryBackoff(Duration.ZERO)
               .dlqHandler((record, error) -> dlqRecords.add(record))
-              .fallback(Fallback.FAIL_PARTITION)
               .build();
 
       pool =

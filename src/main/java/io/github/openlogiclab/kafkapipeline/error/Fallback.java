@@ -15,12 +15,24 @@
  */
 package io.github.openlogiclab.kafkapipeline.error;
 
-/** What to do after all retries are exhausted and DLQ (if configured) also fails. */
+/**
+ * Error handling strategy after all retries are exhausted.
+ *
+ * <p>This is a best-effort strategy: the system always continues processing. Failed records are
+ * always skipped after invoking the {@link FinalFailureHandler}.
+ */
 public enum Fallback {
 
-  /** Treat the record as done (ack) and move on. Logs the failure. */
+  /**
+   * Direct skip — do not attempt DLQ, skip the record immediately. The {@link FinalFailureHandler}
+   * is called before skipping for logging/alerting.
+   */
   SKIP,
 
-  /** Mark the partition as failed, halting further processing until resolved. */
-  FAIL_PARTITION
+  /**
+   * Try DLQ first, then skip if DLQ fails. If a {@link DLQHandler} is configured, the record is
+   * sent there. If DLQ succeeds, the record is acked normally. If DLQ fails (or is not configured),
+   * the {@link FinalFailureHandler} is called and the record is skipped.
+   */
+  DLQ_THEN_SKIP
 }

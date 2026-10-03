@@ -21,7 +21,6 @@ import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
-import io.github.openlogiclab.kafkapipeline.error.Fallback;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
@@ -79,7 +78,7 @@ class WorkerPoolTest {
   }
 
   private WorkerPool<String, String> pool(RecordHandler<String, String> handler) {
-    return pool(1, ErrorStrategy.failFast(), handler, ProcessingLifecycleHook.noOp());
+    return pool(1, ErrorStrategy.skipOnError(), handler, ProcessingLifecycleHook.noOp());
   }
 
   @Nested
@@ -89,14 +88,14 @@ class WorkerPoolTest {
     void rejectsZeroConcurrency() {
       assertThrows(
           IllegalArgumentException.class,
-          () -> pool(0, ErrorStrategy.failFast(), r -> {}, ProcessingLifecycleHook.noOp()));
+          () -> pool(0, ErrorStrategy.skipOnError(), r -> {}, ProcessingLifecycleHook.noOp()));
     }
 
     @Test
     void rejectsNegativeConcurrency() {
       assertThrows(
           IllegalArgumentException.class,
-          () -> pool(-1, ErrorStrategy.failFast(), r -> {}, ProcessingLifecycleHook.noOp()));
+          () -> pool(-1, ErrorStrategy.skipOnError(), r -> {}, ProcessingLifecycleHook.noOp()));
     }
   }
 
@@ -185,7 +184,11 @@ class WorkerPoolTest {
           };
 
       WorkerPool<String, String> wp =
-          pool(1, ErrorStrategy.failFast(), record -> processed.add(record.value()), throwingHook);
+          pool(
+              1,
+              ErrorStrategy.skipOnError(),
+              record -> processed.add(record.value()),
+              throwingHook);
 
       registerAndDispatch(0);
       wp.start();
@@ -213,40 +216,6 @@ class WorkerPoolTest {
                     dlqAttempts.incrementAndGet();
                     throw new RuntimeException("DLQ send failed");
                   })
-              .fallback(Fallback.SKIP)
-              .build();
-
-      WorkerPool<String, String> wp =
-          pool(
-              1,
-              strategy,
-              record -> {
-                throw new RuntimeException("always fails");
-              },
-              ProcessingLifecycleHook.noOp());
-
-      registerAndDispatch(0);
-      wp.start();
-      Thread.sleep(300);
-      wp.stop(1000);
-
-      assertEquals(1, dlqAttempts.get());
-    }
-
-    @Test
-    void dlqFails_fallbackFailPartition() throws Exception {
-      AtomicInteger dlqAttempts = new AtomicInteger();
-
-      ErrorStrategy<String, String> strategy =
-          ErrorStrategy.<String, String>builder()
-              .maxRetries(0)
-              .retryBackoff(Duration.ZERO)
-              .dlqHandler(
-                  (record, error) -> {
-                    dlqAttempts.incrementAndGet();
-                    throw new RuntimeException("DLQ send failed");
-                  })
-              .fallback(Fallback.FAIL_PARTITION)
               .build();
 
       WorkerPool<String, String> wp =
@@ -268,11 +237,11 @@ class WorkerPoolTest {
   }
 
   @Nested
-  class NoDlqFailPartition {
+  class NoDlqSkip {
 
     @Test
-    void noDlq_failPartition() throws Exception {
-      ErrorStrategy<String, String> strategy = ErrorStrategy.failFast();
+    void noDlq_skip() throws Exception {
+      ErrorStrategy<String, String> strategy = ErrorStrategy.skipOnError();
 
       WorkerPool<String, String> wp =
           pool(
@@ -290,7 +259,7 @@ class WorkerPoolTest {
     }
 
     @Test
-    void noDlq_skip() throws Exception {
+    void noDlq_skip_continuesProcessing() throws Exception {
       ErrorStrategy<String, String> strategy = ErrorStrategy.skipOnError();
       CopyOnWriteArrayList<String> processed = new CopyOnWriteArrayList<>();
 
@@ -364,7 +333,6 @@ class WorkerPoolTest {
           ErrorStrategy.<String, String>builder()
               .maxRetries(2)
               .retryBackoff(Duration.ofMillis(10))
-              .fallback(Fallback.FAIL_PARTITION)
               .build();
 
       WorkerPool<String, String> wp =

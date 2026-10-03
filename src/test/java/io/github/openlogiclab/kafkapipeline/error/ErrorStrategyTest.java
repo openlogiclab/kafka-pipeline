@@ -29,20 +29,23 @@ class ErrorStrategyTest {
   class Factories {
 
     @Test
-    void failFast_noRetriesFailPartition() {
-      ErrorStrategy<String, String> s = ErrorStrategy.failFast();
-      assertEquals(0, s.maxRetries());
-      assertEquals(Duration.ZERO, s.retryBackoff());
-      assertFalse(s.hasDlq());
-      assertEquals(Fallback.FAIL_PARTITION, s.fallback());
-    }
-
-    @Test
-    void skipOnError_noRetriesSkip() {
+    void skipOnError_noRetriesWithDefaultHandler() {
       ErrorStrategy<String, String> s = ErrorStrategy.skipOnError();
       assertEquals(0, s.maxRetries());
       assertFalse(s.hasDlq());
       assertEquals(Fallback.SKIP, s.fallback());
+      assertNotNull(s.finalFailureHandler());
+    }
+
+    @Test
+    void withDlq_retriesAndDlq() {
+      DLQHandler<String, String> dlq = (record, error) -> {};
+      ErrorStrategy<String, String> s = ErrorStrategy.withDlq(dlq, 3);
+      assertEquals(3, s.maxRetries());
+      assertTrue(s.hasDlq());
+      assertSame(dlq, s.dlqHandler());
+      assertEquals(Fallback.DLQ_THEN_SKIP, s.fallback());
+      assertNotNull(s.finalFailureHandler());
     }
   }
 
@@ -55,13 +58,17 @@ class ErrorStrategyTest {
     void negativeRetries_throws() {
       assertThrows(
           IllegalArgumentException.class,
-          () -> new ErrorStrategy<>(-1, Duration.ZERO, false, Duration.ZERO, null, Fallback.SKIP));
+          () ->
+              new ErrorStrategy<>(
+                  -1, Duration.ZERO, false, Duration.ZERO, null, Fallback.SKIP, (r, e) -> {}));
     }
 
     @Test
     void zeroRetries_ok() {
       assertDoesNotThrow(
-          () -> new ErrorStrategy<>(0, Duration.ZERO, false, Duration.ZERO, null, Fallback.SKIP));
+          () ->
+              new ErrorStrategy<>(
+                  0, Duration.ZERO, false, Duration.ZERO, null, Fallback.SKIP, (r, e) -> {}));
     }
 
     @Test
@@ -70,7 +77,13 @@ class ErrorStrategyTest {
           IllegalArgumentException.class,
           () ->
               new ErrorStrategy<>(
-                  3, Duration.ofMillis(-1), false, Duration.ZERO, null, Fallback.SKIP));
+                  3,
+                  Duration.ofMillis(-1),
+                  false,
+                  Duration.ZERO,
+                  null,
+                  Fallback.SKIP,
+                  (r, e) -> {}));
     }
 
     @Test
@@ -79,7 +92,13 @@ class ErrorStrategyTest {
           IllegalArgumentException.class,
           () ->
               new ErrorStrategy<>(
-                  3, Duration.ofSeconds(1), true, Duration.ofMillis(-1), null, Fallback.SKIP));
+                  3,
+                  Duration.ofSeconds(1),
+                  true,
+                  Duration.ofMillis(-1),
+                  null,
+                  Fallback.SKIP,
+                  (r, e) -> {}));
     }
   }
 
@@ -90,7 +109,7 @@ class ErrorStrategyTest {
 
     @Test
     void noDlq_returnsFalse() {
-      ErrorStrategy<String, String> s = ErrorStrategy.failFast();
+      ErrorStrategy<String, String> s = ErrorStrategy.skipOnError();
       assertFalse(s.hasDlq());
     }
 
@@ -220,12 +239,14 @@ class ErrorStrategyTest {
       assertFalse(s.exponentialBackoff());
       assertEquals(Duration.ofMinutes(1), s.maxBackoff());
       assertNull(s.dlqHandler());
-      assertEquals(Fallback.FAIL_PARTITION, s.fallback());
+      assertEquals(Fallback.DLQ_THEN_SKIP, s.fallback());
+      assertNotNull(s.finalFailureHandler());
     }
 
     @Test
     void builder_allFields() {
       DLQHandler<String, String> dlq = (record, error) -> {};
+      FinalFailureHandler<String, String> ffh = (record, error) -> {};
       ErrorStrategy<String, String> s =
           ErrorStrategy.<String, String>builder()
               .maxRetries(5)
@@ -233,7 +254,8 @@ class ErrorStrategyTest {
               .exponentialBackoff(true)
               .maxBackoff(Duration.ofSeconds(30))
               .dlqHandler(dlq)
-              .fallback(Fallback.SKIP)
+              .fallback(Fallback.DLQ_THEN_SKIP)
+              .onFinalFailure(ffh)
               .build();
 
       assertEquals(5, s.maxRetries());
@@ -241,7 +263,8 @@ class ErrorStrategyTest {
       assertTrue(s.exponentialBackoff());
       assertEquals(Duration.ofSeconds(30), s.maxBackoff());
       assertSame(dlq, s.dlqHandler());
-      assertEquals(Fallback.SKIP, s.fallback());
+      assertEquals(Fallback.DLQ_THEN_SKIP, s.fallback());
+      assertSame(ffh, s.finalFailureHandler());
     }
 
     @Test
@@ -249,8 +272,7 @@ class ErrorStrategyTest {
       var b =
           ErrorStrategy.<String, String>builder()
               .maxRetries(3)
-              .retryBackoff(Duration.ofMillis(100))
-              .fallback(Fallback.SKIP);
+              .retryBackoff(Duration.ofMillis(100));
 
       assertInstanceOf(ErrorStrategy.Builder.class, b);
     }
