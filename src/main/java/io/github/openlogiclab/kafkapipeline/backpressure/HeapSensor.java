@@ -93,8 +93,10 @@ public final class HeapSensor implements BackpressureSensor {
   @Override
   public String statusDetail() {
     double usage = heapUsage();
-    return String.format("%.1f%%/%.0f%% heap", usage * 100, config.throttleThreshold() * 100)
-        + (throttled ? " [throttled]" : "");
+    String status = throttled ? " THROTTLED" : "";
+    return String.format(
+            "%.1f%% heap (threshold=%.0f%%)", usage * 100, config.throttleThreshold() * 100)
+        + status;
   }
 
   private double heapUsage() {

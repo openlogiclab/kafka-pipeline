@@ -386,7 +386,10 @@ public final class KafkaPipeline<K, V> {
         if (paused) {
           consumer.resume(consumer.assignment());
           paused = false;
-          logger.log(System.Logger.Level.DEBUG, "Backpressure: resumed");
+          logger.log(
+              System.Logger.Level.DEBUG,
+              "Backpressure: resumed. {0}",
+              backpressure.statusSummary());
         }
 
         ConsumerRecords<K, V> records = consumer.poll(config.pollTimeout());

@@ -79,10 +79,7 @@ public final class RecordCountSensor implements BackpressureSensor {
   @Override
   public String statusDetail() {
     int current = counter.records();
-    return current
-        + "/"
-        + config.highWatermark()
-        + " in-flight"
-        + (throttled ? " [throttled]" : "");
+    String status = throttled ? " THROTTLED" : "";
+    return current + " records (threshold=" + config.highWatermark() + ")" + status;
   }
 }

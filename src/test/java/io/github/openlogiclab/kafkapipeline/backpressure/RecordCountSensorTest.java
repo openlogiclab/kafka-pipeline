@@ -236,7 +236,7 @@ class RecordCountSensorTest {
       counter.registered(100, 0);
       sensor.currentStatus();
       String detail = sensor.statusDetail();
-      assertTrue(detail.contains("[throttled]"));
+      assertTrue(detail.contains("THROTTLED"), "Should show throttled: " + detail);
     }
   }
 

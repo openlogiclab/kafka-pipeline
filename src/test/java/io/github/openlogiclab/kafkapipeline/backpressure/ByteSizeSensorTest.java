@@ -189,8 +189,8 @@ class ByteSizeSensorTest {
     void statusDetail_containsFormattedBytes() {
       counter.registered(0, 1024 * 1024);
       String detail = sensor.statusDetail();
-      assertTrue(detail.contains("MB"), "Should format bytes as MB");
-      assertTrue(detail.contains("in-flight"), "Should contain in-flight label");
+      assertTrue(detail.contains("MB"), "Should format bytes as MB: " + detail);
+      assertTrue(detail.contains("threshold="), "Should contain threshold: " + detail);
     }
 
     @Test
@@ -198,7 +198,7 @@ class ByteSizeSensorTest {
       counter.registered(0, 300);
       sensor.currentStatus();
       String detail = sensor.statusDetail();
-      assertTrue(detail.contains("[throttled]"), "Should show throttled flag");
+      assertTrue(detail.contains("THROTTLED"), "Should show throttled flag: " + detail);
     }
   }
 }
