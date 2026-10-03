@@ -117,6 +117,23 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
    */
   Map<TopicPartition, Long> getAllCommittableOffsets();
 
+  /**
+   * Returns committable offsets only for partitions that have uncommitted progress (offset advanced
+   * since last {@link #markCommitted} call). Used for periodic commits to avoid redundant commits.
+   *
+   * @return map of partition to uncommitted offset
+   */
+  Map<TopicPartition, Long> getUncommittedOffsets();
+
+  /**
+   * Marks an offset as confirmed committed to Kafka. Called from async commit callback. Should be
+   * called for each partition after a successful commit.
+   *
+   * @param tp the topic partition
+   * @param offset the committed offset
+   */
+  void markCommitted(TopicPartition tp, long offset);
+
   // ── Rebalance / Lifecycle ─────────────────────────────────────
 
   /**
