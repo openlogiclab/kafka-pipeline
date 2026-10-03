@@ -35,6 +35,13 @@ import java.time.Duration;
  *
  * @param <K> record key type
  * @param <V> record value type
+ * @param maxRetries maximum retry attempts before giving up
+ * @param retryBackoff initial delay between retry attempts
+ * @param exponentialBackoff whether to use exponential backoff
+ * @param maxBackoff maximum delay between retry attempts
+ * @param dlqHandler dead letter queue handler, or null if not configured
+ * @param fallback action to take after retries and DLQ are exhausted
+ * @param finalFailureHandler callback invoked before skipping a failed record
  */
 public record ErrorStrategy<K, V>(
     int maxRetries,
@@ -47,6 +54,7 @@ public record ErrorStrategy<K, V>(
 
   private static final System.Logger logger = System.getLogger(ErrorStrategy.class.getName());
 
+  /** Validates configuration constraints. */
   public ErrorStrategy {
     if (maxRetries < 0) {
       throw new IllegalArgumentException("maxRetries must be >= 0, got " + maxRetries);
@@ -59,7 +67,13 @@ public record ErrorStrategy<K, V>(
     }
   }
 
-  /** No retries, no DLQ, skip failed records with default logging. */
+  /**
+   * No retries, no DLQ, skip failed records with default logging.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   * @return error strategy that skips on error
+   */
   public static <K, V> ErrorStrategy<K, V> skipOnError() {
     return new ErrorStrategy<>(
         0, Duration.ZERO, false, Duration.ZERO, null, Fallback.SKIP, defaultFinalFailureHandler());
@@ -68,8 +82,11 @@ public record ErrorStrategy<K, V>(
   /**
    * Best-effort DLQ with retries. If DLQ fails, skip with default logging.
    *
+   * @param <K> record key type
+   * @param <V> record value type
    * @param dlqHandler the DLQ handler
    * @param maxRetries number of retry attempts before DLQ
+   * @return error strategy with DLQ
    */
   public static <K, V> ErrorStrategy<K, V> withDlq(DLQHandler<K, V> dlqHandler, int maxRetries) {
     return new ErrorStrategy<>(
@@ -82,11 +99,23 @@ public record ErrorStrategy<K, V>(
         defaultFinalFailureHandler());
   }
 
+  /**
+   * Returns a new builder.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   * @return new builder instance
+   */
   public static <K, V> Builder<K, V> builder() {
     return new Builder<>();
   }
 
-  /** Compute the backoff duration for a given attempt number (0-based). */
+  /**
+   * Computes the backoff duration for a given attempt number (0-based).
+   *
+   * @param attempt the attempt number (0-based)
+   * @return the backoff duration
+   */
   public Duration backoffForAttempt(int attempt) {
     if (attempt <= 0 || retryBackoff.isZero()) {
       return retryBackoff;
@@ -99,6 +128,11 @@ public record ErrorStrategy<K, V>(
     return Duration.ofMillis(capped);
   }
 
+  /**
+   * Returns whether a DLQ handler is configured.
+   *
+   * @return true if DLQ is configured
+   */
   public boolean hasDlq() {
     return dlqHandler != null;
   }
@@ -114,7 +148,12 @@ public record ErrorStrategy<K, V>(
             error.getMessage());
   }
 
-  /** Builder for {@link ErrorStrategy}. */
+  /**
+   * Builder for {@link ErrorStrategy}.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   */
   public static final class Builder<K, V> {
     private int maxRetries = 0;
     private Duration retryBackoff = Duration.ofSeconds(1);
@@ -131,6 +170,9 @@ public record ErrorStrategy<K, V>(
      * retries.
      *
      * <p>Default: {@code 0} (no retries).
+     *
+     * @param maxRetries the maximum retry attempts
+     * @return this builder
      */
     public Builder<K, V> maxRetries(int maxRetries) {
       this.maxRetries = maxRetries;
@@ -142,6 +184,9 @@ public record ErrorStrategy<K, V>(
      * multiplied by powers of 2 on each subsequent attempt.
      *
      * <p>Default: {@code 1 second}.
+     *
+     * @param retryBackoff the retry backoff duration
+     * @return this builder
      */
     public Builder<K, V> retryBackoff(Duration retryBackoff) {
       this.retryBackoff = retryBackoff;
@@ -152,6 +197,9 @@ public record ErrorStrategy<K, V>(
      * Whether to apply exponential backoff (base × 2^attempt) instead of fixed delay.
      *
      * <p>Default: {@code false} (fixed delay).
+     *
+     * @param exponentialBackoff whether to use exponential backoff
+     * @return this builder
      */
     public Builder<K, V> exponentialBackoff(boolean exponentialBackoff) {
       this.exponentialBackoff = exponentialBackoff;
@@ -162,6 +210,9 @@ public record ErrorStrategy<K, V>(
      * Upper bound for exponential backoff. Ignored when exponential backoff is disabled.
      *
      * <p>Default: {@code 1 minute}.
+     *
+     * @param maxBackoff the maximum backoff duration
+     * @return this builder
      */
     public Builder<K, V> maxBackoff(Duration maxBackoff) {
       this.maxBackoff = maxBackoff;
@@ -173,6 +224,9 @@ public record ErrorStrategy<K, V>(
      * the DLQ. If the DLQ send succeeds, the record is acked and the offset advances.
      *
      * <p>Default: {@code null} (no DLQ, skip directly).
+     *
+     * @param dlqHandler the DLQ handler
+     * @return this builder
      */
     public Builder<K, V> dlqHandler(DLQHandler<K, V> dlqHandler) {
       this.dlqHandler = dlqHandler;
@@ -183,6 +237,9 @@ public record ErrorStrategy<K, V>(
      * What to do after all retries are exhausted and DLQ (if configured) also fails.
      *
      * <p>Default: {@link Fallback#SKIP}.
+     *
+     * @param fallback the fallback action
+     * @return this builder
      */
     public Builder<K, V> fallback(Fallback fallback) {
       this.fallback = fallback;
@@ -198,12 +255,20 @@ public record ErrorStrategy<K, V>(
      *
      * <p>Default: logs the failure at ERROR level. For critical data, implement a more robust
      * preservation strategy.
+     *
+     * @param handler the final failure handler
+     * @return this builder
      */
     public Builder<K, V> onFinalFailure(FinalFailureHandler<K, V> handler) {
       this.finalFailureHandler = handler;
       return this;
     }
 
+    /**
+     * Builds the error strategy.
+     *
+     * @return the error strategy
+     */
     public ErrorStrategy<K, V> build() {
       if (fallback == Fallback.DLQ_THEN_SKIP && dlqHandler == null) {
         logger.log(

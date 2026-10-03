@@ -31,6 +31,12 @@ public final class RecordCountSensor implements BackpressureSensor {
 
   private volatile boolean throttled = false;
 
+  /**
+   * Creates a record-count backpressure sensor.
+   *
+   * @param config the backpressure configuration
+   * @param counter the in-flight counter to read record counts from
+   */
   public RecordCountSensor(BackpressureConfig config, InFlightCounter counter) {
     this.config = config;
     this.counter = counter;

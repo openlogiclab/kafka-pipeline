@@ -31,6 +31,9 @@ import org.apache.kafka.common.TopicPartition;
  *
  * <p>Stateless — all state lives in the caller or in {@link ErrorStrategy}. Thread-safe as long as
  * the {@link ErrorStrategy} and its {@link DLQHandler} are thread-safe.
+ *
+ * @param <K> record key type
+ * @param <V> record value type
  */
 public final class RetryExecutor<K, V> {
 
@@ -39,21 +42,45 @@ public final class RetryExecutor<K, V> {
   private final ErrorStrategy<K, V> strategy;
   private final PipelineMetricsCollector metricsCollector;
 
+  /**
+   * Creates a retry executor.
+   *
+   * @param strategy the error strategy
+   * @param metricsCollector the metrics collector
+   */
   public RetryExecutor(ErrorStrategy<K, V> strategy, PipelineMetricsCollector metricsCollector) {
     this.strategy = strategy;
     this.metricsCollector = metricsCollector;
   }
 
+  /** A task that can be retried. */
   @FunctionalInterface
   public interface RetryableTask {
+    /**
+     * Executes the task.
+     *
+     * @param attempt the attempt number (0-based)
+     * @throws Exception if processing fails
+     */
     void execute(int attempt) throws Exception;
   }
 
+  /** Resolution of a failure after retries. */
   public enum FailureResolution {
+    /** All records sent to DLQ successfully. */
     DLQ_SUCCESS,
+    /** Records were skipped. */
     SKIPPED
   }
 
+  /**
+   * Executes a task with retries according to the error strategy.
+   *
+   * @param task the task to execute
+   * @param tp the topic partition for logging
+   * @param description description for logging
+   * @return null if successful, otherwise the last exception
+   */
   public Exception executeWithRetries(RetryableTask task, TopicPartition tp, String description) {
     Exception lastError = null;
     int maxAttempts = 1 + strategy.maxRetries();
@@ -93,6 +120,10 @@ public final class RetryExecutor<K, V> {
    *   <li>{@code DLQ_THEN_SKIP}: try DLQ if configured, skip if DLQ fails
    * </ul>
    *
+   * @param records the failed records
+   * @param tp the topic partition
+   * @param error the exception that caused failure
+   * @param description description for logging
    * @return DLQ_SUCCESS if all records were sent to DLQ, SKIPPED otherwise
    */
   public FailureResolution handleFailure(

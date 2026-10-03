@@ -52,6 +52,14 @@ public final class PeriodicCommitter {
   private final AtomicBoolean commitDue = new AtomicBoolean(false);
   private final PipelineMetricsCollector metricsCollector;
 
+  /**
+   * Creates a periodic committer.
+   *
+   * @param offsetTracker the offset tracker to read committable offsets from
+   * @param consumer the Kafka consumer to commit offsets with
+   * @param commitInterval the interval between periodic commits
+   * @param metricsCollector the metrics collector
+   */
   public PeriodicCommitter(
       OffsetTracker offsetTracker,
       Consumer<?, ?> consumer,
@@ -71,6 +79,7 @@ public final class PeriodicCommitter {
             });
   }
 
+  /** Starts the periodic commit scheduler. */
   public void start() {
     if (!running.compareAndSet(false, true)) {
       throw new IllegalStateException("PeriodicCommitter already started");
@@ -82,6 +91,7 @@ public final class PeriodicCommitter {
         System.Logger.Level.INFO, "PeriodicCommitter started with interval {0}ms", intervalMs);
   }
 
+  /** Stops the periodic commit scheduler and waits for termination. */
   public void stop() {
     running.set(false);
     scheduler.shutdown();
@@ -141,6 +151,7 @@ public final class PeriodicCommitter {
     }
   }
 
+  /** Performs a synchronous commit. Must be called from the poll thread. */
   public void commitSync() {
     try {
       Map<TopicPartition, OffsetAndMetadata> offsets = buildCommitMap();
