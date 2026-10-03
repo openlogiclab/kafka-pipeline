@@ -456,6 +456,75 @@ class PartitionWindowTest {
   }
 
   @Nested
+  class CommittedOffsetTracking {
+
+    @Test
+    void getUncommittedOffset_noProgress_empty() {
+      assertEquals(OptionalLong.empty(), window.getUncommittedOffset());
+    }
+
+    @Test
+    void getUncommittedOffset_afterAck_returnsOffset() {
+      window.register(100);
+      window.markInProgress(100);
+      window.ack(100);
+
+      assertEquals(OptionalLong.of(101), window.getUncommittedOffset());
+    }
+
+    @Test
+    void getUncommittedOffset_afterMarkCommitted_empty() {
+      window.register(100);
+      window.markInProgress(100);
+      window.ack(100);
+
+      window.markCommitted(101);
+
+      assertEquals(OptionalLong.empty(), window.getUncommittedOffset());
+    }
+
+    @Test
+    void getUncommittedOffset_partialCommit_returnsNewProgress() {
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
+      window.ackBatch(range(100, 102));
+
+      assertEquals(OptionalLong.of(103), window.getUncommittedOffset());
+
+      window.markCommitted(103);
+
+      assertEquals(OptionalLong.empty(), window.getUncommittedOffset());
+
+      window.ackBatch(range(103, 104));
+
+      assertEquals(OptionalLong.of(105), window.getUncommittedOffset());
+    }
+
+    @Test
+    void markCommitted_usesMax_handlesOutOfOrderCallbacks() {
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
+      window.ackBatch(range(100, 104));
+
+      window.markCommitted(103);
+      window.markCommitted(105);
+      window.markCommitted(102);
+
+      assertEquals(OptionalLong.empty(), window.getUncommittedOffset());
+    }
+
+    @Test
+    void getUncommittedOffset_commitFailure_stillReturnsOffset() {
+      window.register(100);
+      window.markInProgress(100);
+      window.ack(100);
+
+      assertEquals(OptionalLong.of(101), window.getUncommittedOffset());
+      assertEquals(OptionalLong.of(101), window.getUncommittedOffset());
+    }
+  }
+
+  @Nested
   class FailedStateTracking {
 
     @Test
