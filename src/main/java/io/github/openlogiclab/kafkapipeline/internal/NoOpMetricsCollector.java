@@ -27,6 +27,7 @@ import org.apache.kafka.common.TopicPartition;
  */
 public final class NoOpMetricsCollector extends PipelineMetricsCollector {
 
+  /** Singleton instance. */
   public static final NoOpMetricsCollector INSTANCE = new NoOpMetricsCollector();
 
   private static final PipelineMetrics EMPTY =
@@ -40,6 +41,7 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
           0,
           BackpressureStatus.OK,
           0,
+          Map.of(),
           Map.of(),
           0,
           0,
@@ -84,7 +86,7 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
   public void recordDlqFailure(int count) {}
 
   @Override
-  public void recordPartitionFailure() {}
+  public void recordFinalFailure() {}
 
   @Override
   public void recordCommitSuccess() {}

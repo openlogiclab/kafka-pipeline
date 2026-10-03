@@ -22,6 +22,7 @@ import java.util.OptionalLong;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.LongStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -29,6 +30,10 @@ import org.junit.jupiter.api.Test;
 class PartitionWindowTest {
 
   private PartitionWindow window;
+
+  private static long[] range(long from, long to) {
+    return LongStream.rangeClosed(from, to).toArray();
+  }
 
   @BeforeEach
   void setUp() {
@@ -82,18 +87,6 @@ class PartitionWindowTest {
     }
 
     @Test
-    void isFailed_reflectsState() {
-      assertFalse(window.isFailed());
-      window.register(100);
-      window.markInProgress(100);
-      window.fail(100);
-      assertTrue(window.isFailed());
-
-      window.resolveFailure(100);
-      assertFalse(window.isFailed());
-    }
-
-    @Test
     void lag_beforeAnyRegistration() {
       assertEquals(0, window.lag());
     }
@@ -109,8 +102,6 @@ class PartitionWindowTest {
     void lag_afterArrayBatchRegistration() {
       long[] offsets = {100, 200, 300};
       window.registerBatch(offsets);
-      // highestRegistered should be 300, committableOffset is 100
-      // lag = 300 + 1 - 100 = 201
       assertEquals(201, window.lag());
     }
 
@@ -131,63 +122,16 @@ class PartitionWindowTest {
   class RegisterBatch {
 
     @Test
-    void failedStateBlocksBatchRegistration() {
-      window.register(100);
-      window.markInProgress(100);
-      window.fail(100);
-
-      assertThrows(IllegalStateException.class, () -> window.registerBatch(101, 105));
-    }
-
-    @Test
     void batchExceedsCapacity() {
       PartitionWindow small = new PartitionWindow(0, 3);
-      assertThrows(IllegalStateException.class, () -> small.registerBatch(0, 5));
+      assertThrows(IllegalStateException.class, () -> small.registerBatch(range(0, 5)));
     }
 
     @Test
     void batchWithDuplicateRollsBack() {
       window.register(102);
-      assertThrows(IllegalStateException.class, () -> window.registerBatch(100, 104));
+      assertThrows(IllegalStateException.class, () -> window.registerBatch(range(100, 104)));
       assertEquals(1, window.pendingCount());
-    }
-  }
-
-  @Nested
-  class ResolveFailure {
-
-    @Test
-    void resolveNotAtLeftEdge_doesNotShrink() {
-      window.register(100);
-      window.register(101);
-      window.markInProgress(100);
-      window.markInProgress(101);
-      window.fail(101);
-
-      window.resolveFailure(101);
-
-      assertEquals(OptionalLong.empty(), window.getCommittableOffset());
-      assertFalse(window.isFailed());
-
-      window.ack(100);
-      assertEquals(OptionalLong.of(102), window.getCommittableOffset());
-    }
-
-    @Test
-    void resolveAtLeftEdge_shrinksWindow() {
-      window.register(100);
-      window.markInProgress(100);
-      window.fail(100);
-
-      window.resolveFailure(100);
-      assertEquals(OptionalLong.of(101), window.getCommittableOffset());
-    }
-
-    @Test
-    void resolveNonFailedOffset_throws() {
-      window.register(100);
-      window.markInProgress(100);
-      assertThrows(IllegalStateException.class, () -> window.resolveFailure(100));
     }
   }
 
@@ -259,20 +203,6 @@ class PartitionWindowTest {
   class DrainEdgeCases {
 
     @Test
-    void drain_failedPartition_returnsImmediately() {
-      window.register(100);
-      window.markInProgress(100);
-      window.fail(100);
-
-      long start = System.nanoTime();
-      PartitionDrainResult result = window.drain(Duration.ofSeconds(5));
-      long elapsed = System.nanoTime() - start;
-
-      assertFalse(result.allCompleted());
-      assertTrue(elapsed < Duration.ofSeconds(1).toNanos());
-    }
-
-    @Test
     void drain_noInProgress_completesImmediately() {
       PartitionDrainResult result = window.drain(Duration.ofSeconds(1));
       assertTrue(result.allCompleted());
@@ -309,13 +239,13 @@ class PartitionWindowTest {
 
     @Test
     void markBatchInProgress_thenAckBatch_advancesWindow() {
-      window.registerBatch(100, 104);
-      window.markBatchInProgress(100, 104);
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
 
       assertEquals(0, window.pendingCount());
       assertEquals(5, window.inProgressCount());
 
-      window.ackBatch(100, 104);
+      window.ackBatch(range(100, 104));
       assertEquals(0, window.inProgressCount());
       assertEquals(OptionalLong.of(105), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
@@ -323,8 +253,8 @@ class PartitionWindowTest {
 
     @Test
     void markBatchInProgress_partialRange() {
-      window.registerBatch(100, 109);
-      window.markBatchInProgress(100, 104);
+      window.registerBatch(range(100, 109));
+      window.markBatchInProgress(range(100, 104));
 
       assertEquals(5, window.pendingCount());
       assertEquals(5, window.inProgressCount());
@@ -332,49 +262,54 @@ class PartitionWindowTest {
 
     @Test
     void ackBatch_partialRange_onlyShrinksContinuous() {
-      window.registerBatch(100, 104);
-      window.markBatchInProgress(100, 104);
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
 
       window.ack(100);
       window.ack(101);
       assertEquals(OptionalLong.of(102), window.getCommittableOffset());
 
-      window.ackBatch(102, 104);
+      window.ackBatch(range(102, 104));
       assertEquals(OptionalLong.of(105), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
     }
 
     @Test
-    void markBatchInProgress_onUnregisteredOffset_throws() {
+    void markBatchInProgress_onUnregisteredOffset_isLenient() {
       window.register(100);
-      assertThrows(IllegalStateException.class, () -> window.markBatchInProgress(100, 102));
+      // Only 100 is registered, trying to mark 100, 101, 102
+      int transitioned = window.markBatchInProgress(range(100, 102));
+      assertEquals(1, transitioned); // Only 100 transitioned
+      assertEquals(1, window.inProgressCount());
     }
 
     @Test
-    void ackBatch_onNonInProgressOffset_throws() {
-      window.registerBatch(100, 102);
-      assertThrows(IllegalStateException.class, () -> window.ackBatch(100, 102));
+    void ackBatch_onNonInProgressOffset_isLenient() {
+      window.registerBatch(range(100, 102));
+      // Not marked in-progress
+      int acked = window.ackBatch(range(100, 102));
+      assertEquals(0, acked); // None acked because none were IN_PROGRESS
     }
 
     @Test
     void multipleBatches_sequentially() {
-      window.registerBatch(100, 102);
-      window.markBatchInProgress(100, 102);
-      window.ackBatch(100, 102);
+      window.registerBatch(range(100, 102));
+      window.markBatchInProgress(range(100, 102));
+      window.ackBatch(range(100, 102));
       assertEquals(OptionalLong.of(103), window.getCommittableOffset());
 
-      window.registerBatch(103, 105);
-      window.markBatchInProgress(103, 105);
-      window.ackBatch(103, 105);
+      window.registerBatch(range(103, 105));
+      window.markBatchInProgress(range(103, 105));
+      window.ackBatch(range(103, 105));
       assertEquals(OptionalLong.of(106), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
     }
 
     @Test
     void batchAndSingleRecordInterleaved() {
-      window.registerBatch(100, 104);
-      window.markBatchInProgress(100, 104);
-      window.ackBatch(100, 104);
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
+      window.ackBatch(range(100, 104));
 
       window.register(105);
       window.markInProgress(105);
@@ -387,122 +322,13 @@ class PartitionWindowTest {
     void largeBatch_singleLockAcquisition() {
       int batchSize = 1000;
       window = new PartitionWindow(0, 2000);
-      window.registerBatch(0, batchSize - 1);
-      window.markBatchInProgress(0, batchSize - 1);
-      window.ackBatch(0, batchSize - 1);
+      long[] offsets = range(0, batchSize - 1);
+      window.registerBatch(offsets);
+      window.markBatchInProgress(offsets);
+      window.ackBatch(offsets);
 
       assertEquals(OptionalLong.of(batchSize), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
-    }
-  }
-
-  @Nested
-  class BatchFailureOperations {
-
-    @Test
-    void failBatch_marksAllOffsetsAsFailed() {
-      long[] offsets = {100, 105, 110};
-      window.registerBatch(offsets);
-      window.markBatchInProgress(offsets);
-
-      window.failBatch(offsets);
-
-      assertTrue(window.isFailed());
-      assertEquals(0, window.inProgressCount());
-    }
-
-    @Test
-    void failBatch_nonInProgressOffset_throws() {
-      long[] offsets = {100, 105, 110};
-      window.registerBatch(offsets);
-      // Not marked in-progress
-
-      assertThrows(IllegalStateException.class, () -> window.failBatch(offsets));
-    }
-
-    @Test
-    void resolveBatchFailure_marksAllOffsetsAsDone() {
-      long[] offsets = {100, 105, 110};
-      window.registerBatch(offsets);
-      window.markBatchInProgress(offsets);
-      window.failBatch(offsets);
-
-      window.resolveBatchFailure(offsets);
-
-      assertFalse(window.isFailed());
-      assertEquals(OptionalLong.of(111), window.getCommittableOffset());
-      assertEquals(0, window.windowSize());
-    }
-
-    @Test
-    void resolveBatchFailure_nonFailedOffset_throws() {
-      long[] offsets = {100, 105};
-      window.registerBatch(offsets);
-      window.markBatchInProgress(offsets);
-      // Not failed
-
-      assertThrows(IllegalStateException.class, () -> window.resolveBatchFailure(offsets));
-    }
-
-    @Test
-    void failBatch_thenResolveBatch_fullLifecycle() {
-      long[] offsets = {100, 200, 300};
-      window = new PartitionWindow(100, 100);
-
-      window.registerBatch(offsets);
-      window.markBatchInProgress(offsets);
-
-      // All offsets fail together
-      window.failBatch(offsets);
-      assertTrue(window.isFailed());
-      assertEquals(0, window.inProgressCount());
-
-      // After DLQ/skip, resolve all
-      window.resolveBatchFailure(offsets);
-      assertFalse(window.isFailed());
-      assertEquals(OptionalLong.of(301), window.getCommittableOffset());
-    }
-
-    @Test
-    void failBatch_partialBatch_blocksRemainingOffsets() {
-      // Register two batches
-      long[] batch1 = {100, 105};
-      long[] batch2 = {110, 115};
-      window.registerBatch(batch1);
-      window.registerBatch(batch2);
-      window.markBatchInProgress(batch1);
-      window.markBatchInProgress(batch2);
-
-      // First batch fails, second completes
-      window.failBatch(batch1);
-      window.ackBatch(batch2);
-
-      // Window cannot advance past failed offsets
-      assertTrue(window.isFailed());
-      assertEquals(OptionalLong.empty(), window.getCommittableOffset());
-
-      // Resolve batch1 to unblock
-      window.resolveBatchFailure(batch1);
-      assertEquals(OptionalLong.of(116), window.getCommittableOffset());
-    }
-
-    @Test
-    void failBatch_unknownOffset_throws() {
-      long[] offsets = {100, 999}; // 999 is not registered
-      window.register(100);
-      window.markInProgress(100);
-
-      assertThrows(IllegalStateException.class, () -> window.failBatch(offsets));
-    }
-
-    @Test
-    void resolveBatchFailure_unknownOffset_throws() {
-      long[] offsets = {100, 999}; // 999 is not registered
-      window.register(100);
-      window.markInProgress(100);
-      window.fail(100);
-
-      assertThrows(IllegalStateException.class, () -> window.resolveBatchFailure(offsets));
     }
   }
 
@@ -520,12 +346,9 @@ class PartitionWindowTest {
 
     @Test
     void registerBatchWithArray_nonConsecutiveOffsets_usesMinimalCapacity() {
-      // This is the key bug fix: range-based would create 10001 entries
-      // Array-based only creates 3 entries
       PartitionWindow small = new PartitionWindow(0, 100);
       long[] offsets = {100, 5100, 10100};
 
-      // Should succeed because we only track 3 offsets, not 10001
       assertDoesNotThrow(() -> small.registerBatch(offsets));
       assertEquals(3, small.windowSize());
     }
@@ -548,9 +371,6 @@ class PartitionWindowTest {
       window.ackBatch(offsets);
 
       assertEquals(0, window.inProgressCount());
-      // shrinkWindow removes ALL consecutive DONE entries from the left edge
-      // Since the window only contains 100, 105, 110 (no gaps in the TreeMap),
-      // all are DONE so it shrinks all the way through: committable = 110 + 1 = 111
       assertEquals(OptionalLong.of(111), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
     }
@@ -572,66 +392,56 @@ class PartitionWindowTest {
       long[] offsets = {100, 105, 110}; // 105 already exists
 
       assertThrows(IllegalStateException.class, () -> window.registerBatch(offsets));
-      // Only the original 105 should remain
       assertEquals(1, window.pendingCount());
     }
 
     @Test
-    void markBatchInProgressWithArray_unregisteredOffset_throws() {
+    void markBatchInProgressWithArray_unregisteredOffset_isLenient() {
       long[] registered = {100, 102};
       window.registerBatch(registered);
 
       long[] toMark = {100, 101, 102}; // 101 not registered
-      assertThrows(IllegalStateException.class, () -> window.markBatchInProgress(toMark));
+      int transitioned = window.markBatchInProgress(toMark);
+      assertEquals(2, transitioned); // Only 100 and 102 transitioned
     }
 
     @Test
-    void ackBatchWithArray_notInProgress_throws() {
+    void ackBatchWithArray_notInProgress_isLenient() {
       long[] offsets = {100, 105};
       window.registerBatch(offsets);
       // Not marked in-progress
 
-      assertThrows(IllegalStateException.class, () -> window.ackBatch(offsets));
+      int acked = window.ackBatch(offsets);
+      assertEquals(0, acked);
     }
 
     @Test
     void mixedArrayAndRangeOperations() {
-      // Register using array (non-consecutive)
       long[] offsets1 = {100, 105};
       window.registerBatch(offsets1);
+      window.registerBatch(range(110, 112));
 
-      // Register using range (consecutive)
-      window.registerBatch(110, 112);
+      assertEquals(5, window.windowSize());
 
-      assertEquals(5, window.windowSize()); // 100, 105, 110, 111, 112
-
-      // Mark array batch in progress
       window.markBatchInProgress(offsets1);
       assertEquals(2, window.inProgressCount());
 
-      // Mark range batch in progress
-      window.markBatchInProgress(110, 112);
+      window.markBatchInProgress(range(110, 112));
       assertEquals(5, window.inProgressCount());
 
-      // Ack array batch - all entries are DONE, shrinks through 100, 105
       window.ackBatch(offsets1);
-      // After acking 100 and 105, shrinkWindow removes them
-      // But 110, 111, 112 are still IN_PROGRESS, so shrink stops at 106
       assertEquals(OptionalLong.of(106), window.getCommittableOffset());
       assertEquals(3, window.windowSize());
 
-      // Ack range batch
-      window.ackBatch(110, 112);
-      // Now 110, 111, 112 are DONE, shrinks through all
+      window.ackBatch(range(110, 112));
       assertEquals(OptionalLong.of(113), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
     }
 
     @Test
     void widelySpacedOffsets_fullLifecycle() {
-      // Simulate a Kafka batch with compacted/gapped offsets
       long[] offsets = {1000, 2000, 3000, 4000, 5000};
-      window = new PartitionWindow(1000, 100); // Small window capacity
+      window = new PartitionWindow(1000, 100);
 
       window.registerBatch(offsets);
       assertEquals(5, window.windowSize());
@@ -640,13 +450,119 @@ class PartitionWindowTest {
       assertEquals(5, window.inProgressCount());
 
       window.ackBatch(offsets);
-      // All offsets are DONE. shrinkWindow iterates through TreeMap in order:
-      // 1000 DONE -> remove, committable=1001
-      // 2000 DONE -> remove, committable=2001
-      // ... all the way to 5000
-      // Final committable = 5000 + 1 = 5001
       assertEquals(OptionalLong.of(5001), window.getCommittableOffset());
       assertEquals(0, window.windowSize());
+    }
+  }
+
+  @Nested
+  class CommittedOffsetTracking {
+
+    @Test
+    void getUncommittedOffset_noProgress_empty() {
+      assertEquals(OptionalLong.empty(), window.getUncommittedOffset());
+    }
+
+    @Test
+    void getUncommittedOffset_afterAck_returnsOffset() {
+      window.register(100);
+      window.markInProgress(100);
+      window.ack(100);
+
+      assertEquals(OptionalLong.of(101), window.getUncommittedOffset());
+    }
+
+    @Test
+    void getUncommittedOffset_afterMarkCommitted_empty() {
+      window.register(100);
+      window.markInProgress(100);
+      window.ack(100);
+
+      window.markCommitted(101);
+
+      assertEquals(OptionalLong.empty(), window.getUncommittedOffset());
+    }
+
+    @Test
+    void getUncommittedOffset_partialCommit_returnsNewProgress() {
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
+      window.ackBatch(range(100, 102));
+
+      assertEquals(OptionalLong.of(103), window.getUncommittedOffset());
+
+      window.markCommitted(103);
+
+      assertEquals(OptionalLong.empty(), window.getUncommittedOffset());
+
+      window.ackBatch(range(103, 104));
+
+      assertEquals(OptionalLong.of(105), window.getUncommittedOffset());
+    }
+
+    @Test
+    void markCommitted_usesMax_handlesOutOfOrderCallbacks() {
+      window.registerBatch(range(100, 104));
+      window.markBatchInProgress(range(100, 104));
+      window.ackBatch(range(100, 104));
+
+      window.markCommitted(103);
+      window.markCommitted(105);
+      window.markCommitted(102);
+
+      assertEquals(OptionalLong.empty(), window.getUncommittedOffset());
+    }
+
+    @Test
+    void getUncommittedOffset_commitFailure_stillReturnsOffset() {
+      window.register(100);
+      window.markInProgress(100);
+      window.ack(100);
+
+      assertEquals(OptionalLong.of(101), window.getUncommittedOffset());
+      assertEquals(OptionalLong.of(101), window.getUncommittedOffset());
+    }
+  }
+
+  @Nested
+  class FailedStateTracking {
+
+    @Test
+    void isFailed_initiallyFalse() {
+      assertFalse(window.isFailed());
+    }
+
+    @Test
+    void markFailed_setsFailedFlag() {
+      assertFalse(window.isFailed());
+      window.markFailed();
+      assertTrue(window.isFailed());
+    }
+
+    @Test
+    void failureCount_initiallyZero() {
+      assertEquals(0, window.failureCount());
+    }
+
+    @Test
+    void markFailed_incrementsFailureCount() {
+      assertEquals(0, window.failureCount());
+      window.markFailed();
+      assertEquals(1, window.failureCount());
+      window.markFailed();
+      assertEquals(2, window.failureCount());
+    }
+
+    @Test
+    void failedState_isObservabilityOnly_doesNotAffectProcessing() {
+      window.register(100);
+      window.markInProgress(100);
+
+      window.markFailed();
+      assertTrue(window.isFailed());
+
+      window.ack(100);
+      assertEquals(OptionalLong.of(101), window.getCommittableOffset());
     }
   }
 }

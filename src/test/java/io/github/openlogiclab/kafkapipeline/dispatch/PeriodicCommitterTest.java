@@ -328,18 +328,21 @@ class PeriodicCommitterTest {
             }
           };
 
+      // Use 500ms interval - long enough to avoid race between our two calls,
+      // but short enough for reasonable test speed
       PeriodicCommitter c =
-          new PeriodicCommitter(tracker, spy, Duration.ofMillis(50), NoOpMetricsCollector.INSTANCE);
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofMillis(500), NoOpMetricsCollector.INSTANCE);
       c.start();
 
-      // Wait for flag to be set (scheduler fires every 50ms, wait 200ms to be safe)
-      Thread.sleep(200);
+      // Wait for first scheduler fire
+      Thread.sleep(600);
 
       // First call consumes the flag
       c.maybeCommitAsync();
       int firstCount = asyncCalls.get();
 
-      // Second immediate call should not commit (flag cleared)
+      // Second immediate call should not commit (flag cleared, next scheduler fire is ~400ms away)
       c.maybeCommitAsync();
       int secondCount = asyncCalls.get();
 

@@ -31,6 +31,12 @@ public final class ByteSizeSensor implements BackpressureSensor {
 
   private volatile boolean throttled = false;
 
+  /**
+   * Creates a byte-size backpressure sensor.
+   *
+   * @param config the byte backpressure configuration
+   * @param counter the in-flight counter to read byte counts from
+   */
   public ByteSizeSensor(ByteBackpressureConfig config, InFlightCounter counter) {
     this.config = config;
     this.counter = counter;

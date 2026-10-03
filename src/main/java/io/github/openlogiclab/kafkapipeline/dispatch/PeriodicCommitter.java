@@ -52,6 +52,14 @@ public final class PeriodicCommitter {
   private final AtomicBoolean commitDue = new AtomicBoolean(false);
   private final PipelineMetricsCollector metricsCollector;
 
+  /**
+   * Creates a periodic committer.
+   *
+   * @param offsetTracker the offset tracker to read committable offsets from
+   * @param consumer the Kafka consumer to commit offsets with
+   * @param commitInterval the interval between periodic commits
+   * @param metricsCollector the metrics collector
+   */
   public PeriodicCommitter(
       OffsetTracker offsetTracker,
       Consumer<?, ?> consumer,
@@ -71,6 +79,7 @@ public final class PeriodicCommitter {
             });
   }
 
+  /** Starts the periodic commit scheduler. */
   public void start() {
     if (!running.compareAndSet(false, true)) {
       throw new IllegalStateException("PeriodicCommitter already started");
@@ -82,6 +91,7 @@ public final class PeriodicCommitter {
         System.Logger.Level.INFO, "PeriodicCommitter started with interval {0}ms", intervalMs);
   }
 
+  /** Stops the periodic commit scheduler and waits for termination. */
   public void stop() {
     running.set(false);
     scheduler.shutdown();
@@ -117,8 +127,12 @@ public final class PeriodicCommitter {
   public void commitAsync() {
     if (!running.get()) return;
     try {
-      Map<TopicPartition, OffsetAndMetadata> offsets = buildCommitMap();
-      if (offsets.isEmpty()) return;
+      // Only get offsets that have uncommitted progress
+      Map<TopicPartition, OffsetAndMetadata> offsets = buildUncommittedMap();
+      if (offsets.isEmpty()) {
+        logger.log(System.Logger.Level.DEBUG, "No uncommitted offsets, skipping commit");
+        return;
+      }
 
       consumer.commitAsync(
           offsets,
@@ -128,11 +142,11 @@ public final class PeriodicCommitter {
               logger.log(
                   System.Logger.Level.WARNING, "Async commit failed: {0}", exception.getMessage());
             } else {
+              // Mark as committed in offset tracker
+              committedOffsets.forEach(
+                  (tp, meta) -> offsetTracker.markCommitted(tp, meta.offset()));
               metricsCollector.recordCommitSuccess();
-              logger.log(
-                  System.Logger.Level.DEBUG,
-                  "Committed offsets for {0} partitions",
-                  committedOffsets.size());
+              logger.log(System.Logger.Level.DEBUG, "Committed offsets: {0}", committedOffsets);
             }
           });
     } catch (Exception e) {
@@ -141,22 +155,34 @@ public final class PeriodicCommitter {
     }
   }
 
+  /** Performs a synchronous commit. Must be called from the poll thread. */
   public void commitSync() {
     try {
-      Map<TopicPartition, OffsetAndMetadata> offsets = buildCommitMap();
+      // For sync commits (drain/shutdown), always commit current position
+      Map<TopicPartition, OffsetAndMetadata> offsets = buildAllCommittableMap();
       if (offsets.isEmpty()) return;
 
       consumer.commitSync(offsets);
+      // Mark as committed
+      offsets.forEach((tp, meta) -> offsetTracker.markCommitted(tp, meta.offset()));
       metricsCollector.recordCommitSuccess();
-      logger.log(
-          System.Logger.Level.INFO, "Sync committed offsets for {0} partitions", offsets.size());
+      logger.log(System.Logger.Level.INFO, "Sync committed offsets: {0}", offsets);
     } catch (Exception e) {
       metricsCollector.recordCommitFailure();
       logger.log(System.Logger.Level.ERROR, "Sync commit failed: {0}", e.getMessage());
     }
   }
 
-  private Map<TopicPartition, OffsetAndMetadata> buildCommitMap() {
+  private Map<TopicPartition, OffsetAndMetadata> buildUncommittedMap() {
+    Map<TopicPartition, Long> raw = offsetTracker.getUncommittedOffsets();
+    Map<TopicPartition, OffsetAndMetadata> result = new HashMap<>(raw.size());
+    for (Map.Entry<TopicPartition, Long> entry : raw.entrySet()) {
+      result.put(entry.getKey(), new OffsetAndMetadata(entry.getValue()));
+    }
+    return result;
+  }
+
+  private Map<TopicPartition, OffsetAndMetadata> buildAllCommittableMap() {
     Map<TopicPartition, Long> raw = offsetTracker.getAllCommittableOffsets();
     Map<TopicPartition, OffsetAndMetadata> result = new HashMap<>(raw.size());
     for (Map.Entry<TopicPartition, Long> entry : raw.entrySet()) {

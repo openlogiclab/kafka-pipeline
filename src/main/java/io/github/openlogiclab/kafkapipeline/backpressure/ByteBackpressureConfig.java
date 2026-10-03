@@ -24,10 +24,16 @@ package io.github.openlogiclab.kafkapipeline.backpressure;
  *
  * <p>Size estimation uses {@code ConsumerRecord.serializedKeySize() +
  * ConsumerRecord.serializedValueSize()} — the wire payload size, not Java heap overhead.
+ *
+ * @param highWatermarkBytes total in-flight bytes at which the consumer pauses polling
+ * @param lowWatermarkBytes total in-flight bytes at which the consumer resumes polling
+ * @param criticalThresholdBytes hard ceiling for total in-flight bytes
+ * @param enabled whether byte-level backpressure is active
  */
 public record ByteBackpressureConfig(
     long highWatermarkBytes, long lowWatermarkBytes, long criticalThresholdBytes, boolean enabled) {
 
+  /** Validates configuration constraints. */
   public ByteBackpressureConfig {
     if (enabled) {
       if (lowWatermarkBytes <= 0) {
@@ -53,10 +59,20 @@ public record ByteBackpressureConfig(
     }
   }
 
+  /**
+   * Returns a disabled configuration.
+   *
+   * @return disabled configuration
+   */
   public static ByteBackpressureConfig disabled() {
     return new ByteBackpressureConfig(0, 0, 0, false);
   }
 
+  /**
+   * Returns a new builder.
+   *
+   * @return new builder instance
+   */
   public static Builder builder() {
     return new Builder();
   }
@@ -75,6 +91,9 @@ public record ByteBackpressureConfig(
      * #lowWatermarkBytes}.
      *
      * <p>Default: {@code 256 MB}.
+     *
+     * @param highWatermarkBytes the high watermark in bytes
+     * @return this builder
      */
     public Builder highWatermarkBytes(long highWatermarkBytes) {
       this.highWatermarkBytes = highWatermarkBytes;
@@ -86,6 +105,9 @@ public record ByteBackpressureConfig(
      * between high and low watermarks prevents pause/resume flapping.
      *
      * <p>Default: {@code 128 MB}.
+     *
+     * @param lowWatermarkBytes the low watermark in bytes
+     * @return this builder
      */
     public Builder lowWatermarkBytes(long lowWatermarkBytes) {
       this.lowWatermarkBytes = lowWatermarkBytes;
@@ -96,6 +118,9 @@ public record ByteBackpressureConfig(
      * Hard ceiling for total in-flight bytes. When reached, status escalates to {@code CRITICAL}.
      *
      * <p>Default: {@code 512 MB}.
+     *
+     * @param criticalThresholdBytes the critical threshold in bytes
+     * @return this builder
      */
     public Builder criticalThresholdBytes(long criticalThresholdBytes) {
       this.criticalThresholdBytes = criticalThresholdBytes;
@@ -106,12 +131,20 @@ public record ByteBackpressureConfig(
      * Whether byte-level backpressure is enabled. When using {@link
      * ByteBackpressureConfig#builder()}, defaults to {@code true}. Use {@link
      * ByteBackpressureConfig#disabled()} to explicitly disable.
+     *
+     * @param enabled whether enabled
+     * @return this builder
      */
     public Builder enabled(boolean enabled) {
       this.enabled = enabled;
       return this;
     }
 
+    /**
+     * Builds the configuration.
+     *
+     * @return the configuration
+     */
     public ByteBackpressureConfig build() {
       return new ByteBackpressureConfig(
           highWatermarkBytes, lowWatermarkBytes, criticalThresholdBytes, enabled);

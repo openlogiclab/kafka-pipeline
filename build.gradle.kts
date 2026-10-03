@@ -1,7 +1,7 @@
 plugins {
     `java-library`
     id("jacoco")
-    id("com.diffplug.spotless") version "8.4.0"
+    id("com.diffplug.spotless") version "8.10.3"
     id("com.vanniktech.maven.publish") version "0.37.0"
 }
 
@@ -13,7 +13,7 @@ repositories {
 }
 
 dependencies {
-    api("org.apache.kafka:kafka-clients:4.2.0")
+    api("org.apache.kafka:kafka-clients:4.3.1")
 
     testImplementation(platform("org.junit:junit-bom:6.1.1"))
     testImplementation("org.junit.jupiter:junit-jupiter")

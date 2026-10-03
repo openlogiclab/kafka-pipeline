@@ -27,9 +27,16 @@ package io.github.openlogiclab.kafkapipeline.backpressure;
  * </ul>
  *
  * <p>Use {@link #builder()} for custom values, or {@link #defaults()} for sensible defaults.
+ *
+ * @param highWatermark in-flight record count at which the consumer pauses polling
+ * @param lowWatermark in-flight record count at which the consumer resumes polling
+ * @param criticalThreshold hard ceiling for in-flight records
+ * @param enabled whether record-count backpressure is active
  */
 public record BackpressureConfig(
     int highWatermark, int lowWatermark, int criticalThreshold, boolean enabled) {
+
+  /** Validates configuration constraints. */
   public BackpressureConfig {
     if (enabled) {
       if (lowWatermark <= 0) {
@@ -50,14 +57,29 @@ public record BackpressureConfig(
     }
   }
 
+  /**
+   * Returns a configuration with sensible defaults.
+   *
+   * @return default configuration
+   */
   public static BackpressureConfig defaults() {
     return new BackpressureConfig(10_000, 6_000, 50_000, true);
   }
 
+  /**
+   * Returns a disabled configuration.
+   *
+   * @return disabled configuration
+   */
   public static BackpressureConfig disabled() {
     return new BackpressureConfig(0, 0, 0, false);
   }
 
+  /**
+   * Returns a new builder.
+   *
+   * @return new builder instance
+   */
   public static Builder builder() {
     return new Builder();
   }
@@ -76,6 +98,9 @@ public record BackpressureConfig(
      * #lowWatermark}.
      *
      * <p>Default: {@code 10,000}.
+     *
+     * @param highWatermark the high watermark
+     * @return this builder
      */
     public Builder highWatermark(int highWatermark) {
       this.highWatermark = highWatermark;
@@ -87,6 +112,9 @@ public record BackpressureConfig(
      * between high and low watermarks is the hysteresis band that prevents pause/resume flapping.
      *
      * <p>Default: {@code 6,000}.
+     *
+     * @param lowWatermark the low watermark
+     * @return this builder
      */
     public Builder lowWatermark(int lowWatermark) {
       this.lowWatermark = lowWatermark;
@@ -99,6 +127,9 @@ public record BackpressureConfig(
      * net.
      *
      * <p>Default: {@code 50,000}.
+     *
+     * @param criticalThreshold the critical threshold
+     * @return this builder
      */
     public Builder criticalThreshold(int criticalThreshold) {
       this.criticalThreshold = criticalThreshold;
@@ -108,12 +139,20 @@ public record BackpressureConfig(
     /**
      * Whether record-count backpressure is enabled. Defaults to {@code true}. Disabling is not
      * recommended for concurrent pipelines.
+     *
+     * @param enabled whether enabled
+     * @return this builder
      */
     public Builder enabled(boolean enabled) {
       this.enabled = enabled;
       return this;
     }
 
+    /**
+     * Builds the configuration.
+     *
+     * @return the configuration
+     */
     public BackpressureConfig build() {
       return new BackpressureConfig(highWatermark, lowWatermark, criticalThreshold, enabled);
     }
