@@ -179,7 +179,7 @@ class HeapSensorTest {
       HeapSensor sensor = new HeapSensor(config(), stubBean(800));
       sensor.currentStatus();
       String detail = sensor.statusDetail();
-      assertTrue(detail.contains("[throttled]"), "Should show throttled flag, got: " + detail);
+      assertTrue(detail.contains("THROTTLED"), "Should show throttled flag, got: " + detail);
     }
   }
 

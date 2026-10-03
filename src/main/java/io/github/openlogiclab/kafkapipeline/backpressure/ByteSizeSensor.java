@@ -79,11 +79,12 @@ public final class ByteSizeSensor implements BackpressureSensor {
   @Override
   public String statusDetail() {
     long current = counter.bytes();
+    String status = throttled ? " THROTTLED" : "";
     return formatBytes(current)
-        + "/"
+        + " (threshold="
         + formatBytes(config.highWatermarkBytes())
-        + " in-flight"
-        + (throttled ? " [throttled]" : "");
+        + ")"
+        + status;
   }
 
   private static String formatBytes(long bytes) {

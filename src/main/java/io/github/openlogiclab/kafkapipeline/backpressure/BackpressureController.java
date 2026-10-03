@@ -91,15 +91,14 @@ public final class BackpressureController {
    */
   public String statusSummary() {
     if (!enabled) {
-      return "backpressure=disabled";
+      return "backpressure disabled";
     }
-    StringBuilder sb = new StringBuilder("backpressure{");
+    StringBuilder sb = new StringBuilder();
     for (int i = 0, n = sensors.size(); i < n; i++) {
-      if (i > 0) sb.append(", ");
-      BackpressureSensor s = sensors.get(i);
-      sb.append(s.name()).append('=').append(s.statusDetail());
+      if (i > 0) sb.append(" | ");
+      sb.append(sensors.get(i).statusDetail());
     }
-    return sb.append('}').toString();
+    return sb.toString();
   }
 
   /**

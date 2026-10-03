@@ -134,8 +134,7 @@ class BackpressureControllerTest {
       BackpressureController controller = new BackpressureController(CONFIG, sensor);
 
       String summary = controller.statusSummary();
-      assertTrue(summary.contains("record-count"));
-      assertTrue(summary.contains("42"));
+      assertTrue(summary.contains("42 records"), "Should contain record count: " + summary);
     }
 
     @Test
@@ -143,7 +142,7 @@ class BackpressureControllerTest {
       BackpressureController controller =
           new BackpressureController(BackpressureConfig.disabled(), List.of());
 
-      assertEquals("backpressure=disabled", controller.statusSummary());
+      assertEquals("backpressure disabled", controller.statusSummary());
     }
   }
 

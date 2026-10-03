@@ -177,6 +177,8 @@ class BatchWorkerPoolTest {
 
       assertTrue(done.await(3, TimeUnit.SECONDS));
       assertEquals(5, processed.size());
+      // Wait for counter.completed() which runs after handler returns
+      Thread.sleep(50);
       assertEquals(0, counter.records());
     }
 
