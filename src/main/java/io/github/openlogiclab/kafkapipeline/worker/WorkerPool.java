@@ -41,12 +41,21 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
 
   private static final System.Logger logger = System.getLogger(WorkerPool.class.getName());
 
+  /** The executor for running worker tasks. */
   protected final ExecutorService executor;
+
+  /** Whether the pool is running. */
   protected final AtomicBoolean running = new AtomicBoolean(false);
+
+  /** Number of worker threads. */
   protected final int concurrency;
+
+  /** Thread mode (platform or virtual). */
   protected final ThreadMode threadMode;
 
   /**
+   * Creates a new worker pool.
+   *
    * @param concurrency number of worker threads
    * @param threadMode platform or virtual threads
    * @param threadNamePrefix prefix for thread names
@@ -62,10 +71,21 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
     this.executor = createExecutor(threadMode, concurrency, threadNamePrefix, taskQueueCapacity);
   }
 
+  /** Starts the worker threads. */
   public abstract void start();
 
+  /**
+   * Dispatches records to workers for processing.
+   *
+   * @param records the records to process
+   */
   public abstract void dispatch(ConsumerRecords<K, V> records);
 
+  /**
+   * Stops the worker pool and waits for termination.
+   *
+   * @param timeoutMs max time to wait in milliseconds
+   */
   public void stop(long timeoutMs) {
     running.set(false);
     executor.shutdown();
@@ -83,6 +103,11 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
     }
   }
 
+  /**
+   * Returns whether the pool is running.
+   *
+   * @return true if running
+   */
   public boolean isRunning() {
     return running.get();
   }

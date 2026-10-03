@@ -42,7 +42,9 @@ public interface BatchRecordHandler<K, V> {
    * processed and their offsets will be eligible for commit.
    *
    * <p>If this method throws, the error strategy configured on the pipeline determines what happens
-   * next (retry the entire batch, send to DLQ, fail partition, or skip).
+   * next (retry the entire batch, send to DLQ, then skip). The system never halts — failed batches
+   * are always skipped after invoking the {@link
+   * io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler}.
    *
    * @param partition the source partition for all records in this batch
    * @param records the batch of records to process (never empty, all from the same partition)

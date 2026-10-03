@@ -73,7 +73,13 @@ public interface ProcessingLifecycleHook<K, V> {
    */
   default void onError(ConsumerRecord<K, V> record, ProcessingContext context, Exception error) {}
 
-  /** A no-op hook that proceeds with all records and does nothing on completion/error. */
+  /**
+   * A no-op hook that proceeds with all records and does nothing on completion/error.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   * @return no-op lifecycle hook
+   */
   static <K, V> ProcessingLifecycleHook<K, V> noOp() {
     return new ProcessingLifecycleHook<>() {};
   }

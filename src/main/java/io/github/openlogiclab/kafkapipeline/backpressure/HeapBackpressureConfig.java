@@ -26,10 +26,16 @@ package io.github.openlogiclab.kafkapipeline.backpressure;
  * <p>Heap usage is measured via {@code MemoryMXBean.getHeapMemoryUsage()} which reports {@code
  * used/max} — the ratio of occupied heap to the JVM maximum ({@code -Xmx} or {@code
  * -XX:MaxRAMPercentage}).
+ *
+ * @param throttleThreshold heap usage ratio at which the consumer pauses polling
+ * @param resumeThreshold heap usage ratio at which the consumer resumes polling
+ * @param criticalThreshold heap usage ratio at which status escalates to CRITICAL
+ * @param enabled whether heap backpressure is active
  */
 public record HeapBackpressureConfig(
     double throttleThreshold, double resumeThreshold, double criticalThreshold, boolean enabled) {
 
+  /** Validates configuration constraints. */
   public HeapBackpressureConfig {
     if (enabled) {
       if (resumeThreshold <= 0.0 || resumeThreshold >= 1.0) {
@@ -59,10 +65,20 @@ public record HeapBackpressureConfig(
     }
   }
 
+  /**
+   * Returns a disabled configuration.
+   *
+   * @return disabled configuration
+   */
   public static HeapBackpressureConfig disabled() {
     return new HeapBackpressureConfig(0, 0, 0, false);
   }
 
+  /**
+   * Returns a new builder.
+   *
+   * @return new builder instance
+   */
   public static Builder builder() {
     return new Builder();
   }
@@ -81,6 +97,9 @@ public record HeapBackpressureConfig(
      * #resumeThreshold}.
      *
      * <p>Default: {@code 0.7} (70% heap usage).
+     *
+     * @param throttleThreshold the throttle threshold (0.0-1.0)
+     * @return this builder
      */
     public Builder throttleThreshold(double throttleThreshold) {
       this.throttleThreshold = throttleThreshold;
@@ -92,6 +111,9 @@ public record HeapBackpressureConfig(
      * throttle and resume thresholds prevents pause/resume flapping.
      *
      * <p>Default: {@code 0.5} (50% heap usage).
+     *
+     * @param resumeThreshold the resume threshold (0.0-1.0)
+     * @return this builder
      */
     public Builder resumeThreshold(double resumeThreshold) {
       this.resumeThreshold = resumeThreshold;
@@ -102,6 +124,9 @@ public record HeapBackpressureConfig(
      * Heap usage ratio at which status escalates to {@code CRITICAL}.
      *
      * <p>Default: {@code 0.9} (90% heap usage).
+     *
+     * @param criticalThreshold the critical threshold (0.0-1.0)
+     * @return this builder
      */
     public Builder criticalThreshold(double criticalThreshold) {
       this.criticalThreshold = criticalThreshold;
@@ -112,12 +137,20 @@ public record HeapBackpressureConfig(
      * Whether heap backpressure is enabled. When using {@link HeapBackpressureConfig#builder()},
      * defaults to {@code true}. Use {@link HeapBackpressureConfig#disabled()} to explicitly
      * disable.
+     *
+     * @param enabled whether enabled
+     * @return this builder
      */
     public Builder enabled(boolean enabled) {
       this.enabled = enabled;
       return this;
     }
 
+    /**
+     * Builds the configuration.
+     *
+     * @return the configuration
+     */
     public HeapBackpressureConfig build() {
       return new HeapBackpressureConfig(
           throttleThreshold, resumeThreshold, criticalThreshold, enabled);

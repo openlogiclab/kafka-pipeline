@@ -16,11 +16,12 @@
 package io.github.openlogiclab.kafkapipeline.offset;
 
 import java.time.Duration;
-import java.util.Iterator;
 import java.util.Map;
 import java.util.OptionalLong;
-import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -31,25 +32,31 @@ import java.util.concurrent.locks.ReentrantLock;
  * #getCommittableOffset()} only advances past contiguous DONE entries (like TCP's sliding window —
  * only the left edge moves forward).
  *
- * <p>Thread-safe: all public methods acquire the internal lock.
+ * <p>Thread-safe with fine-grained locking: uses {@link ConcurrentSkipListMap} for lock-free entry
+ * access, atomic counters for lock-free monitoring, and a dedicated lock only for window shrinking
+ * and drain synchronization.
  */
 final class PartitionWindow {
 
-  private final ReentrantLock lock = new ReentrantLock();
-  private final Condition drained = lock.newCondition();
+  private final ReentrantLock registerLock = new ReentrantLock();
+  private final ReentrantLock shrinkLock = new ReentrantLock();
+  private final Condition drained = shrinkLock.newCondition();
 
   static final int DEFAULT_MAX_WINDOW_SIZE = 10_000;
 
   private final long baseOffset;
   private final int maxWindowSize;
-  private long committableOffset;
-  private long highestRegistered = -1;
-  private final TreeMap<Long, OffsetStatus> entries = new TreeMap<>();
+  private final AtomicLong committableOffset;
+  private final AtomicLong highestRegistered = new AtomicLong(-1);
+  private final ConcurrentSkipListMap<Long, OffsetStatus> entries = new ConcurrentSkipListMap<>();
 
-  private int pendingCount = 0;
-  private int inProgressCount = 0;
-  private int completedCount = 0;
-  private boolean failed = false;
+  private final AtomicLong committedOffset; // Last offset confirmed committed to Kafka
+
+  private final AtomicInteger pendingCount = new AtomicInteger(0);
+  private final AtomicInteger inProgressCount = new AtomicInteger(0);
+  private final AtomicInteger completedCount = new AtomicInteger(0);
+  private final AtomicInteger failureCount = new AtomicInteger(0);
+  private volatile boolean failed = false;
 
   PartitionWindow(long startOffset) {
     this(startOffset, DEFAULT_MAX_WINDOW_SIZE);
@@ -60,169 +67,196 @@ final class PartitionWindow {
       throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
     }
     this.baseOffset = startOffset;
-    this.committableOffset = startOffset;
+    this.committableOffset = new AtomicLong(startOffset);
+    this.committedOffset = new AtomicLong(startOffset);
     this.maxWindowSize = maxWindowSize;
   }
 
   void register(long offset) {
-    lock.lock();
+    registerLock.lock();
     try {
-      validateNotFailed();
       validateWindowCapacity(1);
       if (entries.containsKey(offset)) {
         throw new IllegalStateException("Offset " + offset + " already tracked in window");
       }
       entries.put(offset, OffsetStatus.REGISTERED);
-      highestRegistered = Math.max(highestRegistered, offset);
-      pendingCount++;
+      updateHighestRegistered(offset);
+      pendingCount.incrementAndGet();
     } finally {
-      lock.unlock();
+      registerLock.unlock();
     }
   }
 
-  void registerBatch(long fromOffset, long toOffset) {
-    lock.lock();
+  void registerBatch(long[] offsets) {
+    registerLock.lock();
     try {
-      validateNotFailed();
-      int batchSize = (int) (toOffset - fromOffset + 1);
-      validateWindowCapacity(batchSize);
-      for (long offset = fromOffset; offset <= toOffset; offset++) {
+      validateWindowCapacity(offsets.length);
+      for (int i = 0; i < offsets.length; i++) {
+        long offset = offsets[i];
         if (entries.containsKey(offset)) {
-          rollbackBatch(fromOffset, offset);
+          rollbackBatch(offsets, i);
           throw new IllegalStateException("Offset " + offset + " already tracked in window");
         }
         entries.put(offset, OffsetStatus.REGISTERED);
-        pendingCount++;
+        updateHighestRegistered(offset);
+        pendingCount.incrementAndGet();
       }
-      highestRegistered = Math.max(highestRegistered, toOffset);
     } finally {
-      lock.unlock();
+      registerLock.unlock();
     }
   }
 
   void markInProgress(long offset) {
-    lock.lock();
-    try {
-      validateNotFailed();
-      OffsetStatus status = entries.get(offset);
-      if (status != OffsetStatus.REGISTERED) {
-        throw new IllegalStateException(
-            "Cannot mark offset " + offset + " in-progress, current status: " + status);
-      }
-      entries.put(offset, OffsetStatus.IN_PROGRESS);
-      pendingCount--;
-      inProgressCount++;
-    } finally {
-      lock.unlock();
+    OffsetStatus prev =
+        entries.computeIfPresent(
+            offset,
+            (k, status) -> {
+              if (status != OffsetStatus.REGISTERED) {
+                throw new IllegalStateException(
+                    "Cannot mark offset " + offset + " in-progress, current status: " + status);
+              }
+              return OffsetStatus.IN_PROGRESS;
+            });
+    if (prev == null) {
+      throw new IllegalStateException(
+          "Cannot mark offset " + offset + " in-progress, current status: null");
     }
+    pendingCount.decrementAndGet();
+    inProgressCount.incrementAndGet();
   }
 
-  void markBatchInProgress(long fromOffset, long toOffset) {
-    lock.lock();
-    try {
-      validateNotFailed();
-      for (long offset = fromOffset; offset <= toOffset; offset++) {
-        OffsetStatus status = entries.get(offset);
-        if (status != OffsetStatus.REGISTERED) {
-          throw new IllegalStateException(
-              "Cannot mark offset " + offset + " in-progress, current status: " + status);
-        }
-        entries.put(offset, OffsetStatus.IN_PROGRESS);
-        pendingCount--;
-        inProgressCount++;
+  /**
+   * Marks a batch of offsets as IN_PROGRESS. Lenient: skips offsets not in REGISTERED state.
+   *
+   * @return number of offsets actually transitioned
+   */
+  int markBatchInProgress(long[] offsets) {
+    int transitioned = 0;
+    for (long offset : offsets) {
+      boolean[] changed = {false};
+      entries.computeIfPresent(
+          offset,
+          (k, status) -> {
+            if (status == OffsetStatus.REGISTERED) {
+              changed[0] = true;
+              return OffsetStatus.IN_PROGRESS;
+            }
+            return status;
+          });
+      if (changed[0]) {
+        transitioned++;
       }
-    } finally {
-      lock.unlock();
     }
+    if (transitioned > 0) {
+      pendingCount.addAndGet(-transitioned);
+      inProgressCount.addAndGet(transitioned);
+    }
+    return transitioned;
   }
 
   void ack(long offset) {
-    lock.lock();
-    try {
-      OffsetStatus status = entries.get(offset);
-      if (status != OffsetStatus.IN_PROGRESS) {
-        throw new IllegalStateException(
-            "Cannot ack offset " + offset + ", current status: " + status);
-      }
-      entries.put(offset, OffsetStatus.DONE);
-      inProgressCount--;
-      completedCount++;
-
-      if (!entries.isEmpty() && entries.firstKey() == offset) {
-        shrinkWindow();
-      }
-
-      drained.signalAll();
-    } finally {
-      lock.unlock();
+    OffsetStatus prev =
+        entries.computeIfPresent(
+            offset,
+            (k, status) -> {
+              if (status != OffsetStatus.IN_PROGRESS) {
+                throw new IllegalStateException(
+                    "Cannot ack offset " + offset + ", current status: " + status);
+              }
+              return OffsetStatus.DONE;
+            });
+    if (prev == null) {
+      throw new IllegalStateException("Cannot ack offset " + offset + ", current status: null");
     }
-  }
+    int remaining = inProgressCount.decrementAndGet();
+    completedCount.incrementAndGet();
 
-  void ackBatch(long fromOffset, long toOffset) {
-    lock.lock();
-    try {
-      for (long offset = fromOffset; offset <= toOffset; offset++) {
-        OffsetStatus status = entries.get(offset);
-        if (status != OffsetStatus.IN_PROGRESS) {
-          throw new IllegalStateException(
-              "Cannot ack offset " + offset + ", current status: " + status);
-        }
-        entries.put(offset, OffsetStatus.DONE);
-        inProgressCount--;
-        completedCount++;
-      }
-      shrinkWindow();
-      drained.signalAll();
-    } finally {
-      lock.unlock();
-    }
-  }
-
-  void fail(long offset) {
-    lock.lock();
-    try {
-      OffsetStatus status = entries.get(offset);
-      if (status != OffsetStatus.IN_PROGRESS) {
-        throw new IllegalStateException(
-            "Cannot fail offset " + offset + ", current status: " + status);
-      }
-      entries.put(offset, OffsetStatus.FAILED);
-      inProgressCount--;
-      failed = true;
-      drained.signalAll();
-    } finally {
-      lock.unlock();
+    tryShrink();
+    if (remaining == 0) {
+      signalDrained();
     }
   }
 
   /**
-   * Scans the window from the left edge, advancing past contiguous DONE entries. Completed entries
-   * are removed to keep the window compact.
+   * Acks a batch of offsets. Lenient: skips offsets not in IN_PROGRESS state.
    *
-   * @return the offset safe to commit (Kafka semantics: "start from here next time"), or empty if
-   *     no progress since partition init
+   * @return number of offsets actually acked
+   */
+  int ackBatch(long[] offsets) {
+    int transitioned = 0;
+    for (long offset : offsets) {
+      boolean[] changed = {false};
+      entries.computeIfPresent(
+          offset,
+          (k, status) -> {
+            if (status == OffsetStatus.IN_PROGRESS) {
+              changed[0] = true;
+              return OffsetStatus.DONE;
+            }
+            return status;
+          });
+      if (changed[0]) {
+        transitioned++;
+      }
+    }
+    if (transitioned > 0) {
+      int remaining = inProgressCount.addAndGet(-transitioned);
+      completedCount.addAndGet(transitioned);
+      tryShrink();
+      if (remaining == 0) {
+        signalDrained();
+      }
+    }
+    return transitioned;
+  }
+
+  /**
+   * Returns the committable offset if it has advanced since the last confirmed commit. Used for
+   * periodic commits to avoid redundant commits when nothing changed.
+   */
+  OptionalLong getUncommittedOffset() {
+    shrinkLock.lock();
+    try {
+      shrinkWindow();
+      long current = committableOffset.get();
+      long committed = committedOffset.get();
+      if (current > committed) {
+        return OptionalLong.of(current);
+      }
+      return OptionalLong.empty();
+    } finally {
+      shrinkLock.unlock();
+    }
+  }
+
+  /**
+   * Returns the committable offset regardless of whether it was already committed. Used for drain
+   * and shutdown where we always want to commit the final position.
    */
   OptionalLong getCommittableOffset() {
-    lock.lock();
+    shrinkLock.lock();
     try {
       shrinkWindow();
-      return committableOffset > baseOffset
-          ? OptionalLong.of(committableOffset)
-          : OptionalLong.empty();
+      long current = committableOffset.get();
+      return current > baseOffset ? OptionalLong.of(current) : OptionalLong.empty();
     } finally {
-      lock.unlock();
+      shrinkLock.unlock();
     }
   }
 
   /**
-   * Waits for all in-progress records to complete (or timeout). Pending (REGISTERED) records that
-   * were never picked up are counted as abandoned.
+   * Marks an offset as confirmed committed to Kafka. Called from async commit callback. Uses max()
+   * to handle out-of-order callbacks safely.
    */
+  void markCommitted(long offset) {
+    committedOffset.updateAndGet(current -> Math.max(current, offset));
+  }
+
   PartitionDrainResult drain(Duration timeout) {
-    lock.lock();
+    shrinkLock.lock();
     try {
       long deadline = System.nanoTime() + timeout.toNanos();
-      while (inProgressCount > 0 && !failed) {
+      while (inProgressCount.get() > 0) {
         long remaining = deadline - System.nanoTime();
         if (remaining <= 0) {
           break;
@@ -230,135 +264,106 @@ final class PartitionWindow {
         drained.await(remaining, TimeUnit.NANOSECONDS);
       }
       shrinkWindow();
-      boolean allCompleted = inProgressCount == 0 && pendingCount == 0 && !failed;
-      int abandoned = pendingCount + inProgressCount;
+      boolean allCompleted = inProgressCount.get() == 0 && pendingCount.get() == 0;
+      int abandoned = pendingCount.get() + inProgressCount.get();
+      long current = committableOffset.get();
       OptionalLong committable =
-          committableOffset > baseOffset
-              ? OptionalLong.of(committableOffset)
-              : OptionalLong.empty();
-      return new PartitionDrainResult(allCompleted, completedCount, abandoned, committable);
+          current > baseOffset ? OptionalLong.of(current) : OptionalLong.empty();
+      return new PartitionDrainResult(allCompleted, completedCount.get(), abandoned, committable);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      int abandoned = pendingCount + inProgressCount;
+      int abandoned = pendingCount.get() + inProgressCount.get();
+      long current = committableOffset.get();
       OptionalLong committable =
-          committableOffset > baseOffset
-              ? OptionalLong.of(committableOffset)
-              : OptionalLong.empty();
-      return new PartitionDrainResult(false, completedCount, abandoned, committable);
+          current > baseOffset ? OptionalLong.of(current) : OptionalLong.empty();
+      return new PartitionDrainResult(false, completedCount.get(), abandoned, committable);
     } finally {
-      lock.unlock();
+      shrinkLock.unlock();
     }
   }
 
   int pendingCount() {
-    lock.lock();
-    try {
-      return pendingCount;
-    } finally {
-      lock.unlock();
-    }
+    return pendingCount.get();
   }
 
   int inProgressCount() {
-    lock.lock();
-    try {
-      return inProgressCount;
-    } finally {
-      lock.unlock();
-    }
+    return inProgressCount.get();
   }
 
   int windowSize() {
-    lock.lock();
-    try {
-      return entries.size();
-    } finally {
-      lock.unlock();
-    }
+    return entries.size();
   }
 
   boolean isFull() {
-    lock.lock();
-    try {
-      return entries.size() >= maxWindowSize;
-    } finally {
-      lock.unlock();
-    }
+    return entries.size() >= maxWindowSize;
+  }
+
+  /** Returns true if any unrecoverable failure has occurred on this partition. */
+  boolean isFailed() {
+    return failed;
+  }
+
+  /** Records that an unrecoverable failure occurred. Called after FinalFailureHandler. */
+  void markFailed() {
+    failed = true;
+    failureCount.incrementAndGet();
+  }
+
+  /** Number of unrecoverable failures that have occurred on this partition. */
+  int failureCount() {
+    return failureCount.get();
   }
 
   long lag() {
-    lock.lock();
-    try {
-      if (highestRegistered < 0) return 0;
-      return highestRegistered + 1 - committableOffset;
-    } finally {
-      lock.unlock();
-    }
+    long highest = highestRegistered.get();
+    if (highest < 0) return 0;
+    return highest + 1 - committableOffset.get();
   }
 
-  boolean isFailed() {
-    lock.lock();
-    try {
-      return failed;
-    } finally {
-      lock.unlock();
-    }
-  }
-
-  /**
-   * Resolves a FAILED offset by converting it to DONE, allowing the window to advance past it.
-   * Clears the failed state so new records can be accepted.
-   *
-   * @throws IllegalStateException if the offset is not in FAILED state
-   */
-  void resolveFailure(long offset) {
-    lock.lock();
-    try {
-      OffsetStatus status = entries.get(offset);
-      if (status != OffsetStatus.FAILED) {
-        throw new IllegalStateException(
-            "Cannot resolve offset " + offset + ", current status: " + status);
-      }
-      entries.put(offset, OffsetStatus.DONE);
-      completedCount++;
-      failed = false;
-
-      if (!entries.isEmpty() && entries.firstKey() == offset) {
+  /** Best-effort shrink. Non-blocking: skips if lock is held by another thread. */
+  private void tryShrink() {
+    if (shrinkLock.tryLock()) {
+      try {
         shrinkWindow();
+      } finally {
+        shrinkLock.unlock();
       }
+    }
+  }
 
+  /** Signals waiting drain threads. Called when inProgressCount reaches 0. */
+  private void signalDrained() {
+    shrinkLock.lock();
+    try {
       drained.signalAll();
     } finally {
-      lock.unlock();
+      shrinkLock.unlock();
     }
   }
 
-  /**
-   * Advances {@code committableOffset} past contiguous DONE entries at the left edge of the window,
-   * removing them as it goes. Must be called while holding the lock.
-   */
   private void shrinkWindow() {
-    Iterator<Map.Entry<Long, OffsetStatus>> it = entries.entrySet().iterator();
-    while (it.hasNext()) {
-      Map.Entry<Long, OffsetStatus> entry = it.next();
-      if (entry.getValue() != OffsetStatus.DONE) {
+    Map.Entry<Long, OffsetStatus> first;
+    while ((first = entries.firstEntry()) != null && first.getValue() == OffsetStatus.DONE) {
+      if (entries.remove(first.getKey(), OffsetStatus.DONE)) {
+        committableOffset.set(first.getKey() + 1);
+      } else {
         break;
       }
-      committableOffset = entry.getKey() + 1;
-      it.remove();
     }
   }
 
-  private void rollbackBatch(long fromOffset, long failedAt) {
-    for (long offset = fromOffset; offset < failedAt; offset++) {
-      entries.remove(offset);
-      pendingCount--;
-    }
+  private void updateHighestRegistered(long offset) {
+    long current;
+    do {
+      current = highestRegistered.get();
+      if (offset <= current) return;
+    } while (!highestRegistered.compareAndSet(current, offset));
   }
 
-  private void validateNotFailed() {
-    if (failed) {
-      throw new IllegalStateException("Partition window is in failed state");
+  private void rollbackBatch(long[] offsets, int failedAtIndex) {
+    for (int i = 0; i < failedAtIndex; i++) {
+      entries.remove(offsets[i]);
+      pendingCount.decrementAndGet();
     }
   }
 
