@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.apache.kafka.common.TopicPartition;
 
 /**
- * Offset tracker for unordered processing (Mode B).
+ * Offset tracker for unordered processing.
  *
  * <p>Records within a partition can be processed concurrently and acked in any order. Uses a
  * per-partition {@link PartitionWindow} (sliding window) to track individual offset states. The
@@ -36,17 +36,23 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   private final ConcurrentHashMap<TopicPartition, PartitionWindow> partitions =
       new ConcurrentHashMap<>();
 
+  /** Creates a new unordered offset tracker. */
+  public UnorderedOffsetTracker() {}
+
   @Override
   public void register(TopicPartition tp, long offset) {
     getOrThrow(tp).register(offset);
   }
 
   @Override
-  public void registerBatch(TopicPartition tp, long fromOffset, long toOffset) {
-    if (fromOffset > toOffset) {
-      throw new IllegalArgumentException("fromOffset " + fromOffset + " > toOffset " + toOffset);
+  public void registerBatch(TopicPartition tp, long[] offsets) {
+    if (Objects.isNull(offsets)) {
+      throw new IllegalArgumentException("offset cannot be Null");
     }
-    getOrThrow(tp).registerBatch(fromOffset, toOffset);
+    if (offsets.length == 0) {
+      throw new IllegalArgumentException("offset cannot be empty");
+    }
+    getOrThrow(tp).registerBatch(offsets);
   }
 
   @Override
@@ -55,8 +61,8 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
-  public void markBatchInProgress(TopicPartition tp, long fromOffset, long toOffset) {
-    getOrThrow(tp).markBatchInProgress(fromOffset, toOffset);
+  public int markBatchInProgress(TopicPartition tp, long[] offsets) {
+    return getOrThrow(tp).markBatchInProgress(offsets);
   }
 
   @Override
@@ -65,18 +71,8 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
-  public void ackBatch(TopicPartition tp, long fromOffset, long toOffset) {
-    getOrThrow(tp).ackBatch(fromOffset, toOffset);
-  }
-
-  @Override
-  public void fail(TopicPartition tp, long offset) {
-    getOrThrow(tp).fail(offset);
-  }
-
-  @Override
-  public void resolveFailure(TopicPartition tp, long offset) {
-    getOrThrow(tp).resolveFailure(offset);
+  public int ackBatch(TopicPartition tp, long[] offsets) {
+    return getOrThrow(tp).ackBatch(offsets);
   }
 
   @Override
@@ -98,6 +94,26 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
           .ifPresent(offset -> result.put(entry.getKey(), offset));
     }
     return result;
+  }
+
+  @Override
+  public Map<TopicPartition, Long> getUncommittedOffsets() {
+    Map<TopicPartition, Long> result = new HashMap<>();
+    for (Map.Entry<TopicPartition, PartitionWindow> entry : partitions.entrySet()) {
+      entry
+          .getValue()
+          .getUncommittedOffset()
+          .ifPresent(offset -> result.put(entry.getKey(), offset));
+    }
+    return result;
+  }
+
+  @Override
+  public void markCommitted(TopicPartition tp, long offset) {
+    PartitionWindow window = partitions.get(tp);
+    if (window != null) {
+      window.markCommitted(offset);
+    }
   }
 
   @Override
@@ -155,6 +171,23 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   public long lag(TopicPartition tp) {
     PartitionWindow window = partitions.get(tp);
     return window != null ? window.lag() : 0;
+  }
+
+  @Override
+  public boolean isFailed(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null && window.isFailed();
+  }
+
+  @Override
+  public void markFailed(TopicPartition tp) {
+    getOrThrow(tp).markFailed();
+  }
+
+  @Override
+  public int failureCount(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.failureCount() : 0;
   }
 
   private PartitionWindow getOrThrow(TopicPartition tp) {

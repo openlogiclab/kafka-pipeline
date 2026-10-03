@@ -70,8 +70,8 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  *       io.github.openlogiclab.kafkapipeline.ThreadMode#VIRTUAL VIRTUAL} threads
  *   <li><b>Backpressure</b> — record-count hysteresis (high/low watermark) pauses the consumer when
  *       workers fall behind
- *   <li><b>Error handling</b> — retry with exponential backoff, optional DLQ hook, then skip or
- *       fail-partition as a final fallback
+ *   <li><b>Error handling</b> — retry with exponential backoff, optional DLQ, then {@link
+ *       io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler} and skip
  *   <li><b>Offset management</b> — unordered sliding-window tracker with monotonic commit
  *       guarantees and periodic async commits
  *   <li><b>Lifecycle hooks</b> — {@link
@@ -95,7 +95,6 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  *             .retryBackoff(Duration.ofSeconds(1))
  *             .exponentialBackoff(true)
  *             .dlqHandler((record, error) -> dlqProducer.send(record))
- *             .fallback(Fallback.SKIP)
  *             .build())
  *         .build());
  *
@@ -142,7 +141,14 @@ public final class KafkaPipeline<K, V> {
 
   private Consumer<K, V> consumer;
   private PeriodicCommitter committer;
+  private PipelineRebalanceListener rebalanceListener;
+  private Thread shutdownHook;
 
+  /**
+   * Creates a new pipeline with the given configuration.
+   *
+   * @param config the pipeline configuration
+   */
   public KafkaPipeline(PipelineConfig<K, V> config) {
     this.config = config;
     this.consumer = null;
@@ -188,11 +194,18 @@ public final class KafkaPipeline<K, V> {
             config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
   }
 
+  /**
+   * Returns a new configuration builder.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   * @return new builder instance
+   */
   public static <K, V> PipelineConfig.Builder<K, V> builder() {
     return PipelineConfig.builder();
   }
 
-  /** Start the pipeline. Blocks the calling thread until {@link #stop()} is called. */
+  /** Starts the pipeline. Blocks the calling thread until {@link #stop()} is called. */
   public void start() {
     if (!running.compareAndSet(false, true)) {
       throw new IllegalStateException("Pipeline already started");
@@ -221,7 +234,11 @@ public final class KafkaPipeline<K, V> {
     }
   }
 
-  /** Start the pipeline on a daemon thread. Returns immediately. */
+  /**
+   * Starts the pipeline on a daemon thread. Returns immediately.
+   *
+   * @return the daemon thread running the pipeline
+   */
   public Thread startAsync() {
     Thread thread = new Thread(this::start);
     thread.setName("kafka-pipeline-main");
@@ -231,7 +248,7 @@ public final class KafkaPipeline<K, V> {
   }
 
   /**
-   * Signal the pipeline to stop gracefully. The poll loop will exit, workers will drain, and
+   * Signals the pipeline to stop gracefully. The poll loop will exit, workers will drain, and
    * offsets will be committed.
    */
   public void stop() {
@@ -243,11 +260,20 @@ public final class KafkaPipeline<K, V> {
     }
   }
 
-  /** Block until the pipeline has fully shut down. */
+  /**
+   * Blocks until the pipeline has fully shut down.
+   *
+   * @throws InterruptedException if the current thread is interrupted while waiting
+   */
   public void awaitShutdown() throws InterruptedException {
     shutdownLatch.await();
   }
 
+  /**
+   * Returns whether the pipeline is running.
+   *
+   * @return true if the pipeline is running
+   */
   public boolean isRunning() {
     return running.get();
   }
@@ -258,6 +284,7 @@ public final class KafkaPipeline<K, V> {
    * <p>This method is safe to call from any thread at any time, including before {@link #start()}.
    * Each call reads the current counter values — no background threads or timers involved.
    *
+   * @return current metrics snapshot
    * @see PipelineMetrics
    */
   public PipelineMetrics metrics() {
@@ -319,7 +346,7 @@ public final class KafkaPipeline<K, V> {
     committer =
         new PeriodicCommitter(offsetTracker, consumer, config.commitInterval(), metricsCollector);
 
-    PipelineRebalanceListener rebalanceListener =
+    rebalanceListener =
         new PipelineRebalanceListener(
             offsetTracker,
             dispatcher,
@@ -337,6 +364,9 @@ public final class KafkaPipeline<K, V> {
 
     while (running.get()) {
       try {
+        // Perform any pending periodic commits on the poll thread (thread-safe)
+        committer.maybeCommitAsync();
+
         if (backpressure.shouldThrottle()) {
           if (!paused) {
             consumer.pause(consumer.assignment());
@@ -401,6 +431,14 @@ public final class KafkaPipeline<K, V> {
       logger.log(System.Logger.Level.WARNING, "Error during final commit", e);
     }
 
+    if (rebalanceListener != null) {
+      try {
+        rebalanceListener.shutdown();
+      } catch (Exception e) {
+        logger.log(System.Logger.Level.WARNING, "Error shutting down rebalance listener", e);
+      }
+    }
+
     if (ownsConsumer) {
       try {
         consumer.close(
@@ -410,22 +448,34 @@ public final class KafkaPipeline<K, V> {
       }
     }
 
+    removeShutdownHook();
+
     logger.log(System.Logger.Level.INFO, "Pipeline shut down complete");
   }
 
   private void registerShutdownHook() {
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(
-                () -> {
-                  logger.log(System.Logger.Level.INFO, "Shutdown hook triggered");
-                  stop();
-                  try {
-                    awaitShutdown();
-                  } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                  }
-                },
-                "kafka-pipeline-shutdown"));
+    shutdownHook =
+        new Thread(
+            () -> {
+              logger.log(System.Logger.Level.INFO, "Shutdown hook triggered");
+              stop();
+              try {
+                awaitShutdown();
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              }
+            },
+            "kafka-pipeline-shutdown");
+    Runtime.getRuntime().addShutdownHook(shutdownHook);
+  }
+
+  private void removeShutdownHook() {
+    if (shutdownHook != null) {
+      try {
+        Runtime.getRuntime().removeShutdownHook(shutdownHook);
+      } catch (IllegalStateException e) {
+        // JVM is already shutting down, ignore
+      }
+    }
   }
 }

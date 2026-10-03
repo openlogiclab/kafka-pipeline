@@ -20,6 +20,11 @@ import java.util.OptionalLong;
 /**
  * Result of draining a partition during rebalance or shutdown. Reports how many records completed
  * vs. were abandoned (still pending/in-progress at timeout).
+ *
+ * @param allCompleted true if all in-flight records completed before timeout
+ * @param completedCount number of records that completed processing
+ * @param abandonedCount number of records still pending or in-progress at timeout
+ * @param committableOffset the offset safe to commit, or empty if no progress
  */
 public record PartitionDrainResult(
     boolean allCompleted, int completedCount, int abandonedCount, OptionalLong committableOffset) {
@@ -27,6 +32,8 @@ public record PartitionDrainResult(
   /**
    * The offset safe to commit for this partition, or empty if no progress was made. This value
    * follows Kafka semantics: committing N means "next poll starts from N".
+   *
+   * @return the committable offset, or empty if no progress
    */
   @Override
   public OptionalLong committableOffset() {
