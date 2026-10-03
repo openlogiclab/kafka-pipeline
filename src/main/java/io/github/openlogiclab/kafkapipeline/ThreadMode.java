@@ -18,8 +18,6 @@ package io.github.openlogiclab.kafkapipeline;
 /**
  * Controls which thread type the worker pool uses.
  *
- * <p>
- *
  * <ul>
  *   <li>{@link #PLATFORM} — OS-level threads (default). Fixed pool of {@code concurrency} threads.
  *       Best for CPU-bound handlers or when you need predictable thread count.

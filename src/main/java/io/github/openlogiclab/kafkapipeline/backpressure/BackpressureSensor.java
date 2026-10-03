@@ -24,12 +24,24 @@ package io.github.openlogiclab.kafkapipeline.backpressure;
  */
 public interface BackpressureSensor {
 
-  /** Evaluate current pressure level. Must be O(1) and lock-free for hot-path performance. */
+  /**
+   * Evaluates current pressure level. Must be O(1) and lock-free for hot-path performance.
+   *
+   * @return the current backpressure status
+   */
   BackpressureStatus currentStatus();
 
-  /** Short identifier for logging and metrics (e.g. "record-count"). */
+  /**
+   * Returns a short identifier for logging and metrics (e.g. "record-count").
+   *
+   * @return the sensor name
+   */
   String name();
 
-  /** Human-readable detail for the current status (e.g. "12000/10000 in-flight"). */
+  /**
+   * Returns human-readable detail for the current status (e.g. "12000/10000 in-flight").
+   *
+   * @return status detail string
+   */
   String statusDetail();
 }

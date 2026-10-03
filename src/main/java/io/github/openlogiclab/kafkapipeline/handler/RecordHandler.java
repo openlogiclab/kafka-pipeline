@@ -46,7 +46,9 @@ public interface RecordHandler<K, V> {
    * offset will be eligible for commit.
    *
    * <p>If this method throws, the error strategy configured on the pipeline determines what happens
-   * next (retry, send to DLQ, fail partition, or skip).
+   * next (retry, send to DLQ, then skip). The system never halts — failed records are always
+   * skipped after invoking the {@link
+   * io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler}.
    *
    * @param record the Kafka record to process
    * @throws Exception if processing fails
