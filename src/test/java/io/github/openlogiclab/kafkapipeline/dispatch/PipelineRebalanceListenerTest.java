@@ -158,5 +158,41 @@ class PipelineRebalanceListenerTest {
       assertEquals(1, commitSyncCalls.get());
       assertTrue(dispatcher.partitions().isEmpty());
     }
+
+    @Test
+    void revokeWithInProgressRecords_drainCompletes() {
+      mockConsumer.assign(List.of(TP0));
+      mockConsumer.updateBeginningOffsets(Map.of(TP0, 0L));
+      listener.onPartitionsAssigned(List.of(TP0));
+
+      tracker.register(TP0, 0);
+      tracker.register(TP0, 1);
+      tracker.markInProgress(TP0, 0);
+      tracker.markInProgress(TP0, 1);
+
+      // Complete both records before drain
+      tracker.ack(TP0, 0);
+      tracker.ack(TP0, 1);
+      counter.registered(2, 0);
+
+      listener.onPartitionsRevoked(List.of(TP0));
+
+      assertEquals(1, commitSyncCalls.get());
+    }
+  }
+
+  @Nested
+  class Shutdown {
+
+    @Test
+    void shutdown_stopsExecutor() {
+      assertDoesNotThrow(() -> listener.shutdown());
+    }
+
+    @Test
+    void shutdown_isIdempotent() {
+      listener.shutdown();
+      assertDoesNotThrow(() -> listener.shutdown());
+    }
   }
 }

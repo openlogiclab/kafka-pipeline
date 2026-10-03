@@ -59,7 +59,7 @@ public class PipelineMetricsCollector {
   private final LongAdder retryAttempts = new LongAdder();
   private final LongAdder dlqSuccesses = new LongAdder();
   private final LongAdder dlqFailures = new LongAdder();
-  private final LongAdder partitionFailures = new LongAdder();
+  private final LongAdder finalFailures = new LongAdder();
   private final LongAdder commitSuccesses = new LongAdder();
   private final LongAdder commitFailures = new LongAdder();
 
@@ -71,6 +71,13 @@ public class PipelineMetricsCollector {
   // ── Partition tracking ────────────────────────────────────────
   private final Set<TopicPartition> assignedPartitions = ConcurrentHashMap.newKeySet();
 
+  /**
+   * Creates a metrics collector.
+   *
+   * @param inFlightCounter the in-flight counter
+   * @param backpressureController the backpressure controller
+   * @param offsetTracker the offset tracker
+   */
   public PipelineMetricsCollector(
       InFlightCounter inFlightCounter,
       BackpressureController backpressureController,
@@ -82,80 +89,139 @@ public class PipelineMetricsCollector {
 
   // ── Hot-path write methods ────────────────────────────────────
 
+  /**
+   * Records successfully processed records.
+   *
+   * @param count number of records processed
+   */
   public void recordProcessed(long count) {
     recordsProcessed.add(count);
   }
 
-  public void recordFailed() {
-    recordsFailed.increment();
+  /**
+   * Records failed records (after all retries and DLQ attempts).
+   *
+   * @param count number of records failed
+   */
+  public void recordFailed(int count) {
+    recordsFailed.add(count);
   }
 
-  public void recordSkipped() {
-    recordsSkipped.increment();
+  /**
+   * Records skipped records.
+   *
+   * @param count number of records skipped
+   */
+  public void recordSkipped(int count) {
+    recordsSkipped.add(count);
   }
 
+  /** Records a poll operation. */
   public void recordPoll() {
     pollCount.increment();
   }
 
+  /** Records an empty poll (no records returned). */
   public void recordEmptyPoll() {
     emptyPollCount.increment();
   }
 
+  /** Records a throttle event (backpressure triggered). */
   public void recordThrottle() {
     throttleCount.increment();
   }
 
+  /** Records a retry attempt. */
   public void recordRetry() {
     retryAttempts.increment();
   }
 
-  public void recordDlqSuccess() {
-    dlqSuccesses.increment();
+  /**
+   * Records successful DLQ sends.
+   *
+   * @param count number of records sent to DLQ
+   */
+  public void recordDlqSuccess(int count) {
+    dlqSuccesses.add(count);
   }
 
-  public void recordDlqFailure() {
-    dlqFailures.increment();
+  /**
+   * Records failed DLQ sends.
+   *
+   * @param count number of records that failed to send to DLQ
+   */
+  public void recordDlqFailure(int count) {
+    dlqFailures.add(count);
   }
 
-  public void recordPartitionFailure() {
-    partitionFailures.increment();
+  /** Records a final failure (record dropped after all recovery attempts). */
+  public void recordFinalFailure() {
+    finalFailures.increment();
   }
 
+  /** Records a successful offset commit. */
   public void recordCommitSuccess() {
     commitSuccesses.increment();
   }
 
+  /** Records a failed offset commit. */
   public void recordCommitFailure() {
     commitFailures.increment();
   }
 
+  /** Records a rebalance event. */
   public void recordRebalance() {
     rebalanceCount.increment();
   }
 
+  /** Records a drain timeout event. */
   public void recordDrainTimeout() {
     drainTimeouts.increment();
   }
 
+  /**
+   * Records abandoned records during drain.
+   *
+   * @param count number of records abandoned
+   */
   public void recordAbandoned(long count) {
     recordsAbandoned.add(count);
   }
 
+  /**
+   * Records a partition assignment.
+   *
+   * @param tp the assigned partition
+   */
   public void partitionAssigned(TopicPartition tp) {
     assignedPartitions.add(tp);
   }
 
+  /**
+   * Records a partition revocation.
+   *
+   * @param tp the revoked partition
+   */
   public void partitionRevoked(TopicPartition tp) {
     assignedPartitions.remove(tp);
   }
 
   // ── Snapshot (cold path) ──────────────────────────────────────
 
+  /**
+   * Creates an immutable snapshot of current metrics.
+   *
+   * @return current metrics snapshot
+   */
   public PipelineMetrics snapshot() {
     Map<TopicPartition, Long> lags = new HashMap<>();
+    Map<TopicPartition, Integer> failures = new HashMap<>();
     for (TopicPartition tp : Set.copyOf(assignedPartitions)) {
       lags.put(tp, offsetTracker.lag(tp));
+      int failureCount = offsetTracker.failureCount(tp);
+      if (failureCount > 0) {
+        failures.put(tp, failureCount);
+      }
     }
 
     return new PipelineMetrics(
@@ -169,10 +235,11 @@ public class PipelineMetricsCollector {
         backpressureController.evaluate(),
         throttleCount.sum(),
         Map.copyOf(lags),
+        Map.copyOf(failures),
         retryAttempts.sum(),
         dlqSuccesses.sum(),
         dlqFailures.sum(),
-        partitionFailures.sum(),
+        finalFailures.sum(),
         commitSuccesses.sum(),
         commitFailures.sum(),
         rebalanceCount.sum(),

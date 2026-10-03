@@ -69,15 +69,27 @@ class PipelineMetricsCollectorTest {
 
     @Test
     void recordFailedIncrements() {
-      collector.recordFailed();
-      collector.recordFailed();
+      collector.recordFailed(1);
+      collector.recordFailed(1);
       assertEquals(2, collector.snapshot().recordsFailed());
     }
 
     @Test
+    void recordFailedWithCount() {
+      collector.recordFailed(5);
+      assertEquals(5, collector.snapshot().recordsFailed());
+    }
+
+    @Test
     void recordSkippedIncrements() {
-      collector.recordSkipped();
+      collector.recordSkipped(1);
       assertEquals(1, collector.snapshot().recordsSkipped());
+    }
+
+    @Test
+    void recordSkippedWithCount() {
+      collector.recordSkipped(3);
+      assertEquals(3, collector.snapshot().recordsSkipped());
     }
 
     @Test
@@ -135,6 +147,27 @@ class PipelineMetricsCollectorTest {
       assertTrue(m.partitionLags().containsKey(TP0));
       assertTrue(m.partitionLags().get(TP0) >= 0);
     }
+
+    @Test
+    void partitionFailuresReflectOffsetTracker() {
+      offsetTracker.initPartition(TP0, 0);
+      offsetTracker.initPartition(TP1, 0);
+      collector.partitionAssigned(TP0);
+      collector.partitionAssigned(TP1);
+
+      // No failures yet
+      PipelineMetrics m1 = collector.snapshot();
+      assertTrue(m1.partitionFailures().isEmpty());
+
+      // Mark failures on TP0
+      offsetTracker.markFailed(TP0);
+      offsetTracker.markFailed(TP0);
+
+      PipelineMetrics m2 = collector.snapshot();
+      assertEquals(1, m2.partitionFailures().size());
+      assertEquals(2, m2.partitionFailures().get(TP0));
+      assertFalse(m2.partitionFailures().containsKey(TP1));
+    }
   }
 
   @Nested
@@ -150,9 +183,9 @@ class PipelineMetricsCollectorTest {
 
     @Test
     void dlqCounters() {
-      collector.recordDlqSuccess();
-      collector.recordDlqSuccess();
-      collector.recordDlqFailure();
+      collector.recordDlqSuccess(1);
+      collector.recordDlqSuccess(1);
+      collector.recordDlqFailure(1);
 
       PipelineMetrics m = collector.snapshot();
       assertEquals(2, m.dlqSuccesses());
@@ -160,9 +193,19 @@ class PipelineMetricsCollectorTest {
     }
 
     @Test
-    void partitionFailureIncrements() {
-      collector.recordPartitionFailure();
-      assertEquals(1, collector.snapshot().partitionFailures());
+    void dlqCountersWithBatchCounts() {
+      collector.recordDlqSuccess(5);
+      collector.recordDlqFailure(3);
+
+      PipelineMetrics m = collector.snapshot();
+      assertEquals(5, m.dlqSuccesses());
+      assertEquals(3, m.dlqFailures());
+    }
+
+    @Test
+    void finalFailureIncrements() {
+      collector.recordFinalFailure();
+      assertEquals(1, collector.snapshot().finalFailures());
     }
 
     @Test
@@ -238,10 +281,11 @@ class PipelineMetricsCollectorTest {
       assertEquals(BackpressureStatus.OK, m.backpressureStatus());
       assertEquals(0, m.throttleCount());
       assertTrue(m.partitionLags().isEmpty());
+      assertTrue(m.partitionFailures().isEmpty());
       assertEquals(0, m.retryAttempts());
       assertEquals(0, m.dlqSuccesses());
       assertEquals(0, m.dlqFailures());
-      assertEquals(0, m.partitionFailures());
+      assertEquals(0, m.finalFailures());
       assertEquals(0, m.commitSuccesses());
       assertEquals(0, m.commitFailures());
       assertEquals(0, m.rebalanceCount());

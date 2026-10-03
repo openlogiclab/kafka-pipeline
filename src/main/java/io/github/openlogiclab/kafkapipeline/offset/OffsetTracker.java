@@ -23,21 +23,16 @@ import org.apache.kafka.common.TopicPartition;
 /**
  * Central source of truth for record lifecycle and offset commit safety.
  *
- * <p>Every record flows through: REGISTERED → IN_PROGRESS → DONE (or FAILED). The tracker ensures
- * that {@link #getCommittableOffset} never returns an offset beyond contiguous completed records,
- * preventing silent data loss on crash/rebalance.
+ * <p>Every record flows through: REGISTERED → IN_PROGRESS → DONE. The tracker ensures that {@link
+ * #getCommittableOffset} never returns an offset beyond contiguous completed records, preventing
+ * silent data loss on crash/rebalance.
  *
- * <p>Two implementations exist:
- *
- * <ul>
- *   <li>{@link SequentialOffsetTracker} — one record in-progress per partition (ordered)
- *   <li>{@link UnorderedOffsetTracker} — concurrent processing per partition (sliding window)
- * </ul>
+ * <p>Uses a sliding window approach that supports concurrent out-of-order processing per partition.
  *
  * <p>All methods are thread-safe. Offset values follow Kafka commit semantics: committing N means
  * "next poll starts from offset N".
  */
-public sealed interface OffsetTracker permits SequentialOffsetTracker, UnorderedOffsetTracker {
+public sealed interface OffsetTracker permits UnorderedOffsetTracker {
 
   // ── Poller calls ──────────────────────────────────────────────
 
@@ -45,67 +40,60 @@ public sealed interface OffsetTracker permits SequentialOffsetTracker, Unordered
    * Registers a single offset as REGISTERED (pending dispatch to a worker). Must be called before
    * the record is dispatched.
    *
+   * @param tp the topic partition
+   * @param offset the offset to register
    * @throws IllegalStateException if the partition is not initialized or offset is duplicate
    */
   void register(TopicPartition tp, long offset);
 
   /**
-   * Registers a contiguous range of offsets [fromOffset, toOffset] inclusive.
+   * Registers a batch of offsets.
    *
-   * @throws IllegalArgumentException if fromOffset > toOffset
+   * @param tp the topic partition
+   * @param offsets the offsets to register
+   * @throws IllegalArgumentException if offsets is empty or null
    * @throws IllegalStateException if any offset in the range overlaps with existing entries
    */
-  void registerBatch(TopicPartition tp, long fromOffset, long toOffset);
+  void registerBatch(TopicPartition tp, long[] offsets);
 
   // ── Worker calls ──────────────────────────────────────────────
 
   /**
    * Marks an offset as IN_PROGRESS (worker has picked it up).
    *
+   * @param tp the topic partition
+   * @param offset the offset to mark
    * @throws IllegalStateException if the offset is not in REGISTERED state
    */
   void markInProgress(TopicPartition tp, long offset);
 
   /**
-   * Marks a contiguous range of offsets [fromOffset, toOffset] as IN_PROGRESS under a single lock
-   * acquisition. Used by batch processing mode for efficiency.
+   * Marks a batch of offsets as IN_PROGRESS. Lenient: skips offsets not in REGISTERED state.
    *
-   * @throws IllegalStateException if any offset in the range is not in REGISTERED state
+   * @param tp the topic partition
+   * @param offsets the offsets to mark
+   * @return number of offsets actually transitioned
    */
-  void markBatchInProgress(TopicPartition tp, long fromOffset, long toOffset);
+  int markBatchInProgress(TopicPartition tp, long[] offsets);
 
   /**
-   * Marks an offset as DONE (processing succeeded, DLQ succeeded, or skipped). This advances the
+   * Marks an offset as DONE (processing succeeded, sent to DLQ, or skipped). This advances the
    * committable offset if the acked record is contiguous with previously completed records.
    *
+   * @param tp the topic partition
+   * @param offset the offset to ack
    * @throws IllegalStateException if the offset is not in IN_PROGRESS state
    */
   void ack(TopicPartition tp, long offset);
 
   /**
-   * Marks a contiguous range of offsets [fromOffset, toOffset] as DONE under a single lock
-   * acquisition. Used by batch processing mode for efficiency.
+   * Marks a batch of offsets as DONE. Lenient: skips offsets not in IN_PROGRESS state.
    *
-   * @throws IllegalStateException if any offset in the range is not in IN_PROGRESS state
+   * @param tp the topic partition
+   * @param offsets the offsets to ack
+   * @return number of offsets actually acked
    */
-  void ackBatch(TopicPartition tp, long fromOffset, long toOffset);
-
-  /**
-   * Marks an offset as FAILED and puts the partition into failed state. No further records will be
-   * accepted for this partition until it is cleared or the failure is resolved via {@link
-   * #resolveFailure}.
-   *
-   * @throws IllegalStateException if the offset is not in IN_PROGRESS state
-   */
-  void fail(TopicPartition tp, long offset);
-
-  /**
-   * Resolves a previously failed offset by treating it as DONE (e.g., after sending to DLQ or
-   * deciding to skip). Clears the partition's failed state so processing can resume.
-   *
-   * @throws IllegalStateException if the offset is not in FAILED state
-   */
-  void resolveFailure(TopicPartition tp, long offset);
+  int ackBatch(TopicPartition tp, long[] offsets);
 
   // ── Committer calls ───────────────────────────────────────────
 
@@ -115,20 +103,43 @@ public sealed interface OffsetTracker permits SequentialOffsetTracker, Unordered
    *
    * <p>The returned value follows Kafka semantics: committing N means "all records before N are
    * processed; start from N on next poll".
+   *
+   * @param tp the topic partition
+   * @return the committable offset, or empty if no progress
    */
   OptionalLong getCommittableOffset(TopicPartition tp);
 
   /**
    * Returns committable offsets for all tracked partitions that have made progress. Partitions with
    * no progress are omitted from the result.
+   *
+   * @return map of partition to committable offset
    */
   Map<TopicPartition, Long> getAllCommittableOffsets();
+
+  /**
+   * Returns committable offsets only for partitions that have uncommitted progress (offset advanced
+   * since last {@link #markCommitted} call). Used for periodic commits to avoid redundant commits.
+   *
+   * @return map of partition to uncommitted offset
+   */
+  Map<TopicPartition, Long> getUncommittedOffsets();
+
+  /**
+   * Marks an offset as confirmed committed to Kafka. Called from async commit callback. Should be
+   * called for each partition after a successful commit.
+   *
+   * @param tp the topic partition
+   * @param offset the committed offset
+   */
+  void markCommitted(TopicPartition tp, long offset);
 
   // ── Rebalance / Lifecycle ─────────────────────────────────────
 
   /**
    * Initializes tracking for a newly assigned partition. Called from {@code onPartitionsAssigned}.
    *
+   * @param tp the topic partition
    * @param startOffset the offset from which this consumer will start polling
    * @throws IllegalStateException if the partition is already initialized
    */
@@ -138,26 +149,68 @@ public sealed interface OffsetTracker permits SequentialOffsetTracker, Unordered
    * Waits for in-progress records on this partition to complete, up to the given timeout. Returns a
    * summary of how many records completed vs. were abandoned. Called from {@code
    * onPartitionsRevoked} before committing final offsets.
+   *
+   * @param tp the topic partition
+   * @param timeout the maximum time to wait
+   * @return result containing completion and abandonment counts
    */
   PartitionDrainResult drainPartition(TopicPartition tp, Duration timeout);
 
   /**
    * Removes all tracking state for this partition. Called after drain + commit during rebalance, or
    * during shutdown cleanup.
+   *
+   * @param tp the topic partition
    */
   void clearPartition(TopicPartition tp);
 
   // ── Monitoring ────────────────────────────────────────────────
 
-  /** Number of records in REGISTERED state (dispatched to queue but not yet picked up). */
+  /**
+   * Number of records in REGISTERED state (dispatched to queue but not yet picked up).
+   *
+   * @param tp the topic partition
+   * @return pending record count
+   */
   int pendingCount(TopicPartition tp);
 
-  /** Number of records in IN_PROGRESS state (currently being processed by workers). */
+  /**
+   * Number of records in IN_PROGRESS state (currently being processed by workers).
+   *
+   * @param tp the topic partition
+   * @return in-progress record count
+   */
   int inProgressCount(TopicPartition tp);
 
   /**
    * Distance between the highest registered offset and the committable offset. Useful for
    * monitoring how far behind processing is from polling.
+   *
+   * @param tp the topic partition
+   * @return the lag count
    */
   long lag(TopicPartition tp);
+
+  /**
+   * Returns true if any unrecoverable failure has occurred on this partition.
+   *
+   * @param tp the topic partition
+   * @return true if failed
+   */
+  boolean isFailed(TopicPartition tp);
+
+  /**
+   * Records that an unrecoverable failure occurred on this partition.
+   *
+   * @param tp the topic partition
+   */
+  void markFailed(TopicPartition tp);
+
+  /**
+   * Number of unrecoverable failures that have occurred on this partition.
+   *
+   * @param tp the topic partition
+   * @return failure count
+   */
+  int failureCount(TopicPartition tp);
 }
