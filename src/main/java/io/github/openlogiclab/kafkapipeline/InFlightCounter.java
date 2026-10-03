@@ -36,11 +36,26 @@ public final class InFlightCounter {
   private final LongAdder records = new LongAdder();
   private final LongAdder bytes = new LongAdder();
 
+  /** Creates a new counter. */
+  public InFlightCounter() {}
+
+  /**
+   * Records that records have been registered for processing.
+   *
+   * @param recordCount number of records registered
+   * @param byteCount total bytes of records registered
+   */
   public void registered(int recordCount, long byteCount) {
     records.add(recordCount);
     bytes.add(byteCount);
   }
 
+  /**
+   * Records that records have completed processing.
+   *
+   * @param recordCount number of records completed
+   * @param byteCount total bytes of records completed
+   */
   public void completed(int recordCount, long byteCount) {
     records.add(-recordCount);
     bytes.add(-byteCount);
@@ -50,6 +65,8 @@ public final class InFlightCounter {
    * Approximate in-flight count — precision is not required; used only for backpressure decisions.
    * {@code sum()} iterates all internal cells and adds them up; concurrent writes may land between
    * cell reads, so the result can be off by a few records.
+   *
+   * @return approximate in-flight record count
    */
   public int records() {
     return (int) records.sum();
@@ -58,6 +75,8 @@ public final class InFlightCounter {
   /**
    * Approximate in-flight bytes — precision is not required; used only for backpressure decisions.
    * Same cell-summation semantics as {@link #records()}.
+   *
+   * @return approximate in-flight byte count
    */
   public long bytes() {
     return bytes.sum();

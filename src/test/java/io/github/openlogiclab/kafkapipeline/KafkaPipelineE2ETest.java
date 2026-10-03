@@ -22,7 +22,6 @@ import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureStatus;
 import io.github.openlogiclab.kafkapipeline.backpressure.ByteBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
-import io.github.openlogiclab.kafkapipeline.error.Fallback;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import java.time.Duration;
@@ -243,7 +242,6 @@ class KafkaPipelineE2ETest {
                   ErrorStrategy.<String, String>builder()
                       .maxRetries(3)
                       .retryBackoff(Duration.ofMillis(10))
-                      .fallback(Fallback.FAIL_PARTITION)
                       .build())
               .build();
 
@@ -288,7 +286,6 @@ class KafkaPipelineE2ETest {
                       .maxRetries(2)
                       .retryBackoff(Duration.ofMillis(10))
                       .dlqHandler((record, error) -> dlqRecords.add(record))
-                      .fallback(Fallback.FAIL_PARTITION)
                       .build())
               .build();
 
@@ -770,7 +767,6 @@ class KafkaPipelineE2ETest {
                   ErrorStrategy.<String, String>builder()
                       .maxRetries(3)
                       .retryBackoff(Duration.ofMillis(10))
-                      .fallback(Fallback.FAIL_PARTITION)
                       .build())
               .build();
 
@@ -929,7 +925,6 @@ class KafkaPipelineE2ETest {
                       .maxRetries(1)
                       .retryBackoff(Duration.ofMillis(10))
                       .dlqHandler((record, error) -> dlqRecords.add(record))
-                      .fallback(Fallback.FAIL_PARTITION)
                       .build())
               .build();
 

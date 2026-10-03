@@ -38,8 +38,11 @@ import org.apache.kafka.common.TopicPartition;
  *   markInProgress → hook.beforeProcess
  *       → handler.handle (with retry)
  *       → success: hook.afterProcess → ack
- *       → failure: DLQ → skip / fail partition
+ *       → failure: DLQ → FinalFailureHandler → skip
  * </pre>
+ *
+ * @param <K> record key type
+ * @param <V> record value type
  */
 public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
 
@@ -54,6 +57,19 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private final InFlightCounter counter;
   private final PipelineMetricsCollector metricsCollector;
 
+  /**
+   * Creates a single-record worker pool.
+   *
+   * @param concurrency number of worker threads
+   * @param threadMode platform or virtual threads
+   * @param handler the record handler
+   * @param hook the lifecycle hook
+   * @param retryExecutor the retry executor
+   * @param offsetTracker the offset tracker
+   * @param dispatcher the record dispatcher
+   * @param counter the in-flight counter
+   * @param metricsCollector the metrics collector
+   */
   public SingleRecordWorkerPool(
       int concurrency,
       ThreadMode threadMode,
@@ -172,16 +188,14 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       return;
     }
 
+    // Best-effort: DLQ or skip, always ack and continue
     RetryExecutor.FailureResolution resolution =
         retryExecutor.handleFailure(List.of(record), tp, lastError, desc);
-
-    switch (resolution) {
-      case DLQ_SUCCESS, SKIP -> offsetTracker.ack(tp, offset);
-      case FAIL_PARTITION -> {
-        offsetTracker.fail(tp, offset);
-        metricsCollector.recordFailed(1);
-      }
+    if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
+      offsetTracker.markFailed(tp);
+      metricsCollector.recordFailed(1);
     }
+    offsetTracker.ack(tp, offset);
     counter.completed(1, recordBytes);
   }
 }

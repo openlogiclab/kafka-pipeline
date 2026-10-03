@@ -147,6 +147,27 @@ class PipelineMetricsCollectorTest {
       assertTrue(m.partitionLags().containsKey(TP0));
       assertTrue(m.partitionLags().get(TP0) >= 0);
     }
+
+    @Test
+    void partitionFailuresReflectOffsetTracker() {
+      offsetTracker.initPartition(TP0, 0);
+      offsetTracker.initPartition(TP1, 0);
+      collector.partitionAssigned(TP0);
+      collector.partitionAssigned(TP1);
+
+      // No failures yet
+      PipelineMetrics m1 = collector.snapshot();
+      assertTrue(m1.partitionFailures().isEmpty());
+
+      // Mark failures on TP0
+      offsetTracker.markFailed(TP0);
+      offsetTracker.markFailed(TP0);
+
+      PipelineMetrics m2 = collector.snapshot();
+      assertEquals(1, m2.partitionFailures().size());
+      assertEquals(2, m2.partitionFailures().get(TP0));
+      assertFalse(m2.partitionFailures().containsKey(TP1));
+    }
   }
 
   @Nested
@@ -182,9 +203,9 @@ class PipelineMetricsCollectorTest {
     }
 
     @Test
-    void partitionFailureIncrements() {
-      collector.recordPartitionFailure();
-      assertEquals(1, collector.snapshot().partitionFailures());
+    void finalFailureIncrements() {
+      collector.recordFinalFailure();
+      assertEquals(1, collector.snapshot().finalFailures());
     }
 
     @Test
@@ -260,10 +281,11 @@ class PipelineMetricsCollectorTest {
       assertEquals(BackpressureStatus.OK, m.backpressureStatus());
       assertEquals(0, m.throttleCount());
       assertTrue(m.partitionLags().isEmpty());
+      assertTrue(m.partitionFailures().isEmpty());
       assertEquals(0, m.retryAttempts());
       assertEquals(0, m.dlqSuccesses());
       assertEquals(0, m.dlqFailures());
-      assertEquals(0, m.partitionFailures());
+      assertEquals(0, m.finalFailures());
       assertEquals(0, m.commitSuccesses());
       assertEquals(0, m.commitFailures());
       assertEquals(0, m.rebalanceCount());
