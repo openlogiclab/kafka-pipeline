@@ -13,7 +13,7 @@ repositories {
 }
 
 dependencies {
-    api("org.apache.kafka:kafka-clients:4.3.1")
+    api("org.apache.kafka:kafka-clients:4.4.0")
 
     testImplementation(platform("org.junit:junit-bom:6.1.1"))
     testImplementation("org.junit.jupiter:junit-jupiter")
