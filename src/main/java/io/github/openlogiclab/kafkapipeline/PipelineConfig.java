@@ -100,6 +100,9 @@ public record PipelineConfig<K, V>(
     if (dispatchQueueCapacity <= 0) {
       throw new IllegalArgumentException("dispatchQueueCapacity must be positive");
     }
+    if (maxWindowSize <= 0) {
+      throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
+    }
     int maxPollRecords = maxPollRecords(consumerProperties);
     if (maxWindowSize < maxPollRecords) {
       throw new IllegalArgumentException(

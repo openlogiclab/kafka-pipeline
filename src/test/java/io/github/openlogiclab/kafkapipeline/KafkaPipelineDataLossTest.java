@@ -243,4 +243,169 @@ class KafkaPipelineDataLossTest {
         committed == null || committed.offset() == 0L,
         "offset 0 must stay uncommitted so it is redelivered, got " + committed);
   }
+
+  private void await(BooleanSupplier cond, String message) throws InterruptedException {
+    assertTrue(await(cond), message);
+  }
+
+  private boolean committedAt(TopicPartition tp, long offset) {
+    OffsetAndMetadata committed = mockConsumer.committed(Set.of(tp)).get(tp);
+    return committed != null && committed.offset() == offset;
+  }
+
+  @Test
+  void batchMode_fullWindow_seeksBackToBatchStart() throws Exception {
+    Map<Long, AtomicInteger> processed = new ConcurrentHashMap<>();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 2)
+            .maxWindowSize(8)
+            .batchHandler(
+                (tp, batch) -> {
+                  if (batch.get(0).offset() == 0L) {
+                    release.await(10, TimeUnit.SECONDS);
+                  }
+                  for (ConsumerRecord<String, String> r : batch) {
+                    processed
+                        .computeIfAbsent(r.offset(), o -> new AtomicInteger())
+                        .incrementAndGet();
+                  }
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+
+    // Batch 0..4 blocks and stays in the window (5 of 8). Batch 5..9 cannot fit as a whole, so
+    // none of it is registered and the consumer seeks back to its first offset.
+    serveLog(TP0, 20, 5);
+    await(() -> mockConsumer.paused().contains(TP0), "TP0 should be window-paused");
+    assertEquals(5L, mockConsumer.position(TP0), "consumer should be seeked back to offset 5");
+    assertTrue(processed.isEmpty());
+
+    release.countDown();
+
+    await(() -> processed.size() == 20, "Expected 0..19, got " + processed.keySet());
+    processed.values().forEach(c -> assertEquals(1, c.get()));
+    await(() -> committedAt(TP0, 20L), "Offsets through 19 should be committed");
+  }
+
+  @Test
+  void batchMode_shutdownInterruptDuringRetry_doesNotDlqOrCommitBatch() throws Exception {
+    AtomicInteger dlqCalls = new AtomicInteger();
+    CountDownLatch firstAttempt = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .shutdownTimeout(Duration.ofMillis(200))
+            .errorStrategy(
+                ErrorStrategy.<String, String>builder()
+                    .maxRetries(3)
+                    .retryBackoff(Duration.ofSeconds(30))
+                    .dlqHandler((record, error) -> dlqCalls.incrementAndGet())
+                    .build())
+            .batchHandler(
+                (tp, batch) -> {
+                  firstAttempt.countDown();
+                  throw new RuntimeException("downstream unavailable");
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 3);
+
+    assertTrue(firstAttempt.await(5, TimeUnit.SECONDS));
+    Thread.sleep(100); // now sleeping in retry backoff
+    pipeline.stop();
+    pipeline.awaitShutdown();
+
+    assertEquals(0, dlqCalls.get(), "an interrupted batch must not be sent to the DLQ");
+    OffsetAndMetadata committed = mockConsumer.committed(Set.of(TP0)).get(TP0);
+    assertTrue(
+        committed == null || committed.offset() == 0L,
+        "the batch must stay uncommitted so it is redelivered, got " + committed);
+  }
+
+  @Test
+  void stuckPartitionPauses_otherPartitionKeepsFlowing() throws Exception {
+    Map<String, AtomicInteger> processed = new ConcurrentHashMap<>();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 3)
+            .maxWindowSize(8)
+            .handler(
+                record -> {
+                  blockOnFirstRecord(TP0, record);
+                  processed
+                      .computeIfAbsent(record.value(), v -> new AtomicInteger())
+                      .incrementAndGet();
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0, TP1);
+
+    serveLog(TP0, 20, 5);
+    serveLog(TP1, 50, 5);
+
+    await(() -> mockConsumer.paused().contains(TP0), "TP0 should be window-paused");
+    await(
+        () -> processed.keySet().stream().filter(v -> v.startsWith("1:")).count() == 50,
+        "TP1 should finish all 50 records while TP0 is stuck, got " + processed.keySet());
+    assertFalse(mockConsumer.paused().contains(TP1), "TP1 must not be paused");
+    assertFalse(processed.containsKey("0:0"), "TP0's stuck record is still running");
+    await(() -> committedAt(TP1, 50L), "TP1 should commit while TP0 is stuck");
+
+    release.countDown();
+
+    await(
+        () -> processed.keySet().stream().filter(v -> v.startsWith("0:")).count() == 20,
+        "TP0 should finish after the stuck record completes, got " + processed.keySet());
+    processed.values().forEach(c -> assertEquals(1, c.get()));
+    await(() -> committedAt(TP0, 20L), "TP0 should commit through 19");
+  }
+
+  @Test
+  void windowPausedPartitionRevokedAndReassigned_isResumedAndReprocessed() throws Exception {
+    Map<Long, AtomicInteger> processed = new ConcurrentHashMap<>();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 2)
+            .maxWindowSize(8)
+            .drainTimeout(Duration.ofMillis(200))
+            .handler(
+                record -> {
+                  blockOnFirstRecord(TP0, record);
+                  processed
+                      .computeIfAbsent(record.offset(), o -> new AtomicInteger())
+                      .incrementAndGet();
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+
+    serveLog(TP0, 20, 5);
+    await(() -> mockConsumer.paused().contains(TP0), "TP0 should be window-paused");
+
+    // Revoke TP0 while offset 0 is still stuck. Nothing past it may be committed.
+    mockConsumer.rebalance(List.of());
+    Thread.sleep(300);
+    OffsetAndMetadata committed = mockConsumer.committed(Set.of(TP0)).get(TP0);
+    assertTrue(
+        committed == null || committed.offset() == 0L,
+        "nothing past the stuck record may be committed on revoke, got " + committed);
+    release.countDown();
+
+    // Reassigned: the partition starts unpaused from its committed offset and every record is
+    // processed again (at-least-once).
+    processed.clear();
+    mockConsumer.rebalance(List.of(TP0));
+    await(() -> processed.keySet().containsAll(rangeSet(0, 20)), "Expected 0..19 after reassign");
+    assertFalse(mockConsumer.paused().contains(TP0));
+    await(() -> committedAt(TP0, 20L), "TP0 should commit through 19 after reassign");
+  }
+
+  private static Set<Long> rangeSet(long from, long to) {
+    Set<Long> set = new java.util.HashSet<>();
+    for (long i = from; i < to; i++) set.add(i);
+    return set;
+  }
 }

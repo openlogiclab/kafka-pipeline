@@ -339,4 +339,61 @@ class PipelineConfigTest {
       assertNotNull(b);
     }
   }
+
+  // ── Window Size ──────────────────────────────────────────────
+
+  @Nested
+  class WindowSize {
+
+    @Test
+    void defaultIs10000() {
+      assertEquals(10_000, minimalBuilder().build().maxWindowSize());
+    }
+
+    @Test
+    void customValueIsKept() {
+      assertEquals(2_000, minimalBuilder().maxWindowSize(2_000).build().maxWindowSize());
+    }
+
+    @Test
+    void belowDefaultMaxPollRecords_throws() {
+      IllegalArgumentException e =
+          assertThrows(
+              IllegalArgumentException.class, () -> minimalBuilder().maxWindowSize(499).build());
+      assertTrue(e.getMessage().contains("max.poll.records"));
+    }
+
+    @Test
+    void belowConfiguredMaxPollRecords_throws() {
+      Properties p = props();
+      p.put("max.poll.records", "2000");
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> minimalBuilder().consumerProperties(p).maxWindowSize(1_000).build());
+    }
+
+    @Test
+    void equalToMaxPollRecords_isAllowed() {
+      Properties p = props();
+      p.put("max.poll.records", 50);
+      assertEquals(
+          50, minimalBuilder().consumerProperties(p).maxWindowSize(50).build().maxWindowSize());
+    }
+
+    @Test
+    void invalidMaxPollRecords_throws() {
+      Properties p = props();
+      p.put("max.poll.records", "lots");
+      assertThrows(
+          IllegalArgumentException.class, () -> minimalBuilder().consumerProperties(p).build());
+    }
+
+    @Test
+    void nonPositive_throws() {
+      IllegalArgumentException e =
+          assertThrows(
+              IllegalArgumentException.class, () -> minimalBuilder().maxWindowSize(0).build());
+      assertTrue(e.getMessage().contains("positive"));
+    }
+  }
 }
