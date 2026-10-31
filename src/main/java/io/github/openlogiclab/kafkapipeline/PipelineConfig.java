@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Properties;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 
 /**
  * Top-level configuration for a {@link KafkaPipeline}.
@@ -51,6 +52,7 @@ import java.util.Properties;
  * @param shutdownTimeout max wait for workers during shutdown
  * @param pollTimeout Kafka consumer poll timeout
  * @param dispatchQueueCapacity capacity of per-partition dispatch queues
+ * @param maxWindowSize max tracked offsets per partition before that partition is paused
  */
 public record PipelineConfig<K, V>(
     Properties consumerProperties,
@@ -69,7 +71,8 @@ public record PipelineConfig<K, V>(
     Duration drainTimeout,
     Duration shutdownTimeout,
     Duration pollTimeout,
-    int dispatchQueueCapacity) {
+    int dispatchQueueCapacity,
+    int maxWindowSize) {
   /** Validates configuration constraints. */
   public PipelineConfig {
     Objects.requireNonNull(consumerProperties, "consumerProperties");
@@ -96,6 +99,27 @@ public record PipelineConfig<K, V>(
     }
     if (dispatchQueueCapacity <= 0) {
       throw new IllegalArgumentException("dispatchQueueCapacity must be positive");
+    }
+    int maxPollRecords = maxPollRecords(consumerProperties);
+    if (maxWindowSize < maxPollRecords) {
+      throw new IllegalArgumentException(
+          "maxWindowSize ("
+              + maxWindowSize
+              + ") must be >= max.poll.records ("
+              + maxPollRecords
+              + "), otherwise a single poll may never fit in a partition window");
+    }
+  }
+
+  private static int maxPollRecords(Properties props) {
+    Object value = props.get(ConsumerConfig.MAX_POLL_RECORDS_CONFIG);
+    if (value == null) {
+      return ConsumerConfig.DEFAULT_MAX_POLL_RECORDS;
+    }
+    try {
+      return Integer.parseInt(value.toString().trim());
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException("Invalid max.poll.records: " + value, e);
     }
   }
 
@@ -138,6 +162,7 @@ public record PipelineConfig<K, V>(
     private Duration shutdownTimeout = Duration.ofSeconds(30);
     private Duration pollTimeout = Duration.ofMillis(100);
     private int dispatchQueueCapacity = 500;
+    private int maxWindowSize = 10_000;
 
     private Builder() {}
 
@@ -388,6 +413,28 @@ public record PipelineConfig<K, V>(
     }
 
     /**
+     * Maximum number of offsets tracked per partition before that partition is paused.
+     *
+     * <p>The window holds every offset from the oldest unfinished record up to the newest fetched
+     * one, including records that already completed behind it. When a partition's window reaches
+     * 80% of this size, the consumer pauses that partition only (other partitions keep flowing) and
+     * resumes it once the window drops to 50%. A larger window gives slow records more slack but
+     * uses more memory (roughly 50 bytes per entry) and means more records are redelivered after a
+     * crash.
+     *
+     * <p>Must be at least {@code max.poll.records}.
+     *
+     * <p>Default: {@code 10000}.
+     *
+     * @param maxWindowSize the per-partition window capacity
+     * @return this builder
+     */
+    public Builder<K, V> maxWindowSize(int maxWindowSize) {
+      this.maxWindowSize = maxWindowSize;
+      return this;
+    }
+
+    /**
      * Builds an immutable {@link PipelineConfig}.
      *
      * @return the built configuration
@@ -417,7 +464,8 @@ public record PipelineConfig<K, V>(
           drainTimeout,
           shutdownTimeout,
           pollTimeout,
-          dispatchQueueCapacity);
+          dispatchQueueCapacity,
+          maxWindowSize);
     }
   }
 }

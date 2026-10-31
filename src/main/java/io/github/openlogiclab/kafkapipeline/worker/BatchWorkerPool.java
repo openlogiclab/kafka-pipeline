@@ -21,7 +21,10 @@ import io.github.openlogiclab.kafkapipeline.ThreadMode;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
+import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
@@ -87,7 +90,8 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   }
 
   @Override
-  public void dispatch(ConsumerRecords<K, V> records) {
+  public Map<TopicPartition, Long> dispatch(ConsumerRecords<K, V> records) {
+    Map<TopicPartition, Long> rejected = Map.of();
     for (TopicPartition tp : records.partitions()) {
       List<ConsumerRecord<K, V>> batch = records.records(tp);
 
@@ -100,12 +104,19 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         batchBytes += RecordSize.estimateBytes(record);
       }
 
-      offsetTracker.registerBatch(tp, offsets);
+      try {
+        offsetTracker.registerBatch(tp, offsets);
+      } catch (WindowFullException e) {
+        if (rejected.isEmpty()) rejected = new HashMap<>();
+        rejected.put(tp, offsets[0]);
+        continue;
+      }
       counter.registered(batch.size(), batchBytes);
 
       long totalBytes = batchBytes;
       executor.submit(() -> processBatch(tp, batch, offsets, totalBytes));
     }
+    return rejected;
   }
 
   private void processBatch(
@@ -136,6 +147,15 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       offsetTracker.ackBatch(tp, offsets);
       counter.completed(batch.size(), totalBytes);
       metricsCollector.recordProcessed(batch.size());
+      return;
+    }
+
+    if (Thread.currentThread().isInterrupted()) {
+      // Interrupted by shutdown, not a processing failure: leave the offsets unacked so they are
+      // not committed and the batch is redelivered.
+      logger.log(
+          System.Logger.Level.DEBUG, "Interrupted while processing {0} {1}, not acking", tp, desc);
+      counter.completed(batch.size(), totalBytes);
       return;
     }
 

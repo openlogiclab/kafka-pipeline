@@ -16,6 +16,7 @@
 package io.github.openlogiclab.kafkapipeline.worker;
 
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -23,6 +24,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.common.TopicPartition;
 
 /**
  * Abstraction over how polled records are distributed and processed.
@@ -77,9 +79,15 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
   /**
    * Dispatches records to workers for processing.
    *
+   * <p>If a partition's offset window has no room, that partition's remaining records are not
+   * dispatched. The returned map gives, for each such partition, the offset of the first record
+   * that was not dispatched; the caller must seek the consumer back to it so nothing is skipped.
+   *
    * @param records the records to process
+   * @return first undispatched offset per partition whose window was full (empty if all records
+   *     were dispatched)
    */
-  public abstract void dispatch(ConsumerRecords<K, V> records);
+  public abstract Map<TopicPartition, Long> dispatch(ConsumerRecords<K, V> records);
 
   /**
    * Stops the worker pool and waits for termination.

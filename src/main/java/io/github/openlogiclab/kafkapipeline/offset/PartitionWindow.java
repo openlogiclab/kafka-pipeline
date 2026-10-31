@@ -52,6 +52,8 @@ final class PartitionWindow {
 
   private final AtomicLong committedOffset; // Last offset confirmed committed to Kafka
 
+  // entries.size() is O(n) on ConcurrentSkipListMap, so track the size separately.
+  private final AtomicInteger windowSize = new AtomicInteger(0);
   private final AtomicInteger pendingCount = new AtomicInteger(0);
   private final AtomicInteger inProgressCount = new AtomicInteger(0);
   private final AtomicInteger completedCount = new AtomicInteger(0);
@@ -80,6 +82,7 @@ final class PartitionWindow {
         throw new IllegalStateException("Offset " + offset + " already tracked in window");
       }
       entries.put(offset, OffsetStatus.REGISTERED);
+      windowSize.incrementAndGet();
       updateHighestRegistered(offset);
       pendingCount.incrementAndGet();
     } finally {
@@ -98,6 +101,7 @@ final class PartitionWindow {
           throw new IllegalStateException("Offset " + offset + " already tracked in window");
         }
         entries.put(offset, OffsetStatus.REGISTERED);
+        windowSize.incrementAndGet();
         updateHighestRegistered(offset);
         pendingCount.incrementAndGet();
       }
@@ -291,11 +295,11 @@ final class PartitionWindow {
   }
 
   int windowSize() {
-    return entries.size();
+    return windowSize.get();
   }
 
   boolean isFull() {
-    return entries.size() >= maxWindowSize;
+    return windowSize.get() >= maxWindowSize;
   }
 
   /** Returns true if any unrecoverable failure has occurred on this partition. */
@@ -345,6 +349,7 @@ final class PartitionWindow {
     Map.Entry<Long, OffsetStatus> first;
     while ((first = entries.firstEntry()) != null && first.getValue() == OffsetStatus.DONE) {
       if (entries.remove(first.getKey(), OffsetStatus.DONE)) {
+        windowSize.decrementAndGet();
         committableOffset.set(first.getKey() + 1);
       } else {
         break;
@@ -363,15 +368,17 @@ final class PartitionWindow {
   private void rollbackBatch(long[] offsets, int failedAtIndex) {
     for (int i = 0; i < failedAtIndex; i++) {
       entries.remove(offsets[i]);
+      windowSize.decrementAndGet();
       pendingCount.decrementAndGet();
     }
   }
 
   private void validateWindowCapacity(int count) {
-    if (entries.size() + count > maxWindowSize) {
-      throw new IllegalStateException(
+    int current = windowSize.get();
+    if (current + count > maxWindowSize) {
+      throw new WindowFullException(
           "Window full: current="
-              + entries.size()
+              + current
               + " + requested="
               + count
               + " exceeds max="

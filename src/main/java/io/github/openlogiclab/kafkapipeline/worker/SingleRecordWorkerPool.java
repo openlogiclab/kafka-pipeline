@@ -26,7 +26,10 @@ import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
+import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
@@ -106,14 +109,23 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   }
 
   @Override
-  public void dispatch(ConsumerRecords<K, V> records) {
-    for (ConsumerRecord<K, V> record : records) {
-      TopicPartition tp = new TopicPartition(record.topic(), record.partition());
-      offsetTracker.register(tp, record.offset());
-      counter.registered(1, RecordSize.estimateBytes(record));
-      dispatcher.dispatch(tp, record);
+  public Map<TopicPartition, Long> dispatch(ConsumerRecords<K, V> records) {
+    Map<TopicPartition, Long> rejected = Map.of();
+    for (TopicPartition tp : records.partitions()) {
+      for (ConsumerRecord<K, V> record : records.records(tp)) {
+        try {
+          offsetTracker.register(tp, record.offset());
+        } catch (WindowFullException e) {
+          if (rejected.isEmpty()) rejected = new HashMap<>();
+          rejected.put(tp, record.offset());
+          break;
+        }
+        counter.registered(1, RecordSize.estimateBytes(record));
+        dispatcher.dispatch(tp, record);
+      }
     }
     dispatcher.wakeWorkers();
+    return rejected;
   }
 
   private void workerLoop() {
@@ -185,6 +197,18 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       offsetTracker.ack(tp, offset);
       counter.completed(1, recordBytes);
       metricsCollector.recordProcessed(1);
+      return;
+    }
+
+    if (Thread.currentThread().isInterrupted()) {
+      // Interrupted by shutdown, not a processing failure: leave the offset unacked so it is
+      // not committed and the record is redelivered.
+      logger.log(
+          System.Logger.Level.DEBUG,
+          "Interrupted while processing {0}:{1}, not acking",
+          tp,
+          offset);
+      counter.completed(1, recordBytes);
       return;
     }
 
