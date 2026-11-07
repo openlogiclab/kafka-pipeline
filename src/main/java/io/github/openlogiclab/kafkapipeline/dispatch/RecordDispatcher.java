@@ -128,11 +128,37 @@ public final class RecordDispatcher<K, V> {
   }
 
   /**
-   * Enqueues a record into the partition's dispatch queue. The caller provides the pre-built {@link
-   * TopicPartition} to avoid redundant object allocation on the hot path.
+   * Returns whether the partition's queue has room for at least one more record. The poll thread is
+   * the only producer, so a {@code true} result stays true until it dispatches.
+   *
+   * @param tp the partition
+   * @return true if {@link #dispatch} will not find the queue full
+   */
+  public boolean hasRoom(TopicPartition tp) {
+    BlockingQueue<ConsumerRecord<K, V>> queue = queues.get(tp);
+    return queue != null && queue.remainingCapacity() > 0;
+  }
+
+  /**
+   * Returns whether the partition's queue has drained to at most half its capacity, the point at
+   * which a partition paused for a full queue may resume fetching.
+   *
+   * @param tp the partition
+   * @return true if the queue is at most half full (or no longer exists)
+   */
+  public boolean hasDrained(TopicPartition tp) {
+    BlockingQueue<ConsumerRecord<K, V>> queue = queues.get(tp);
+    return queue == null || queue.size() <= queueCapacity / 2;
+  }
+
+  /**
+   * Enqueues a record into the partition's dispatch queue. Never blocks: callers must check {@link
+   * #hasRoom} first. The caller provides the pre-built {@link TopicPartition} to avoid redundant
+   * object allocation on the hot path.
    *
    * @param tp the partition
    * @param record the record to dispatch
+   * @throws IllegalStateException if the partition has no queue or the queue is full
    */
   public void dispatch(TopicPartition tp, ConsumerRecord<K, V> record) {
     BlockingQueue<ConsumerRecord<K, V>> queue = queues.get(tp);
@@ -141,18 +167,18 @@ public final class RecordDispatcher<K, V> {
           "No queue for partition " + tp + ". Was addPartition() called?");
     }
     if (!queue.offer(record)) {
-      logQueueFull(tp);
-      try {
-        queue.put(record);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        return;
-      }
+      throw new IllegalStateException("Dispatch queue full for " + tp + "; check hasRoom() first");
     }
     queued.incrementAndGet();
   }
 
-  private void logQueueFull(TopicPartition tp) {
+  /**
+   * Records that a partition's remaining records were not dispatched because its queue was full.
+   * Logs a rate-limited warning: at most one line per interval, with a count.
+   *
+   * @param tp the partition
+   */
+  public void reportFull(TopicPartition tp) {
     long blocks = queueFullBlocks.incrementAndGet();
     long now = System.nanoTime();
     long last = lastQueueFullLogNanos.get();
@@ -161,8 +187,9 @@ public final class RecordDispatcher<K, V> {
       queueFullBlocks.addAndGet(-blocks);
       logger.log(
           System.Logger.Level.WARNING,
-          "Dispatch queue full for {0}, blocking until space is available ({1} blocked dispatches"
-              + " since last warning) — review backpressure thresholds vs dispatchQueueCapacity",
+          "Dispatch queue full for {0}, pausing the partition until workers catch up ({1} times"
+              + " since last warning) — consider more concurrency or a larger"
+              + " dispatchQueueCapacity",
           tp,
           blocks);
     }

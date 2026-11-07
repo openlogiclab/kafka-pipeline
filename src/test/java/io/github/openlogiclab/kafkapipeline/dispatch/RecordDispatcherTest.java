@@ -167,32 +167,30 @@ class RecordDispatcherTest {
     }
 
     @Test
-    void dispatch_blocksWhenQueueFull() throws Exception {
-      RecordDispatcher<String, String> small = new RecordDispatcher<>(2);
+    void dispatch_neverBlocks_hasRoomAndHasDrainedTrackCapacity() {
+      RecordDispatcher<String, String> small = new RecordDispatcher<>(4);
       small.addPartition(TP0);
 
-      small.dispatch(TP0, record(TP0, 0));
-      small.dispatch(TP0, record(TP0, 1));
-      assertEquals(2, small.totalQueuedRecords());
-
-      CountDownLatch blocked = new CountDownLatch(1);
-      CountDownLatch done = new CountDownLatch(1);
-      Thread producer =
-          new Thread(
-              () -> {
-                blocked.countDown();
-                small.dispatch(TP0, record(TP0, 2));
-                done.countDown();
-              });
-      producer.start();
-
-      assertTrue(blocked.await(1, TimeUnit.SECONDS));
-      Thread.sleep(100);
-      assertFalse(done.await(200, TimeUnit.MILLISECONDS), "dispatch should be blocking");
+      for (int i = 0; i < 4; i++) {
+        assertTrue(small.hasRoom(TP0));
+        small.dispatch(TP0, record(TP0, i));
+      }
+      assertFalse(small.hasRoom(TP0));
+      assertFalse(small.hasDrained(TP0));
+      assertThrows(IllegalStateException.class, () -> small.dispatch(TP0, record(TP0, 4)));
+      assertEquals(4, small.totalQueuedRecords());
 
       small.poll(10, TimeUnit.MILLISECONDS);
-      assertTrue(done.await(1, TimeUnit.SECONDS), "dispatch should unblock after poll frees space");
-      assertEquals(2, small.totalQueuedRecords());
+      assertTrue(small.hasRoom(TP0));
+      assertFalse(small.hasDrained(TP0), "3 of 4 is above half");
+      small.poll(10, TimeUnit.MILLISECONDS);
+      assertTrue(small.hasDrained(TP0), "2 of 4 is half");
+    }
+
+    @Test
+    void hasRoom_falseAndHasDrained_trueForUnknownPartition() {
+      assertFalse(dispatcher.hasRoom(TP2));
+      assertTrue(dispatcher.hasDrained(TP2));
     }
   }
 
@@ -475,7 +473,7 @@ class RecordDispatcherTest {
   class QueueFullWarning {
 
     @Test
-    void loggedOncePerIntervalNotPerBlockedRecord() throws Exception {
+    void loggedOncePerIntervalNotPerFullQueue() {
       java.util.logging.Logger jul =
           java.util.logging.Logger.getLogger(RecordDispatcher.class.getName());
       AtomicInteger warnings = new AtomicInteger();
@@ -497,19 +495,12 @@ class RecordDispatcherTest {
           };
       jul.addHandler(handler);
       try {
-        RecordDispatcher<String, String> small = new RecordDispatcher<>(1);
-        small.addPartition(TP0);
-        small.dispatch(TP0, record(TP0, 0));
+        dispatcher.addPartition(TP0);
+        dispatcher.reportFull(TP0);
+        dispatcher.reportFull(TP0);
+        dispatcher.reportFull(TP0);
 
-        for (long offset = 1; offset <= 3; offset++) {
-          long next = offset;
-          Thread producer = Thread.ofPlatform().start(() -> small.dispatch(TP0, record(TP0, next)));
-          while (producer.getState() != Thread.State.WAITING) Thread.sleep(5); // blocked in put()
-          assertNotNull(small.poll(1, TimeUnit.SECONDS));
-          producer.join(2_000);
-        }
-
-        assertEquals(1, warnings.get(), "three blocked dispatches should log one warning");
+        assertEquals(1, warnings.get(), "three full-queue reports should log one warning");
       } finally {
         jul.removeHandler(handler);
       }

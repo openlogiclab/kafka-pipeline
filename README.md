@@ -18,7 +18,7 @@ This library packages all of that into a clean pipeline that you configure once 
 
 > **At-least-once delivery.** This library guarantees that every record is delivered to your handler at least once. It will **never** silently drop data. The tradeoff: duplicate delivery is possible after a crash (see [The Duplicate Processing Problem](#the-duplicate-processing-problem)). If you need exactly-once, implement idempotent processing in your handler.
 >
-> **Blocking under pressure, not dropping.** When internal queues fill up (misconfigured backpressure, unexpected burst, slow downstream), the poll thread **blocks** until space is available rather than discarding records. This preserves data integrity at the cost of temporary latency. A `WARNING` log is emitted when blocking occurs — if you see it in production, tune your backpressure thresholds or concurrency. See [Tuning `dispatchQueueCapacity`](#tuning-dispatchqueuecapacity) for details.
+> **Pausing under pressure, not dropping or blocking.** When internal queues fill up (misconfigured backpressure, unexpected burst, slow downstream), the affected partition is **paused** and the records that did not fit are fetched again later, rather than discarded. The poll thread itself never blocks, so heartbeats, rebalances and `stop()` keep working even when handlers are stuck. A rate-limited `WARNING` log is emitted when this happens — if you see it in production, tune your backpressure thresholds or concurrency. See [Tuning `dispatchQueueCapacity`](#tuning-dispatchqueuecapacity) for details.
 
 ## Installation
 
@@ -309,6 +309,8 @@ Two options, set explicitly when you configure concurrency:
 // Virtual threads (JDK 21+) — good for I/O-bound work (DB, HTTP, etc.)
 .concurrency(ThreadMode.VIRTUAL, 500)
 ```
+
+> **Virtual threads on Java 21–23: watch out for pinning.** A virtual thread that blocks inside a `synchronized` block or method (for example a JDBC driver, an HTTP client, or your own code doing I/O while holding a monitor) *pins* its carrier OS thread. There are only as many carriers as CPU cores by default, so a few pinned handlers can stall every other virtual thread, including ones that would release the lock — which looks like a deadlock. Options: run on Java 24+ (JEP 491 removes this pinning), replace `synchronized` around blocking calls with `ReentrantLock`, or use `ThreadMode.PLATFORM`. Run with `-Djdk.tracePinnedThreads=short` to find pinning sites. The library's own worker code does not hold monitors while calling your handler.
 
 ### Error Handling
 
@@ -612,12 +614,14 @@ KafkaPipeline.<String, String>builder()
     .build();
 ```
 
-When the queue fills up, the dispatch call **blocks** the poll thread until space is available. This acts as a runtime safety net — you'll see a `WARNING` log if it happens:
+When the queue fills up, the poll thread does **not** block. Records that don't fit stay unacknowledged, the consumer seeks back to the first of them and pauses that partition; other partitions keep flowing. The partition resumes once its queue has drained to half capacity, and the skipped records are fetched again — nothing is dropped. You'll see a rate-limited `WARNING` log if this happens:
 
 ```
-WARNING: Dispatch queue full for topic-0, blocking until space is available
-         — review backpressure thresholds vs dispatchQueueCapacity
+WARNING: Dispatch queue full for topic-0, pausing the partition until workers catch up
+         (N times since last warning) — consider more concurrency or a larger dispatchQueueCapacity
 ```
+
+Because the poll thread keeps running, heartbeats, rebalances and `stop()` are unaffected even if every handler is stuck.
 
 > **Warning:** If you see this message in production, it typically means backpressure thresholds are set too high relative to processing speed, or `dispatchQueueCapacity` is too low. Fix the root cause — don't just increase the queue capacity, as oversized queues waste memory and reduce backpressure sensitivity (records sit idle in the queue longer before backpressure kicks in).
 
@@ -642,7 +646,7 @@ KafkaPipeline.<String, String>builder()
     .build();
 ```
 
-In this setup, backpressure pauses the poll loop well before the dispatch queue fills up. The queue only blocks as a last resort if something unexpected happens at runtime.
+In this setup, backpressure pauses the poll loop well before the dispatch queue fills up. The queue-full pause only kicks in as a last resort if something unexpected happens at runtime.
 
 ## Offset Management
 

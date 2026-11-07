@@ -397,13 +397,14 @@ public record PipelineConfig<K, V>(
      * </ul>
      *
      * <p>A good starting point is Kafka's {@code max.poll.records} (default 500). If the queue
-     * fills up, the dispatch/submit call blocks the poll thread (with a WARNING log) until space is
-     * available — this acts as a safety net but should not happen under normal operation when
-     * backpressure thresholds are configured correctly.
+     * fills up, the poll thread never blocks: that partition is paused, the records that did not
+     * fit are fetched again later (seek back to the first one), and a rate-limited WARNING is
+     * logged. The partition resumes once its queue has drained to half capacity. This is a safety
+     * net and should be rare when backpressure thresholds are configured correctly.
      *
      * <p><b>Warning:</b> setting this too high wastes memory and reduces backpressure sensitivity
      * (records sit in the queue longer before backpressure reacts). Setting it too low causes
-     * frequent blocking of the poll thread, which degrades throughput.
+     * frequent pause/refetch cycles, which waste fetch bandwidth and degrade throughput.
      *
      * <p>Default: {@code 500} (matches Kafka's default {@code max.poll.records}).
      *

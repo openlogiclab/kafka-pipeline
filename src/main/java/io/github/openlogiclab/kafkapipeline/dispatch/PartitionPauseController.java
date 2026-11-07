@@ -21,6 +21,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.common.TopicPartition;
 
@@ -48,7 +49,11 @@ public final class PartitionPauseController {
   private final OffsetTracker offsetTracker;
   private final int pauseAt;
   private final int resumeAt;
+  private final Predicate<TopicPartition> hasRoom;
   private final Set<TopicPartition> windowPaused = new HashSet<>();
+  // Partitions whose records were sent back with a seek because they did not fit (full window or
+  // full queue). They resume once the window has drained and the worker pool has room again.
+  private final Set<TopicPartition> rejectedPaused = new HashSet<>();
 
   /**
    * Creates a pause controller.
@@ -57,6 +62,20 @@ public final class PartitionPauseController {
    * @param offsetTracker source of per-partition window sizes
    */
   public PartitionPauseController(Consumer<?, ?> consumer, OffsetTracker offsetTracker) {
+    this(consumer, offsetTracker, tp -> true);
+  }
+
+  /**
+   * Creates a pause controller.
+   *
+   * @param consumer the Kafka consumer whose partitions are paused and resumed
+   * @param offsetTracker source of per-partition window sizes
+   * @param hasRoom whether the worker pool can take a partition's records again after they were
+   *     sent back because its queue was full
+   */
+  public PartitionPauseController(
+      Consumer<?, ?> consumer, OffsetTracker offsetTracker, Predicate<TopicPartition> hasRoom) {
+    this.hasRoom = hasRoom;
     this.consumer = consumer;
     this.offsetTracker = offsetTracker;
     int max = offsetTracker.maxWindowSize();
@@ -72,6 +91,7 @@ public final class PartitionPauseController {
   public void apply(boolean throttled) {
     Set<TopicPartition> assignment = consumer.assignment();
     windowPaused.retainAll(assignment);
+    rejectedPaused.retainAll(assignment);
 
     for (TopicPartition tp : assignment) {
       int size = offsetTracker.windowSize(tp);
@@ -94,13 +114,16 @@ public final class PartitionPauseController {
             size,
             offsetTracker.maxWindowSize());
       }
+      if (rejectedPaused.contains(tp) && size <= resumeAt && hasRoom.test(tp)) {
+        rejectedPaused.remove(tp);
+      }
     }
 
     Set<TopicPartition> paused = consumer.paused();
     List<TopicPartition> toPause = new ArrayList<>();
     List<TopicPartition> toResume = new ArrayList<>();
     for (TopicPartition tp : assignment) {
-      boolean shouldPause = throttled || windowPaused.contains(tp);
+      boolean shouldPause = throttled || windowPaused.contains(tp) || rejectedPaused.contains(tp);
       boolean isPaused = paused.contains(tp);
       if (shouldPause && !isPaused) {
         toPause.add(tp);
@@ -113,9 +136,9 @@ public final class PartitionPauseController {
   }
 
   /**
-   * Handles records that did not fit in their partition's window: seeks each partition back to the
-   * first record that was not dispatched, so it is fetched again, and pauses the partition until
-   * its window has room.
+   * Handles records that did not fit (full offset window or full worker queue): seeks each
+   * partition back to the first record that was not dispatched, so it is fetched again, and pauses
+   * the partition until there is room.
    *
    * @param rejected first undispatched offset per partition
    */
@@ -125,14 +148,25 @@ public final class PartitionPauseController {
       TopicPartition tp = entry.getKey();
       long offset = entry.getValue();
       consumer.seek(tp, offset);
-      windowPaused.add(tp);
+      rejectedPaused.add(tp);
       logger.log(
-          System.Logger.Level.WARNING,
-          "Window full for {0}, seeking back to offset {1} and pausing until it drains",
+          System.Logger.Level.DEBUG,
+          "No room for {0} from offset {1}; seeking back and pausing until there is room",
           tp,
           offset);
     }
     consumer.pause(rejected.keySet());
+  }
+
+  /**
+   * Returns whether a partition is paused by this controller for any reason other than global
+   * throttling.
+   *
+   * @param tp the partition
+   * @return true if window-paused or paused after its records were sent back
+   */
+  public boolean isPaused(TopicPartition tp) {
+    return windowPaused.contains(tp) || rejectedPaused.contains(tp);
   }
 
   /**

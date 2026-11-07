@@ -345,7 +345,7 @@ public final class KafkaPipeline<K, V> {
       consumer = new KafkaConsumer<>(props);
     }
 
-    pauseController = new PartitionPauseController(consumer, offsetTracker);
+    pauseController = new PartitionPauseController(consumer, offsetTracker, workerPool::canResume);
 
     committer =
         new PeriodicCommitter(offsetTracker, consumer, config.commitInterval(), metricsCollector);
