@@ -32,8 +32,10 @@ import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.MemberToRemove;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.admin.RemoveMembersFromConsumerGroupOptions;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -143,6 +145,109 @@ class KafkaPipelineBrokerIT {
         "a restart should pick up exactly where the committed offsets left off");
   }
 
+  @Test
+  void memberLeavingMidStream_survivorFinishesWithoutLoss() throws Exception {
+    String topic = createTopic();
+    String group = "g-" + UUID.randomUUID();
+    Set<String> seen = ConcurrentHashMap.newKeySet();
+    Map<String, Set<Integer>> partitionsByMember = new ConcurrentHashMap<>();
+
+    start(group, topic, record -> handleAs("a", record, seen, partitionsByMember));
+    KafkaPipeline<String, String> b =
+        start(group, topic, record -> handleAs("b", record, seen, partitionsByMember));
+    await(() -> membersWithPartitions(group) == 2, () -> "both members should get partitions");
+
+    produce(topic, 0, 3_000);
+    await(
+        () -> !partitionsByMember.getOrDefault("b", Set.of()).isEmpty() && seen.size() >= 500,
+        () -> "processed " + seen.size());
+
+    // Member b leaves while it still has records in flight; a takes over its partitions.
+    b.stop();
+    b.awaitShutdown();
+    pipelines.remove(b);
+
+    await(() -> seen.size() == 3_000, () -> "processed " + seen.size() + "/3000");
+    await(() -> committedToEnd(group, topic), () -> "committed " + committed(group, topic));
+  }
+
+  @Test
+  void shutdownWithRecordsInFlight_commitsOnlyProcessedRecords_restartFinishesTheRest()
+      throws Exception {
+    String topic = createTopic();
+    String group = "g-" + UUID.randomUUID();
+    produce(topic, 0, 2_000);
+
+    Set<TopicPartitionOffset> processed = ConcurrentHashMap.newKeySet();
+    io.github.openlogiclab.kafkapipeline.handler.RecordHandler<String, String> slow =
+        record -> {
+          Thread.sleep(ThreadLocalRandom.current().nextInt(0, 20));
+          processed.add(new TopicPartitionOffset(record.partition(), record.offset()));
+        };
+
+    KafkaPipeline<String, String> first = start(group, topic, slow);
+    await(() -> processed.size() >= 300, () -> "processed " + processed.size());
+    first.stop();
+    first.awaitShutdown();
+    pipelines.remove(first);
+
+    // Every offset below each committed position must have been processed: shutdown must never
+    // commit past a record that was still queued or running.
+    Map<TopicPartition, Long> committedAfterStop = committed(group, topic);
+    assertFalse(committedAfterStop.isEmpty(), "shutdown should commit completed work");
+    committedAfterStop.forEach(
+        (tp, offset) -> {
+          for (long o = 0; o < offset; o++) {
+            assertTrue(
+                processed.contains(new TopicPartitionOffset(tp.partition(), o)),
+                "committed past unprocessed offset " + o + " of " + tp);
+          }
+        });
+    assertTrue(processed.size() < 2_000, "stop should not wait for the whole backlog");
+
+    start(group, topic, slow);
+    await(() -> processed.size() == 2_000, () -> "processed " + processed.size() + "/2000");
+    await(() -> committedToEnd(group, topic), () -> "committed " + committed(group, topic));
+  }
+
+  @Test
+  void consumerRemovedFromGroup_rejoinsAndFinishesWithoutLoss() throws Exception {
+    String topic = createTopic();
+    String group = "g-" + UUID.randomUUID();
+    String instanceId = "member-" + UUID.randomUUID();
+    produce(topic, 0, 2_000);
+
+    Set<String> seen = ConcurrentHashMap.newKeySet();
+    KafkaPipeline<String, String> pipeline =
+        start(
+            group,
+            topic,
+            record -> {
+              Thread.sleep(25);
+              seen.add(record.value());
+            },
+            Map.of(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, instanceId));
+    await(() -> seen.size() >= 300, () -> "processed " + seen.size());
+
+    // Kick the consumer out of the group, as the coordinator does when it considers a member
+    // dead. Its partitions are lost rather than revoked: it can no longer commit for them.
+    try (Admin admin = admin()) {
+      admin
+          .removeMembersFromConsumerGroup(
+              group,
+              new RemoveMembersFromConsumerGroupOptions(List.of(new MemberToRemove(instanceId))))
+          .all()
+          .get();
+    }
+
+    await(() -> seen.size() == 2_000, () -> "processed " + seen.size() + "/2000 after kick-out");
+    await(() -> committedToEnd(group, topic), () -> "committed " + committed(group, topic));
+    assertTrue(pipeline.isRunning(), "pipeline should rejoin, not stop");
+    assertTrue(pipeline.metrics().rebalanceCount() >= 1, "the kick-out should have happened");
+  }
+
+  private record TopicPartitionOffset(int partition, long offset) {}
+
   // ── helpers ───────────────────────────────────────────────────
 
   private static void handleAs(
@@ -162,12 +267,21 @@ class KafkaPipelineBrokerIT {
       String group,
       String topic,
       io.github.openlogiclab.kafkapipeline.handler.RecordHandler<String, String> handler) {
+    return start(group, topic, handler, Map.of());
+  }
+
+  private KafkaPipeline<String, String> start(
+      String group,
+      String topic,
+      io.github.openlogiclab.kafkapipeline.handler.RecordHandler<String, String> handler,
+      Map<String, String> extraProps) {
     Properties props = new Properties();
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
     props.put(ConsumerConfig.GROUP_ID_CONFIG, group);
     props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
     props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
     props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+    props.putAll(extraProps);
     KafkaPipeline<String, String> pipeline =
         new KafkaPipeline<>(
             KafkaPipeline.<String, String>builder()
@@ -176,6 +290,7 @@ class KafkaPipelineBrokerIT {
                 .handler(handler)
                 .concurrency(ThreadMode.VIRTUAL, 50)
                 .commitInterval(Duration.ofMillis(200))
+                .drainTimeout(Duration.ofSeconds(2))
                 .shutdownTimeout(Duration.ofSeconds(10))
                 .build());
     pipelines.add(pipeline);

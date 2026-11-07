@@ -85,6 +85,35 @@ class PipelineRebalanceListenerTest {
   }
 
   @Test
+  void lostPartitions_dropStateWithoutDrainingOrCommitting() {
+    mockConsumer.assign(List.of(TP0));
+    mockConsumer.updateBeginningOffsets(Map.of(TP0, 0L));
+    listener.onPartitionsAssigned(List.of(TP0));
+    tracker.register(TP0, 0L);
+    tracker.markInProgress(TP0, 0L); // still running; would block a normal revoke's drain
+    tracker.register(TP0, 1L);
+    dispatcher.dispatch(TP0, new ConsumerRecord<>("test", 0, 1L, "k", "v"));
+    counter.registered(2, 0);
+
+    long start = System.nanoTime();
+    listener.onPartitionsLost(List.of(TP0));
+
+    assertTrue(
+        System.nanoTime() - start < java.util.concurrent.TimeUnit.SECONDS.toNanos(1),
+        "must not wait drainTimeout");
+    assertEquals(0, commitSyncCalls.get(), "lost partitions cannot be committed");
+    assertFalse(dispatcher.partitions().contains(TP0));
+    assertEquals(OffsetTracker.NO_GENERATION, tracker.generation(TP0));
+    assertEquals(1, counter.records(), "queued record released; running one still counts");
+  }
+
+  @Test
+  void lostNothing_isANoOp() {
+    listener.onPartitionsLost(List.of());
+    assertEquals(0, commitSyncCalls.get());
+  }
+
+  @Test
   void assignedQueue_carriesTheTrackersGeneration() {
     mockConsumer.assign(List.of(TP0));
     mockConsumer.updateBeginningOffsets(Map.of(TP0, 0L));
