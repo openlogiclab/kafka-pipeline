@@ -90,6 +90,37 @@ tasks.test {
     finalizedBy(tasks.jacocoTestReport)
 }
 
+// Tests against a real Kafka broker in Docker (Testcontainers). Kept out of the fast unit-test task;
+// `check` runs them, so CI does too. Run alone with `./gradlew integrationTest`.
+val integrationTestSourceSet: SourceSet = sourceSets.create("integrationTest") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
+configurations[integrationTestSourceSet.implementationConfigurationName]
+    .extendsFrom(configurations.testImplementation.get())
+configurations[integrationTestSourceSet.runtimeOnlyConfigurationName]
+    .extendsFrom(configurations.testRuntimeOnly.get())
+
+dependencies {
+    "integrationTestImplementation"("org.testcontainers:testcontainers-kafka:2.0.4")
+    "integrationTestImplementation"("org.testcontainers:testcontainers-junit-jupiter:2.0.4")
+    "integrationTestRuntimeOnly"("org.slf4j:slf4j-simple:2.0.17")
+}
+
+val integrationTest = tasks.register<Test>("integrationTest") {
+    description = "Runs tests against a real Kafka broker (requires Docker)."
+    group = "verification"
+    testClassesDirs = integrationTestSourceSet.output.classesDirs
+    classpath = integrationTestSourceSet.runtimeClasspath
+    useJUnitPlatform()
+    shouldRunAfter(tasks.test)
+}
+
+tasks.check {
+    dependsOn(integrationTest)
+}
+
 tasks.jacocoTestReport {
     dependsOn(tasks.test)
     reports {

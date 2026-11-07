@@ -604,7 +604,7 @@ app.get("/health", ctx -> {
 |---|---|---|
 | Throughput drops to zero | `backpressureStatus`, `inFlightRecords` | Backpressure triggered — workers slower than poll rate |
 | Consumer lag growing | `partitionLags`, `retryAttempts` | Retry storms or slow handler |
-| Frequent rebalances | `rebalanceCount`, `drainTimeouts` | `max.poll.interval.ms` too low for handler time |
+| Frequent rebalances | `rebalanceCount`, `drainTimeouts` | Pods restarting or scaling without static membership, or `session.timeout.ms` too low (see [Running in Production](#running-in-production)) |
 | Data loss suspected | `recordsSkipped`, `dlqSuccesses` | Fallback=SKIP dropping records |
 | Memory pressure | `inFlightRecords`, `inFlightBytes` | Backpressure thresholds too high |
 
@@ -639,7 +639,7 @@ pipeline.awaitShutdown();
 | `lifecycleHook` | no-op | Before/after/error callbacks (per-record mode only) |
 | `commitInterval` | 5s | How often to commit offsets async |
 | `drainTimeout` | 30s | Max wait for in-flight records during rebalance |
-| `shutdownTimeout` | 30s | Max wait for workers during shutdown |
+| `shutdownTimeout` | 30s | Max wait for records already being processed to finish on shutdown; queued records that haven't started are redelivered on the next start |
 | `pollTimeout` | 100ms | Kafka consumer poll timeout |
 | `dispatchQueueCapacity` | 500 | Bounded queue capacity for pending work (see below) |
 | `maxConcurrencyPerPartition` | 0 (unlimited) | Max records of one partition processed at once, so a slow partition can't take every worker (per-record mode; see [Noisy partitions](#noisy-partitions)) |
@@ -700,6 +700,41 @@ KafkaPipeline.<String, String>builder()
 
 In this setup, backpressure pauses the poll loop well before the dispatch queue fills up. The queue-full pause only kicks in as a last resort if something unexpected happens at runtime.
 
+## Running in Production
+
+### Kafka consumer settings
+
+Pass these through `consumerProperties`:
+
+```java
+// Only partitions that actually move are revoked during a rebalance; the rest keep processing.
+kafkaProps.put("partition.assignment.strategy",
+    "org.apache.kafka.clients.consumer.CooperativeStickyAssignor");
+
+// Static membership: a restarting pod rejoins with the same identity and keeps its partitions,
+// so a rolling deploy does not trigger a rebalance per pod. Must be unique and stable per
+// instance, e.g. the StatefulSet pod name exposed through the Kubernetes downward API.
+kafkaProps.put("group.instance.id", System.getenv("POD_NAME"));
+kafkaProps.put("session.timeout.ms", "45000"); // longer than a pod restart takes
+```
+
+`max.poll.interval.ms` does not need to cover handler time. The poll thread keeps calling `poll()` while records are processed, and pauses partitions instead of blocking when queues or windows fill up. It only has to cover `drainTimeout` (default 30s), which runs inside `poll()` during a rebalance.
+
+### Scaling
+
+- **Partitions cap parallelism across pods.** Each partition belongs to one pod in the group, so pods beyond the partition count sit idle. Create topics with headroom (for example 2–4× the most pods you expect); adding partitions later changes which partition each key maps to.
+- **Scale on consumer lag, not CPU.** I/O-bound handlers keep CPU low while lag grows. KEDA's Kafka scaler can scale a Deployment on lag directly.
+- **Get more out of each pod first.** `ThreadMode.VIRTUAL` and batch mode with bulk writes downstream usually raise throughput per pod more cheaply than adding pods.
+- **One pipeline per workload.** See [One topic per pipeline](#one-topic-per-pipeline) and [Noisy partitions](#noisy-partitions).
+
+### Kubernetes CPU limits
+
+The JVM sizes itself from the container's CPU limit: the number of carrier threads that run virtual threads, GC threads and `availableProcessors()` all follow it. With a limit of `1` or less (e.g. `500m`), every virtual thread shares a single carrier, and CFS throttling adds latency spikes.
+
+- Give pods at least 2 CPUs, or set the processor count explicitly with `-XX:ActiveProcessorCount=N`.
+- Pinning threads to cores (CPU affinity) is not supported. Containers with CPU limits run on time slices across cores, and virtual threads move between carriers, so pinning would not hold.
+- Size the heap from the container limit, e.g. `-XX:MaxRAMPercentage=75`, and keep backpressure watermarks well under it.
+
 ## Offset Management
 
 This is the hardest part to get right, and the main reason this library exists.
@@ -742,7 +777,7 @@ KafkaPipeline.<String, String>builder()
 
 A larger window gives slow records more slack before the partition pauses, but uses more memory (roughly 50 bytes per entry) and means more records are reprocessed after a crash.
 
-On rebalance, the pipeline drains in-flight records (up to `drainTimeout`), does a final sync commit, then hands the partition off cleanly.
+On rebalance, the pipeline drains in-flight records (up to `drainTimeout`), does a final sync commit, then hands the partition off cleanly. A record that is still running when `drainTimeout` expires is not acked when it finishes, even if the partition has come back to this same consumer in the meantime: each assignment gets its own generation, and results from an older one are discarded. That record is redelivered from the committed offset instead.
 
 ### The Duplicate Processing Problem
 
@@ -778,8 +813,12 @@ The library doesn't try to solve idempotency for you — that's deeply tied to y
 ## Running Tests
 
 ```bash
-./gradlew test
+./gradlew test               # unit tests
+./gradlew integrationTest    # against a real Kafka broker in Docker (Testcontainers)
+./gradlew check              # both, plus formatting checks
 ```
+
+Integration tests are skipped automatically when Docker is not available.
 
 ## Contributing
 

@@ -149,7 +149,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         RecordDispatcher.PollResult<K, V> result = dispatcher.poll(100, MILLISECONDS);
         if (result == null) continue;
         try {
-          processRecord(result.partition(), result.record());
+          processRecord(result.partition(), result.record(), result.generation());
         } finally {
           dispatcher.release(result);
         }
@@ -159,9 +159,9 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     }
   }
 
-  private void processRecord(TopicPartition tp, ConsumerRecord<K, V> record) {
+  private void processRecord(TopicPartition tp, ConsumerRecord<K, V> record, long generation) {
     try {
-      process(tp, record);
+      process(tp, record, generation);
     } finally {
       // Always release the in-flight slot, even if the partition was revoked mid-processing and
       // the ack below failed; otherwise backpressure would never drain.
@@ -169,12 +169,12 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     }
   }
 
-  private void process(TopicPartition tp, ConsumerRecord<K, V> record) {
+  private void process(TopicPartition tp, ConsumerRecord<K, V> record, long generation) {
     long offset = record.offset();
     ProcessingContext ctx = new ProcessingContext(tp, offset, 0);
 
     try {
-      offsetTracker.markInProgress(tp, offset);
+      offsetTracker.markInProgress(tp, offset, generation);
     } catch (IllegalStateException e) {
       logger.log(
           System.Logger.Level.WARNING,
@@ -197,21 +197,21 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     }
 
     if (shouldSkipViaHook) {
-      ack(tp, offset);
+      ack(tp, offset, generation);
       metricsCollector.recordSkipped(1);
       return;
     }
 
     String desc = "offset " + offset;
+    int[] lastAttempt = {0};
     Exception lastError =
         retryExecutor.executeWithRetries(
             attempt -> {
-              ProcessingContext attemptCtx = new ProcessingContext(tp, offset, attempt);
+              lastAttempt[0] = attempt;
               try {
                 handler.handle(record);
-                hook.afterProcess(record, attemptCtx);
               } catch (Exception ex) {
-                hook.onError(record, attemptCtx, ex);
+                hook.onError(record, new ProcessingContext(tp, offset, attempt), ex);
                 throw ex;
               }
             },
@@ -219,7 +219,16 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
             desc);
 
     if (lastError == null) {
-      ack(tp, offset);
+      // Outside the retry loop: a hook that throws must not re-run a handler that succeeded.
+      try {
+        hook.afterProcess(record, new ProcessingContext(tp, offset, lastAttempt[0]));
+      } catch (Exception e) {
+        logger.log(
+            System.Logger.Level.WARNING,
+            "afterProcess hook threw for " + tp + ":" + offset + "; the record is still acked",
+            e);
+      }
+      ack(tp, offset, generation);
       metricsCollector.recordProcessed(1);
       return;
     }
@@ -240,9 +249,9 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         retryExecutor.handleFailure(List.of(record), tp, lastError, desc);
     if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
       metricsCollector.recordFailed(1);
-      if (ack(tp, offset)) offsetTracker.markFailed(tp);
+      if (ack(tp, offset, generation)) offsetTracker.markFailed(tp);
     } else {
-      ack(tp, offset);
+      ack(tp, offset, generation);
     }
   }
 
@@ -251,9 +260,9 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
    * record finishes after its partition was revoked and the drain timeout expired. The new owner
    * re-consumes it from the last committed offset, so there is nothing more to do here.
    */
-  private boolean ack(TopicPartition tp, long offset) {
+  private boolean ack(TopicPartition tp, long offset, long generation) {
     try {
-      offsetTracker.ack(tp, offset);
+      offsetTracker.ack(tp, offset, generation);
       return true;
     } catch (IllegalStateException e) {
       logger.log(

@@ -127,7 +127,10 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       counter.registered(batch.size(), batchBytes);
 
       long totalBytes = batchBytes;
-      executor.submit(() -> processBatch(tp, batch, offsets, totalBytes));
+      // Captured on the poll thread, where rebalance callbacks also run, so it is exactly the
+      // generation the batch was registered under.
+      long generation = offsetTracker.generation(tp);
+      executor.submit(() -> processBatch(tp, batch, offsets, totalBytes, generation));
     }
     return rejected;
   }
@@ -138,14 +141,18 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   }
 
   private void processBatch(
-      TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets, long totalBytes) {
+      TopicPartition tp,
+      List<ConsumerRecord<K, V>> batch,
+      long[] offsets,
+      long totalBytes,
+      long generation) {
     try {
       if (handlerPermits == null) {
-        process(tp, batch, offsets);
+        process(tp, batch, offsets, generation);
       } else {
         handlerPermits.acquire();
         try {
-          process(tp, batch, offsets);
+          process(tp, batch, offsets, generation);
         } finally {
           handlerPermits.release();
         }
@@ -161,12 +168,13 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     }
   }
 
-  private void process(TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets) {
+  private void process(
+      TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets, long generation) {
     long firstOffset = offsets[0];
     long lastOffset = offsets[offsets.length - 1];
 
     try {
-      offsetTracker.markBatchInProgress(tp, offsets);
+      offsetTracker.markBatchInProgress(tp, offsets, generation);
     } catch (IllegalStateException e) {
       logger.log(
           System.Logger.Level.WARNING,
@@ -184,7 +192,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         retryExecutor.executeWithRetries(attempt -> handler.handleBatch(tp, batch), tp, desc);
 
     if (lastError == null) {
-      ackBatch(tp, offsets, desc);
+      ackBatch(tp, offsets, generation, desc);
       metricsCollector.recordProcessed(batch.size());
       return;
     }
@@ -202,9 +210,9 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         retryExecutor.handleFailure(batch, tp, lastError, desc);
     if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
       metricsCollector.recordFailed(batch.size());
-      if (ackBatch(tp, offsets, desc)) offsetTracker.markFailed(tp);
+      if (ackBatch(tp, offsets, generation, desc)) offsetTracker.markFailed(tp);
     } else {
-      ackBatch(tp, offsets, desc);
+      ackBatch(tp, offsets, generation, desc);
     }
   }
 
@@ -213,9 +221,9 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
    * finishes after its partition was revoked and the drain timeout expired. The new owner
    * re-consumes it from the last committed offset, so there is nothing more to do here.
    */
-  private boolean ackBatch(TopicPartition tp, long[] offsets, String desc) {
+  private boolean ackBatch(TopicPartition tp, long[] offsets, long generation, String desc) {
     try {
-      offsetTracker.ackBatch(tp, offsets);
+      offsetTracker.ackBatch(tp, offsets, generation);
       return true;
     } catch (IllegalStateException e) {
       logger.log(

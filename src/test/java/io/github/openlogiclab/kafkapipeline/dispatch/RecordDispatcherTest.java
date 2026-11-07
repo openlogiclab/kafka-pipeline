@@ -174,7 +174,7 @@ class RecordDispatcherTest {
       dispatcher.addPartition(TP0);
       dispatcher.dispatch(TP0, record(TP0, 0));
       RecordDispatcher.PollResult<String, String> r = dispatcher.poll(10, TimeUnit.MILLISECONDS);
-      assertNull(r.lane());
+      assertEquals(-1L, r.generation(), "no generation given to addPartition");
       assertEquals(0, dispatcher.activeRecords(TP0));
       dispatcher.release(r);
       assertEquals(0, dispatcher.activeRecords(TP0));

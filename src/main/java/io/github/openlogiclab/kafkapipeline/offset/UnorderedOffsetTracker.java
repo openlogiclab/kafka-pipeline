@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.kafka.common.TopicPartition;
 
 /**
@@ -37,6 +38,7 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
       new ConcurrentHashMap<>();
 
   private final int maxWindowSize;
+  private final AtomicLong nextGeneration = new AtomicLong();
 
   /** Creates a new unordered offset tracker. */
   public UnorderedOffsetTracker() {
@@ -92,6 +94,32 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
+  public long generation(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.generation() : NO_GENERATION;
+  }
+
+  @Override
+  public void markInProgress(TopicPartition tp, long offset, long generation) {
+    getOrThrow(tp, generation).markInProgress(offset);
+  }
+
+  @Override
+  public int markBatchInProgress(TopicPartition tp, long[] offsets, long generation) {
+    return getOrThrow(tp, generation).markBatchInProgress(offsets);
+  }
+
+  @Override
+  public void ack(TopicPartition tp, long offset, long generation) {
+    getOrThrow(tp, generation).ack(offset);
+  }
+
+  @Override
+  public int ackBatch(TopicPartition tp, long[] offsets, long generation) {
+    return getOrThrow(tp, generation).ackBatch(offsets);
+  }
+
+  @Override
   public OptionalLong getCommittableOffset(TopicPartition tp) {
     PartitionWindow window = partitions.get(tp);
     if (Objects.isNull(window)) {
@@ -135,7 +163,8 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   @Override
   public void initPartition(TopicPartition tp, long startOffset) {
     PartitionWindow existing =
-        partitions.putIfAbsent(tp, new PartitionWindow(startOffset, maxWindowSize));
+        partitions.putIfAbsent(
+            tp, new PartitionWindow(startOffset, maxWindowSize, nextGeneration.incrementAndGet()));
     if (existing != null) {
       throw new IllegalStateException(
           "Partition " + tp + " already initialized. Call clearPartition first.");
@@ -216,6 +245,21 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   @Override
   public int maxWindowSize() {
     return maxWindowSize;
+  }
+
+  private PartitionWindow getOrThrow(TopicPartition tp, long generation) {
+    PartitionWindow window = getOrThrow(tp);
+    if (generation != NO_GENERATION && window.generation() != generation) {
+      throw new IllegalStateException(
+          "Partition "
+              + tp
+              + " was re-assigned since this record was fetched (generation "
+              + generation
+              + ", now "
+              + window.generation()
+              + ")");
+    }
+    return window;
   }
 
   private PartitionWindow getOrThrow(TopicPartition tp) {
