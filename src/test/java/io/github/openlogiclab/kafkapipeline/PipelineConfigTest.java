@@ -37,9 +37,26 @@ class PipelineConfigTest {
   private PipelineConfig.Builder<String, String> minimalBuilder() {
     return PipelineConfig.<String, String>builder()
         .consumerProperties(props())
-        .topics("test-topic")
+        .topic("test-topic")
         .handler(record -> {})
         .concurrency(ThreadMode.PLATFORM, 4);
+  }
+
+  @Test
+  void topic_subscribesToExactlyThatTopic() {
+    assertEquals(List.of("test-topic"), minimalBuilder().build().topics());
+  }
+
+  @Test
+  void topic_null_throws() {
+    assertThrows(NullPointerException.class, () -> minimalBuilder().topic(null));
+  }
+
+  @Test
+  void topics_stillSupportsSeveralTopics() {
+    assertEquals(
+        List.of("orders-us", "orders-eu"),
+        minimalBuilder().topics("orders-us", "orders-eu").build().topics());
   }
 
   // ── Builder Required Fields ──────────────────────────────────

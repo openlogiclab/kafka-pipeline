@@ -58,7 +58,7 @@ kafkaProps.put("value.deserializer", "org.apache.kafka.common.serialization.Stri
 KafkaPipeline<String, String> pipeline = new KafkaPipeline<>(
     KafkaPipeline.<String, String>builder()
         .consumerProperties(kafkaProps)
-        .topics("orders", "payments")
+        .topic("orders")
         .handler(record -> orderService.process(record))
         .concurrency(ThreadMode.VIRTUAL, 200)
         .build());
@@ -298,6 +298,36 @@ The high/low watermark gap is the hysteresis band. Without it, the consumer woul
 
 ## Configuration
 
+### One topic per pipeline
+
+Use `.topic("orders")` and run one `KafkaPipeline` per topic, each with its own `group.id`. Everything inside a pipeline is shared: the worker thread pool, the global backpressure watermarks and the consumer. If one pipeline serves two topics, a slow topic can occupy every worker and its backpressure pauses the other topic too.
+
+```java
+ordersProps.put("group.id", "svc-orders");
+paymentsProps.put("group.id", "svc-payments");
+
+KafkaPipeline<String, String> orders = new KafkaPipeline<>(
+    KafkaPipeline.<String, String>builder()
+        .consumerProperties(ordersProps)
+        .topic("orders")
+        .handler(record -> orderService.process(record))
+        .concurrency(ThreadMode.VIRTUAL, 200)
+        .build());
+
+KafkaPipeline<String, String> payments = new KafkaPipeline<>(
+    KafkaPipeline.<String, String>builder()
+        .consumerProperties(paymentsProps)
+        .topic("payments")
+        .handler(record -> paymentService.process(record))
+        .concurrency(ThreadMode.VIRTUAL, 50)
+        .build());
+
+orders.startAsync();
+payments.startAsync();
+```
+
+`.topics("orders-us", "orders-eu")` is still available for topics that are really the same workload (same handler, similar volume and latency), such as regional shards.
+
 ### Thread Model
 
 Two options, set explicitly when you configure concurrency:
@@ -350,7 +380,7 @@ For high-throughput scenarios where per-record overhead matters — bulk inserts
 KafkaPipeline<String, String> pipeline = new KafkaPipeline<>(
     KafkaPipeline.<String, String>builder()
         .consumerProperties(kafkaProps)
-        .topics("events")
+        .topic("events")
         .batchHandler((partition, records) -> {
             bulkInsert(records);
         })
@@ -574,7 +604,7 @@ pipeline.awaitShutdown();
 | Option | Default | Description |
 |---|---|---|
 | `consumerProperties` | *required* | Standard Kafka consumer properties (`enable.auto.commit` is forced to `false`) |
-| `topics` | *required* | Topics to subscribe to |
+| `topic` / `topics` | *required* | Topic to subscribe to; one per pipeline is recommended (see [One topic per pipeline](#one-topic-per-pipeline)) |
 | `handler` | *one required* | Your `RecordHandler<K,V>` for per-record mode |
 | `batchHandler` | *one required* | Your `BatchRecordHandler<K,V>` for batch mode |
 | `concurrency(ThreadMode, int)` | *required* | Thread model and worker count |
@@ -605,7 +635,7 @@ kafkaProps.put("max.poll.records", "1000");
 
 KafkaPipeline.<String, String>builder()
     .consumerProperties(kafkaProps)
-    .topics("events")
+    .topic("events")
     .handler(record -> process(record))
     .concurrency(ThreadMode.VIRTUAL, 200)
     .dispatchQueueCapacity(1000)
@@ -630,7 +660,7 @@ A full example tying `dispatchQueueCapacity`, `max.poll.records`, and backpressu
 
 KafkaPipeline.<String, String>builder()
     .consumerProperties(kafkaProps)
-    .topics("orders")
+    .topic("orders")
     .handler(record -> orderService.process(record))
     .concurrency(ThreadMode.VIRTUAL, 100)
     .backpressure(BackpressureConfig.builder()
