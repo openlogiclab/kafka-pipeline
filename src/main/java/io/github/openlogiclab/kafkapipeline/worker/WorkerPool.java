@@ -20,9 +20,11 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
 
@@ -90,6 +92,55 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
   public abstract Map<TopicPartition, Long> dispatch(ConsumerRecords<K, V> records);
 
   /**
+   * Returns whether a partition that was paused because its records could not be queued may resume
+   * fetching. Called from the poll thread.
+   *
+   * @param tp the partition
+   * @return true once there is room again
+   */
+  public abstract boolean canResume(TopicPartition tp);
+
+  /**
+   * Returns whether the bounded task queue (PLATFORM threads with a task queue capacity) has room
+   * for one more task. Always true for unbounded executors. The poll thread is the only submitter,
+   * so a {@code true} result stays true until it submits.
+   */
+  protected boolean hasTaskQueueRoom() {
+    return !(executor instanceof ThreadPoolExecutor tpe) || tpe.getQueue().remainingCapacity() > 0;
+  }
+
+  /** Returns whether the bounded task queue has drained to at most half its capacity. */
+  protected boolean taskQueueDrained() {
+    if (!(executor instanceof ThreadPoolExecutor tpe)) return true;
+    var queue = tpe.getQueue();
+    int capacity = queue.size() + queue.remainingCapacity();
+    return queue.size() <= capacity / 2;
+  }
+
+  // Rate limit for the "task queue full" warning: at most one log line per interval.
+  private static final long QUEUE_FULL_LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
+  private final AtomicLong lastQueueFullLogNanos =
+      new AtomicLong(System.nanoTime() - QUEUE_FULL_LOG_INTERVAL_NANOS);
+  private final AtomicLong queueFullCount = new AtomicLong();
+
+  /** Logs a rate-limited warning that a partition was paused because the task queue was full. */
+  protected void reportTaskQueueFull(TopicPartition tp) {
+    long count = queueFullCount.incrementAndGet();
+    long now = System.nanoTime();
+    long last = lastQueueFullLogNanos.get();
+    if (now - last >= QUEUE_FULL_LOG_INTERVAL_NANOS
+        && lastQueueFullLogNanos.compareAndSet(last, now)) {
+      queueFullCount.addAndGet(-count);
+      logger.log(
+          System.Logger.Level.WARNING,
+          "Executor task queue full, pausing {0} until workers catch up ({1} times since last"
+              + " warning) — consider more concurrency or a larger dispatchQueueCapacity",
+          tp,
+          count);
+    }
+  }
+
+  /**
    * Stops the worker pool and waits for termination.
    *
    * @param timeoutMs max time to wait in milliseconds
@@ -143,16 +194,10 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
               factory,
               (task, pool) -> {
                 if (pool.isShutdown()) return;
-                logger.log(
-                    System.Logger.Level.WARNING,
-                    "Executor task queue full (capacity={0}), caller thread will block "
-                        + "— consider increasing concurrency or lowering throughput",
-                    taskQueueCapacity);
-                try {
-                  pool.getQueue().put(task);
-                } catch (InterruptedException e) {
-                  Thread.currentThread().interrupt();
-                }
+                // Unreachable while dispatch() checks hasTaskQueueRoom() first; fail loudly rather
+                // than blocking the poll thread.
+                throw new RejectedExecutionException(
+                    "Task queue full (capacity=" + taskQueueCapacity + ")");
               });
         } else {
           yield Executors.newFixedThreadPool(concurrency, factory);

@@ -67,7 +67,7 @@ class BatchWorkerPoolTest {
   class ExecutorQueueFull {
 
     @Test
-    void rejectedExecutionHandler_blocksUntilSpace() throws Exception {
+    void fullTaskQueue_rejectsBatchWithoutBlockingTheCaller() throws Exception {
       TopicPartition tp1 = new TopicPartition("test", 1);
       TopicPartition tp2 = new TopicPartition("test", 2);
       tracker.initPartition(tp1, 0);
@@ -78,7 +78,6 @@ class BatchWorkerPoolTest {
       AtomicInteger completedBatches = new AtomicInteger();
 
       // concurrency=1 + taskQueueCapacity=1: one thread occupied + one slot in queue.
-      // Third submit triggers the RejectedExecutionHandler.
       BatchWorkerPool<String, String> pool =
           new BatchWorkerPool<>(
               1,
@@ -98,27 +97,24 @@ class BatchWorkerPoolTest {
       pool.start();
 
       // First dispatch (TP0) occupies the single thread
-      pool.dispatch(buildRecords(TP0, 0, 0));
+      assertTrue(pool.dispatch(buildRecords(TP0, 0, 0)).isEmpty());
       assertTrue(taskStarted.await(3, TimeUnit.SECONDS));
-
       // Second dispatch (tp1) fills the queue (capacity=1)
-      pool.dispatch(buildRecords(tp1, 0, 0));
+      assertTrue(pool.dispatch(buildRecords(tp1, 0, 0)).isEmpty());
+      assertFalse(pool.canResume(tp2));
 
-      // Third dispatch (tp2) triggers RejectedExecutionHandler — caller blocks
-      Thread submitter = new Thread(() -> pool.dispatch(buildRecords(tp2, 0, 0)));
-      submitter.start();
+      // Third dispatch (tp2) finds no room: returned for a seek-back, nothing registered.
+      long start = System.nanoTime();
+      Map<TopicPartition, Long> rejected = pool.dispatch(buildRecords(tp2, 5, 6));
+      assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(1), "must not block");
+      assertEquals(Map.of(tp2, 5L), rejected);
+      assertEquals(0, tracker.windowSize(tp2));
 
-      Thread.sleep(200);
-      assertTrue(submitter.isAlive(), "Submitter should be blocked by RejectedExecutionHandler");
-
-      // Release first task — frees the thread, queue drains
       blockLatch.countDown();
-      submitter.join(5000);
-
-      assertFalse(submitter.isAlive(), "Submitter should have completed");
+      long deadline = System.currentTimeMillis() + 5_000;
+      while (completedBatches.get() < 2 && System.currentTimeMillis() < deadline) Thread.sleep(10);
+      assertTrue(pool.canResume(tp2), "queue drained, partition may resume");
       pool.stop(5000);
-
-      assertEquals(3, completedBatches.get());
     }
   }
 

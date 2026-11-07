@@ -114,6 +114,13 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     int dispatched = 0;
     for (TopicPartition tp : records.partitions()) {
       for (ConsumerRecord<K, V> record : records.records(tp)) {
+        if (!dispatcher.hasRoom(tp)) {
+          // Never block the poll thread on a full queue: fetch the rest again once it drains.
+          dispatcher.reportFull(tp);
+          if (rejected.isEmpty()) rejected = new HashMap<>();
+          rejected.put(tp, record.offset());
+          break;
+        }
         try {
           offsetTracker.register(tp, record.offset());
         } catch (WindowFullException e) {
@@ -128,6 +135,11 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     }
     dispatcher.wakeWorkers(dispatched);
     return rejected;
+  }
+
+  @Override
+  public boolean canResume(TopicPartition tp) {
+    return dispatcher.hasDrained(tp);
   }
 
   private void workerLoop() {
