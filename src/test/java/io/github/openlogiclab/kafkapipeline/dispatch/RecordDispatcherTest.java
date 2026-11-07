@@ -123,6 +123,18 @@ class RecordDispatcherTest {
       dispatcher.retainOnly(Set.of(TP0, TP2));
       assertEquals(Set.of(TP0, TP2), dispatcher.partitions());
     }
+
+    @Test
+    void retainOnly_stopsPollingRemovedPartitions() {
+      dispatcher.addPartition(TP0);
+      dispatcher.addPartition(TP1);
+      dispatcher.dispatch(TP1, record(TP1, 0));
+
+      dispatcher.retainOnly(Set.of(TP0));
+
+      assertEquals(0, dispatcher.totalQueuedRecords());
+      assertNull(dispatcher.poll(10, TimeUnit.MILLISECONDS), "removed queue must not be polled");
+    }
   }
 
   @Nested
@@ -249,7 +261,7 @@ class RecordDispatcherTest {
       assertTrue(started.await(1, TimeUnit.SECONDS));
       Thread.sleep(50);
       dispatcher.dispatch(TP0, record(TP0, 99));
-      dispatcher.wakeWorkers();
+      dispatcher.wakeWorkers(1);
 
       assertTrue(done.await(1, TimeUnit.SECONDS));
       assertNotNull(result.get());
@@ -369,6 +381,138 @@ class RecordDispatcherTest {
       exec.awaitTermination(2, TimeUnit.SECONDS);
       assertEquals(total, polled.get());
       assertEquals(0, large.totalQueuedRecords());
+    }
+  }
+
+  @Nested
+  class TargetedWakeups {
+
+    private Thread parkedWorker(AtomicInteger got, CountDownLatch registered) {
+      Thread t =
+          Thread.ofPlatform()
+              .start(
+                  () -> {
+                    registered.countDown();
+                    if (dispatcher.poll(10, TimeUnit.SECONDS) != null) got.incrementAndGet();
+                  });
+      return t;
+    }
+
+    private void awaitParked(Thread... threads) throws InterruptedException {
+      long deadline = System.currentTimeMillis() + 2_000;
+      for (Thread t : threads) {
+        while (t.getState() != Thread.State.TIMED_WAITING) {
+          assertTrue(System.currentTimeMillis() < deadline, "worker did not park");
+          Thread.sleep(5);
+        }
+      }
+    }
+
+    @Test
+    void wakeWorkers_wakesNoMoreWorkersThanRecords() throws Exception {
+      dispatcher.addPartition(TP0);
+      AtomicInteger got = new AtomicInteger();
+      CountDownLatch registered = new CountDownLatch(3);
+      Thread a = parkedWorker(got, registered);
+      Thread b = parkedWorker(got, registered);
+      Thread c = parkedWorker(got, registered);
+      awaitParked(a, b, c);
+
+      dispatcher.dispatch(TP0, record(TP0, 0));
+      dispatcher.wakeWorkers(1);
+
+      long deadline = System.currentTimeMillis() + 2_000;
+      while (got.get() < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+      assertEquals(1, got.get());
+      Thread.sleep(100);
+      int stillParked = 0;
+      for (Thread t : new Thread[] {a, b, c}) {
+        if (t.getState() == Thread.State.TIMED_WAITING) stillParked++;
+      }
+      assertEquals(2, stillParked, "only one worker should have been woken");
+
+      a.interrupt();
+      b.interrupt();
+      c.interrupt();
+    }
+
+    @Test
+    void remainingRecordsAreHandedOnWithoutWaitingForTimeout() throws Exception {
+      dispatcher.addPartition(TP0);
+      AtomicInteger got = new AtomicInteger();
+      CountDownLatch registered = new CountDownLatch(2);
+      Thread a = parkedWorker(got, registered);
+      Thread b = parkedWorker(got, registered);
+      awaitParked(a, b);
+
+      // Two records but only one wakeup: the woken worker sees a record still queued and wakes
+      // the other, well before the 10s park timeout.
+      dispatcher.dispatch(TP0, record(TP0, 0));
+      dispatcher.dispatch(TP0, record(TP0, 1));
+      dispatcher.wakeWorkers(1);
+
+      a.join(2_000);
+      b.join(2_000);
+      assertEquals(2, got.get());
+    }
+
+    @Test
+    void wakeWorkers_withNoRecordsWakesNobody() throws Exception {
+      dispatcher.addPartition(TP0);
+      AtomicInteger got = new AtomicInteger();
+      Thread a = parkedWorker(got, new CountDownLatch(1));
+      awaitParked(a);
+
+      dispatcher.wakeWorkers(0);
+      Thread.sleep(100);
+
+      assertEquals(Thread.State.TIMED_WAITING, a.getState());
+      a.interrupt();
+    }
+  }
+
+  @Nested
+  class QueueFullWarning {
+
+    @Test
+    void loggedOncePerIntervalNotPerBlockedRecord() throws Exception {
+      java.util.logging.Logger jul =
+          java.util.logging.Logger.getLogger(RecordDispatcher.class.getName());
+      AtomicInteger warnings = new AtomicInteger();
+      java.util.logging.Handler handler =
+          new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord r) {
+              if (r.getLevel() == java.util.logging.Level.WARNING
+                  && String.valueOf(r.getMessage()).startsWith("Dispatch queue full")) {
+                warnings.incrementAndGet();
+              }
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+          };
+      jul.addHandler(handler);
+      try {
+        RecordDispatcher<String, String> small = new RecordDispatcher<>(1);
+        small.addPartition(TP0);
+        small.dispatch(TP0, record(TP0, 0));
+
+        for (long offset = 1; offset <= 3; offset++) {
+          long next = offset;
+          Thread producer = Thread.ofPlatform().start(() -> small.dispatch(TP0, record(TP0, next)));
+          while (producer.getState() != Thread.State.WAITING) Thread.sleep(5); // blocked in put()
+          assertNotNull(small.poll(1, TimeUnit.SECONDS));
+          producer.join(2_000);
+        }
+
+        assertEquals(1, warnings.get(), "three blocked dispatches should log one warning");
+      } finally {
+        jul.removeHandler(handler);
+      }
     }
   }
 }

@@ -111,6 +111,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   @Override
   public Map<TopicPartition, Long> dispatch(ConsumerRecords<K, V> records) {
     Map<TopicPartition, Long> rejected = Map.of();
+    int dispatched = 0;
     for (TopicPartition tp : records.partitions()) {
       for (ConsumerRecord<K, V> record : records.records(tp)) {
         try {
@@ -122,9 +123,10 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         }
         counter.registered(1, RecordSize.estimateBytes(record));
         dispatcher.dispatch(tp, record);
+        dispatched++;
       }
     }
-    dispatcher.wakeWorkers();
+    dispatcher.wakeWorkers(dispatched);
     return rejected;
   }
 

@@ -25,6 +25,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
@@ -48,6 +50,16 @@ public final class RecordDispatcher<K, V> {
 
   private final int queueCapacity;
   private final Set<Thread> waitingWorkers = ConcurrentHashMap.newKeySet();
+
+  // Approximate number of queued records, used to decide whether to wake another worker. It can
+  // briefly lag the queues; the park timeout in poll() bounds the cost of a missed wakeup.
+  private final AtomicInteger queued = new AtomicInteger();
+
+  // Rate limit for the "queue full" warning: at most one log line per interval.
+  private static final long QUEUE_FULL_LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
+  private final AtomicLong lastQueueFullLogNanos =
+      new AtomicLong(System.nanoTime() - QUEUE_FULL_LOG_INTERVAL_NANOS);
+  private final AtomicLong queueFullBlocks = new AtomicLong();
 
   // Cached snapshot of partition entries, rebuilt only on addPartition/removePartition.
   // tryPollAll() reads this volatile reference instead of calling toArray() on every poll.
@@ -101,6 +113,7 @@ public final class RecordDispatcher<K, V> {
     if (queue == null) return List.of();
     List<ConsumerRecord<K, V>> drained = new ArrayList<>(queue.size());
     queue.drainTo(drained);
+    queued.addAndGet(-drained.size());
     logger.log(
         System.Logger.Level.DEBUG,
         "Removed dispatch queue for {0}, discarded {1} records",
@@ -128,11 +141,7 @@ public final class RecordDispatcher<K, V> {
           "No queue for partition " + tp + ". Was addPartition() called?");
     }
     if (!queue.offer(record)) {
-      logger.log(
-          System.Logger.Level.WARNING,
-          "Dispatch queue full for {0}, blocking until space is available — "
-              + "review backpressure thresholds vs dispatchQueueCapacity",
-          tp);
+      logQueueFull(tp);
       try {
         queue.put(record);
       } catch (InterruptedException e) {
@@ -140,15 +149,46 @@ public final class RecordDispatcher<K, V> {
         return;
       }
     }
+    queued.incrementAndGet();
+  }
+
+  private void logQueueFull(TopicPartition tp) {
+    long blocks = queueFullBlocks.incrementAndGet();
+    long now = System.nanoTime();
+    long last = lastQueueFullLogNanos.get();
+    if (now - last >= QUEUE_FULL_LOG_INTERVAL_NANOS
+        && lastQueueFullLogNanos.compareAndSet(last, now)) {
+      queueFullBlocks.addAndGet(-blocks);
+      logger.log(
+          System.Logger.Level.WARNING,
+          "Dispatch queue full for {0}, blocking until space is available ({1} blocked dispatches"
+              + " since last warning) — review backpressure thresholds vs dispatchQueueCapacity",
+          tp,
+          blocks);
+    }
   }
 
   /**
-   * Unparks all waiting workers. Call once after dispatching a batch of records, rather than per
-   * record, to avoid redundant syscalls.
+   * Wakes up to {@code records} waiting workers. Call once after dispatching a batch of records,
+   * rather than per record, to avoid redundant syscalls. Waking more workers than there are records
+   * would only make the extra ones scan the queues and park again.
+   *
+   * @param records number of records just dispatched
    */
-  public void wakeWorkers() {
+  public void wakeWorkers(int records) {
+    if (records <= 0) return;
+    int woken = 0;
     for (Thread t : waitingWorkers) {
       LockSupport.unpark(t);
+      if (++woken >= records) break;
+    }
+  }
+
+  private void wakeOneWorker() {
+    // The caller has already removed itself from waitingWorkers.
+    for (Thread t : waitingWorkers) {
+      LockSupport.unpark(t);
+      return;
     }
   }
 
@@ -163,16 +203,27 @@ public final class RecordDispatcher<K, V> {
    */
   public PollResult<K, V> poll(long timeout, TimeUnit unit) {
     PollResult<K, V> result = tryPollAll();
-    if (result != null) return result;
-
-    waitingWorkers.add(Thread.currentThread());
-    try {
-      LockSupport.parkNanos(this, unit.toNanos(timeout));
-    } finally {
-      waitingWorkers.remove(Thread.currentThread());
+    if (result == null) {
+      Thread self = Thread.currentThread();
+      waitingWorkers.add(self);
+      try {
+        // Re-check after registering: a record dispatched between the first check and the add
+        // would otherwise not wake this worker until the timeout.
+        result = tryPollAll();
+        if (result == null) {
+          LockSupport.parkNanos(this, unit.toNanos(timeout));
+          result = tryPollAll();
+        }
+      } finally {
+        waitingWorkers.remove(self);
+      }
     }
-
-    return tryPollAll();
+    // If records are still queued, hand the wakeup on so they don't wait for a timeout. This
+    // covers wakeups that went to a worker that found its record already taken.
+    if (result != null && queued.get() > 0) {
+      wakeOneWorker();
+    }
+    return result;
   }
 
   private PollResult<K, V> tryPollAll() {
@@ -186,6 +237,7 @@ public final class RecordDispatcher<K, V> {
           snap[(start + i) % len];
       ConsumerRecord<K, V> record = entry.getValue().poll();
       if (record != null) {
+        queued.decrementAndGet();
         return new PollResult<>(entry.getKey(), record);
       }
     }
@@ -231,6 +283,10 @@ public final class RecordDispatcher<K, V> {
    * @param partitions the partitions to retain
    */
   public void retainOnly(Collection<TopicPartition> partitions) {
-    queues.keySet().retainAll(partitions);
+    for (TopicPartition tp : partitions()) {
+      if (!partitions.contains(tp)) {
+        removePartition(tp);
+      }
+    }
   }
 }
