@@ -25,6 +25,7 @@ import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
@@ -45,6 +46,10 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   private final OffsetTracker offsetTracker;
   private final InFlightCounter counter;
   private final PipelineMetricsCollector metricsCollector;
+
+  // Virtual-thread executors start a thread per task with no upper bound, so concurrency is
+  // enforced here instead. Null for platform threads, where the fixed-size pool already bounds it.
+  private final Semaphore handlerPermits;
 
   /**
    * Creates a new batch worker pool.
@@ -75,6 +80,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     this.offsetTracker = offsetTracker;
     this.counter = counter;
     this.metricsCollector = metricsCollector;
+    this.handlerPermits = threadMode == ThreadMode.VIRTUAL ? new Semaphore(concurrency) : null;
   }
 
   @Override
@@ -122,7 +128,20 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   private void processBatch(
       TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets, long totalBytes) {
     try {
-      process(tp, batch, offsets);
+      if (handlerPermits == null) {
+        process(tp, batch, offsets);
+      } else {
+        handlerPermits.acquire();
+        try {
+          process(tp, batch, offsets);
+        } finally {
+          handlerPermits.release();
+        }
+      }
+    } catch (InterruptedException e) {
+      // Shutdown while waiting for a permit: the batch was never started, so leave its offsets
+      // unacked and let it be redelivered.
+      Thread.currentThread().interrupt();
     } finally {
       // Always release the in-flight slots, even if the partition was revoked mid-processing and
       // the ack below failed; otherwise backpressure would never drain.
