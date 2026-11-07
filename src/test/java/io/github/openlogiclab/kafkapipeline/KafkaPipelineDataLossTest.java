@@ -408,4 +408,159 @@ class KafkaPipelineDataLossTest {
     for (long i = from; i < to; i++) set.add(i);
     return set;
   }
+
+  @Test
+  void stopWhileOutsidePoll_finalCommitStillLands() throws Exception {
+    // Real KafkaConsumer semantics: wakeup() makes the *next* blocking call throw, which can be
+    // the shutdown commitSync if stop() lands while the poll thread is not inside poll().
+    AtomicInteger wakeupThrows = new AtomicInteger();
+    mockConsumer =
+        new MockConsumer<>("earliest") {
+          private volatile boolean wakeupPending;
+
+          @Override
+          public void wakeup() {
+            wakeupPending = true; // not consumed by poll(), as if stop() landed outside it
+          }
+
+          @Override
+          public synchronized void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+            if (wakeupPending) {
+              wakeupPending = false;
+              wakeupThrows.incrementAndGet();
+              throw new org.apache.kafka.common.errors.WakeupException();
+            }
+            super.commitSync(offsets);
+          }
+        };
+    AtomicInteger processed = new AtomicInteger();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .commitInterval(Duration.ofMinutes(10)) // only the final commit can commit
+            .handler(record -> processed.incrementAndGet())
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 3);
+    await(() -> processed.get() == 3, "records should be processed");
+
+    pipeline.stop();
+    pipeline.awaitShutdown();
+
+    assertEquals(1, wakeupThrows.get(), "the pending wakeup should have fired on the commit");
+    assertTrue(committedAt(TP0, 3L), "the final commit must still land after the wakeup");
+  }
+
+  @Test
+  void recordFinishingAfterRevoke_releasesInFlightCount() throws Exception {
+    CountDownLatch started = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .drainTimeout(Duration.ofMillis(100))
+            .handler(
+                record -> {
+                  started.countDown();
+                  blockOnFirstRecord(TP0, record);
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 1);
+    assertTrue(started.await(5, TimeUnit.SECONDS));
+
+    // Revoke while offset 0 is still running; the drain times out and the window is cleared.
+    mockConsumer.rebalance(List.of());
+    assertEquals(1, pipeline.metrics().inFlightRecords());
+
+    // The record finishes after its partition is gone. Its ack fails, but the in-flight slot
+    // must still be released or backpressure would never drain.
+    release.countDown();
+    await(
+        () -> pipeline.metrics().inFlightRecords() == 0,
+        "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
+    assertEquals(0, pipeline.metrics().inFlightBytes());
+  }
+
+  @Test
+  void batchFinishingAfterRevoke_releasesInFlightCount() throws Exception {
+    CountDownLatch started = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .drainTimeout(Duration.ofMillis(100))
+            .batchHandler(
+                (tp, batch) -> {
+                  started.countDown();
+                  release.await(10, TimeUnit.SECONDS);
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 3);
+    assertTrue(started.await(5, TimeUnit.SECONDS));
+
+    mockConsumer.rebalance(List.of());
+    assertEquals(3, pipeline.metrics().inFlightRecords());
+
+    release.countDown();
+    await(
+        () -> pipeline.metrics().inFlightRecords() == 0,
+        "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
+  }
+
+  @Test
+  void recordFailingAfterRevoke_releasesInFlightCount() throws Exception {
+    CountDownLatch started = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .drainTimeout(Duration.ofMillis(100))
+            .handler(
+                record -> {
+                  started.countDown();
+                  release.await(10, TimeUnit.SECONDS);
+                  throw new RuntimeException("fails after its partition was revoked");
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 1);
+    assertTrue(started.await(5, TimeUnit.SECONDS));
+
+    mockConsumer.rebalance(List.of());
+    release.countDown();
+
+    await(
+        () -> pipeline.metrics().inFlightRecords() == 0,
+        "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
+  }
+
+  @Test
+  void batchFailingAfterRevoke_releasesInFlightCount() throws Exception {
+    CountDownLatch started = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .drainTimeout(Duration.ofMillis(100))
+            .batchHandler(
+                (tp, batch) -> {
+                  started.countDown();
+                  release.await(10, TimeUnit.SECONDS);
+                  throw new RuntimeException("fails after its partition was revoked");
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 3);
+    assertTrue(started.await(5, TimeUnit.SECONDS));
+
+    mockConsumer.rebalance(List.of());
+    release.countDown();
+
+    await(
+        () -> pipeline.metrics().inFlightRecords() == 0,
+        "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
+  }
 }

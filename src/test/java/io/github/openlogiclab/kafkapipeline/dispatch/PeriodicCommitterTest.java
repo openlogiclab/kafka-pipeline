@@ -29,6 +29,7 @@ import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.WakeupException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -53,6 +54,32 @@ class PeriodicCommitterTest {
 
   @Nested
   class CommitSync {
+
+    @Test
+    void retriesOnceWhenAPendingWakeupFiresDuringTheCommit() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
+      AtomicInteger attempts = new AtomicInteger();
+      Consumer<String, String> consumer =
+          new SpyConsumer(captured, null) {
+            @Override
+            public void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+              if (attempts.incrementAndGet() == 1) throw new WakeupException();
+              super.commitSync(offsets);
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, consumer, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.commitSync();
+
+      assertEquals(2, attempts.get());
+      assertEquals(1L, captured.get().get(TP0).offset());
+      assertTrue(tracker.getUncommittedOffsets().isEmpty(), "offset should be marked committed");
+    }
 
     @Test
     void commitsOffsetsForCompletedRecords() {

@@ -121,6 +121,16 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
 
   private void processBatch(
       TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets, long totalBytes) {
+    try {
+      process(tp, batch, offsets);
+    } finally {
+      // Always release the in-flight slots, even if the partition was revoked mid-processing and
+      // the ack below failed; otherwise backpressure would never drain.
+      counter.completed(batch.size(), totalBytes);
+    }
+  }
+
+  private void process(TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets) {
     long firstOffset = offsets[0];
     long lastOffset = offsets[offsets.length - 1];
 
@@ -134,7 +144,6 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
           lastOffset,
           tp,
           e.getMessage());
-      counter.completed(batch.size(), totalBytes);
       return;
     }
 
@@ -144,8 +153,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         retryExecutor.executeWithRetries(attempt -> handler.handleBatch(tp, batch), tp, desc);
 
     if (lastError == null) {
-      offsetTracker.ackBatch(tp, offsets);
-      counter.completed(batch.size(), totalBytes);
+      ackBatch(tp, offsets, desc);
       metricsCollector.recordProcessed(batch.size());
       return;
     }
@@ -155,7 +163,6 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       // not committed and the batch is redelivered.
       logger.log(
           System.Logger.Level.DEBUG, "Interrupted while processing {0} {1}, not acking", tp, desc);
-      counter.completed(batch.size(), totalBytes);
       return;
     }
 
@@ -163,10 +170,31 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     RetryExecutor.FailureResolution resolution =
         retryExecutor.handleFailure(batch, tp, lastError, desc);
     if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
-      offsetTracker.markFailed(tp);
       metricsCollector.recordFailed(batch.size());
+      if (ackBatch(tp, offsets, desc)) offsetTracker.markFailed(tp);
+    } else {
+      ackBatch(tp, offsets, desc);
     }
-    offsetTracker.ackBatch(tp, offsets);
-    counter.completed(batch.size(), totalBytes);
+  }
+
+  /**
+   * Acks a batch. Returns false if the partition is no longer tracked, which happens when a batch
+   * finishes after its partition was revoked and the drain timeout expired. The new owner
+   * re-consumes it from the last committed offset, so there is nothing more to do here.
+   */
+  private boolean ackBatch(TopicPartition tp, long[] offsets, String desc) {
+    try {
+      offsetTracker.ackBatch(tp, offsets);
+      return true;
+    } catch (IllegalStateException e) {
+      logger.log(
+          System.Logger.Level.INFO,
+          "Finished {0} {1} but could not ack it ({2}); the partition was likely revoked and the"
+              + " batch will be redelivered to its new owner",
+          tp,
+          desc,
+          e.getMessage());
+      return false;
+    }
   }
 }
