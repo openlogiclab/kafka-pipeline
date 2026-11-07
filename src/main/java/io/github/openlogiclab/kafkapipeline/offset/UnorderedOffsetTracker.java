@@ -16,6 +16,7 @@
 package io.github.openlogiclab.kafkapipeline.offset;
 
 import java.time.Duration;
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -38,6 +39,7 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
       new ConcurrentHashMap<>();
 
   private final int maxWindowSize;
+  private volatile boolean trackCompleted;
   private final AtomicLong nextGeneration = new AtomicLong();
 
   /** Creates a new unordered offset tracker. */
@@ -51,10 +53,23 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
    * @param maxWindowSize per-partition window capacity
    */
   public UnorderedOffsetTracker(int maxWindowSize) {
+    this(maxWindowSize, false);
+  }
+
+  /**
+   * Creates a tracker.
+   *
+   * @param maxWindowSize per-partition window capacity
+   * @param trackCompleted whether commit points record offsets that finished beyond the committed
+   *     one, and whether {@link #initPartition(TopicPartition, long, String)} skips the ones a
+   *     previous owner recorded
+   */
+  public UnorderedOffsetTracker(int maxWindowSize, boolean trackCompleted) {
     if (maxWindowSize <= 0) {
       throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
     }
     this.maxWindowSize = maxWindowSize;
+    this.trackCompleted = trackCompleted;
   }
 
   @Override
@@ -71,6 +86,19 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
       throw new IllegalArgumentException("offset cannot be empty");
     }
     getOrThrow(tp).registerBatch(offsets);
+  }
+
+  @Override
+  public boolean registerUnlessDone(TopicPartition tp, long offset) {
+    return getOrThrow(tp).registerUnlessDone(offset);
+  }
+
+  @Override
+  public long[] registerBatchUnlessDone(TopicPartition tp, long[] offsets) {
+    if (Objects.isNull(offsets) || offsets.length == 0) {
+      throw new IllegalArgumentException("offsets cannot be null or empty");
+    }
+    return getOrThrow(tp).registerBatchUnlessDone(offsets);
   }
 
   @Override
@@ -153,6 +181,35 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
+  public Map<TopicPartition, CommitPoint> getUncommittedCommitPoints() {
+    Map<TopicPartition, CommitPoint> result = new HashMap<>();
+    partitions.forEach(
+        (tp, window) -> window.getUncommittedCommitPoint().ifPresent(p -> result.put(tp, p)));
+    return result;
+  }
+
+  @Override
+  public Map<TopicPartition, CommitPoint> getAllCommitPoints() {
+    Map<TopicPartition, CommitPoint> result = new HashMap<>();
+    partitions.forEach((tp, window) -> window.getCommitPoint().ifPresent(p -> result.put(tp, p)));
+    return result;
+  }
+
+  @Override
+  public void stopTrackingCompleted() {
+    trackCompleted = false;
+    partitions.values().forEach(PartitionWindow::stopTrackingCompleted);
+  }
+
+  @Override
+  public void markCommitted(TopicPartition tp, CommitPoint point) {
+    PartitionWindow window = partitions.get(tp);
+    if (window != null) {
+      window.markCommitted(point);
+    }
+  }
+
+  @Override
   public void markCommitted(TopicPartition tp, long offset) {
     PartitionWindow window = partitions.get(tp);
     if (window != null) {
@@ -162,12 +219,31 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
 
   @Override
   public void initPartition(TopicPartition tp, long startOffset) {
-    PartitionWindow existing =
-        partitions.putIfAbsent(
-            tp, new PartitionWindow(startOffset, maxWindowSize, nextGeneration.incrementAndGet()));
+    initPartition(tp, startOffset, null);
+  }
+
+  @Override
+  public void initPartition(TopicPartition tp, long startOffset, String committedMetadata) {
+    BitSet preDone =
+        trackCompleted
+            ? CompletedOffsetsCodec.decode(committedMetadata, startOffset)
+            : new BitSet();
+    PartitionWindow window =
+        new PartitionWindow(
+            startOffset, maxWindowSize, nextGeneration.incrementAndGet(), trackCompleted, preDone);
+    PartitionWindow existing = partitions.putIfAbsent(tp, window);
     if (existing != null) {
       throw new IllegalStateException(
           "Partition " + tp + " already initialized. Call clearPartition first.");
+    }
+    if (!preDone.isEmpty()) {
+      logger.log(
+          System.Logger.Level.INFO,
+          "{0}: {1} records after offset {2} were already processed by the previous owner and will"
+              + " be skipped",
+          tp,
+          preDone.cardinality(),
+          startOffset);
     }
   }
 

@@ -16,6 +16,7 @@
 package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.offset.CommitPoint;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import java.time.Duration;
 import java.util.HashMap;
@@ -27,6 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.OffsetMetadataTooLarge;
 import org.apache.kafka.common.errors.WakeupException;
 
 /**
@@ -140,12 +142,15 @@ public final class PeriodicCommitter {
           (committedOffsets, exception) -> {
             if (exception != null) {
               metricsCollector.recordCommitFailure();
+              if (metadataTooLarge(exception)) return;
               logger.log(
                   System.Logger.Level.WARNING, "Async commit failed: {0}", exception.getMessage());
             } else {
               // Mark as committed in offset tracker
               committedOffsets.forEach(
-                  (tp, meta) -> offsetTracker.markCommitted(tp, meta.offset()));
+                  (tp, meta) ->
+                      offsetTracker.markCommitted(
+                          tp, new CommitPoint(meta.offset(), meta.metadata())));
               metricsCollector.recordCommitSuccess();
               logger.log(System.Logger.Level.DEBUG, "Committed offsets: {0}", committedOffsets);
             }
@@ -173,30 +178,61 @@ public final class PeriodicCommitter {
         consumer.commitSync(offsets);
       }
       // Mark as committed
-      offsets.forEach((tp, meta) -> offsetTracker.markCommitted(tp, meta.offset()));
+      offsets.forEach(
+          (tp, meta) ->
+              offsetTracker.markCommitted(tp, new CommitPoint(meta.offset(), meta.metadata())));
       metricsCollector.recordCommitSuccess();
       logger.log(System.Logger.Level.INFO, "Sync committed offsets: {0}", offsets);
     } catch (Exception e) {
       metricsCollector.recordCommitFailure();
+      if (metadataTooLarge(e) && !retriedWithoutMetadata) {
+        // Commit the offsets again, now without metadata, rather than losing this final commit.
+        retriedWithoutMetadata = true;
+        try {
+          commitSync();
+        } finally {
+          retriedWithoutMetadata = false;
+        }
+        return;
+      }
       logger.log(System.Logger.Level.ERROR, "Sync commit failed: {0}", e.getMessage());
     }
   }
 
-  private Map<TopicPartition, OffsetAndMetadata> buildUncommittedMap() {
-    Map<TopicPartition, Long> raw = offsetTracker.getUncommittedOffsets();
-    Map<TopicPartition, OffsetAndMetadata> result = new HashMap<>(raw.size());
-    for (Map.Entry<TopicPartition, Long> entry : raw.entrySet()) {
-      result.put(entry.getKey(), new OffsetAndMetadata(entry.getValue()));
+  private boolean retriedWithoutMetadata; // poll thread only
+
+  /**
+   * If the broker rejected the commit metadata as too large, stops writing it so later commits go
+   * through with plain offsets.
+   */
+  private boolean metadataTooLarge(Throwable e) {
+    for (Throwable t = e; t != null; t = t.getCause()) {
+      if (t instanceof OffsetMetadataTooLarge) {
+        offsetTracker.stopTrackingCompleted();
+        logger.log(
+            System.Logger.Level.WARNING,
+            "The broker rejected commit metadata as too large (offset.metadata.max.bytes). No"
+                + " longer recording finished offsets: records that finished after a stuck one"
+                + " will be processed again after a restart. Set offset.metadata.max.bytes to at"
+                + " least 4096 to keep this, or turn off skipCompletedOnRestart.");
+        return true;
+      }
     }
-    return result;
+    return false;
+  }
+
+  private Map<TopicPartition, OffsetAndMetadata> buildUncommittedMap() {
+    return toKafka(offsetTracker.getUncommittedCommitPoints());
   }
 
   private Map<TopicPartition, OffsetAndMetadata> buildAllCommittableMap() {
-    Map<TopicPartition, Long> raw = offsetTracker.getAllCommittableOffsets();
-    Map<TopicPartition, OffsetAndMetadata> result = new HashMap<>(raw.size());
-    for (Map.Entry<TopicPartition, Long> entry : raw.entrySet()) {
-      result.put(entry.getKey(), new OffsetAndMetadata(entry.getValue()));
-    }
+    return toKafka(offsetTracker.getAllCommitPoints());
+  }
+
+  private static Map<TopicPartition, OffsetAndMetadata> toKafka(
+      Map<TopicPartition, CommitPoint> points) {
+    Map<TopicPartition, OffsetAndMetadata> result = new HashMap<>(points.size());
+    points.forEach((tp, p) -> result.put(tp, new OffsetAndMetadata(p.offset(), p.metadata())));
     return result;
   }
 }

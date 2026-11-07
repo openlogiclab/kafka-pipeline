@@ -156,17 +156,19 @@ class RecordDispatcherTest {
     }
 
     @Test
-    void releaseAfterRevokeAndReassign_doesNotTouchTheNewQueuesCount() {
+    void recordStillRunningAfterRevokeAndReassign_keepsCountingUntilReleased() {
       capped.dispatch(TP0, record(TP0, 0));
       RecordDispatcher.PollResult<String, String> old = capped.poll(10, TimeUnit.MILLISECONDS);
       capped.removePartition(TP0);
       capped.addPartition(TP0);
       capped.dispatch(TP0, record(TP0, 1));
-      capped.poll(10, TimeUnit.MILLISECONDS);
-      assertEquals(1, capped.activeRecords(TP0));
+      RecordDispatcher.PollResult<String, String> fresh = capped.poll(10, TimeUnit.MILLISECONDS);
+      assertEquals(2, capped.activeRecords(TP0), "the old record still occupies a worker");
 
       capped.release(old);
-      assertEquals(1, capped.activeRecords(TP0), "stale release must not free a new slot");
+      assertEquals(1, capped.activeRecords(TP0));
+      capped.release(fresh);
+      assertEquals(0, capped.activeRecords(TP0));
     }
 
     @Test
@@ -638,6 +640,110 @@ class RecordDispatcherTest {
       } finally {
         jul.removeHandler(handler);
       }
+    }
+  }
+
+  @Nested
+  class OrderingAcrossReassignment {
+
+    private ConsumerRecord<String, String> keyed(long offset, String key) {
+      return new ConsumerRecord<>(TP0.topic(), TP0.partition(), offset, key, "v" + offset);
+    }
+
+    @Test
+    void keyStillRunningFromBeforeARevoke_blocksTheSameKeyAfterReassign() {
+      RecordDispatcher<String, String> d =
+          new RecordDispatcher<>(
+              10, 0, 4, io.github.openlogiclab.kafkapipeline.ProcessingOrder.KEY);
+      d.addPartition(TP0, 1);
+      d.dispatch(TP0, keyed(5, "A"));
+      RecordDispatcher.PollResult<String, String> old = d.poll(10, TimeUnit.MILLISECONDS);
+      assertEquals(5, old.record().offset());
+
+      // Revoked (drain timed out, old A:5 still running) and assigned back to this consumer.
+      d.removePartition(TP0);
+      d.addPartition(TP0, 2);
+      d.dispatch(TP0, keyed(5, "A"));
+      d.dispatch(TP0, keyed(6, "A"));
+      d.dispatch(TP0, keyed(7, "B"));
+
+      RecordDispatcher.PollResult<String, String> next = d.poll(10, TimeUnit.MILLISECONDS);
+      assertEquals("B", next.record().key(), "A is still running from the old assignment");
+      assertNull(d.poll(10, TimeUnit.MILLISECONDS));
+
+      d.release(old);
+      RecordDispatcher.PollResult<String, String> a = d.poll(10, TimeUnit.MILLISECONDS);
+      assertEquals(5, a.record().offset());
+      assertEquals(2, a.generation());
+      assertNull(d.poll(10, TimeUnit.MILLISECONDS), "A:6 waits for A:5");
+      d.release(a);
+      assertEquals(6, d.poll(10, TimeUnit.MILLISECONDS).record().offset());
+    }
+
+    @Test
+    void partitionRecordStillRunningFromBeforeARevoke_blocksThePartitionAfterReassign() {
+      RecordDispatcher<String, String> d =
+          new RecordDispatcher<>(
+              10, 0, 4, io.github.openlogiclab.kafkapipeline.ProcessingOrder.PARTITION);
+      d.addPartition(TP0, 1);
+      d.dispatch(TP0, keyed(5, "A"));
+      RecordDispatcher.PollResult<String, String> old = d.poll(10, TimeUnit.MILLISECONDS);
+
+      d.removePartition(TP0);
+      d.addPartition(TP0, 2);
+      d.dispatch(TP0, keyed(5, "A"));
+      assertNull(d.poll(10, TimeUnit.MILLISECONDS), "old record still running");
+
+      d.release(old);
+      assertEquals(5, d.poll(10, TimeUnit.MILLISECONDS).record().offset());
+    }
+
+    @Test
+    void stateOfRemovedPartitions_isDroppedOnceNothingRuns() {
+      RecordDispatcher<String, String> d =
+          new RecordDispatcher<>(
+              10, 0, 4, io.github.openlogiclab.kafkapipeline.ProcessingOrder.KEY);
+      for (int p = 0; p < 1_000; p++) {
+        TopicPartition tp = new TopicPartition("t", p);
+        d.addPartition(tp, p);
+        d.dispatch(tp, new ConsumerRecord<>("t", p, 0, "k", "v"));
+        d.removePartition(tp);
+      }
+      assertEquals(0, d.retainedPartitionState());
+
+      // Kept while a record is still running, dropped on the next remove after it finished.
+      d.addPartition(TP0, 1);
+      d.dispatch(TP0, keyed(5, "A"));
+      RecordDispatcher.PollResult<String, String> running = d.poll(10, TimeUnit.MILLISECONDS);
+      d.removePartition(TP0);
+      assertEquals(1, d.retainedPartitionState());
+      d.release(running);
+      d.addPartition(TP0, 2);
+      d.removePartition(TP0);
+      assertEquals(0, d.retainedPartitionState());
+    }
+
+    @Test
+    void releaseOfAnOldRecord_wakesAWorkerForTheNewAssignment() throws Exception {
+      RecordDispatcher<String, String> d =
+          new RecordDispatcher<>(
+              10, 0, 4, io.github.openlogiclab.kafkapipeline.ProcessingOrder.PARTITION);
+      d.addPartition(TP0, 1);
+      d.dispatch(TP0, keyed(5, "A"));
+      RecordDispatcher.PollResult<String, String> old = d.poll(10, TimeUnit.MILLISECONDS);
+      d.removePartition(TP0);
+      d.addPartition(TP0, 2);
+      d.dispatch(TP0, keyed(5, "A"));
+
+      AtomicReference<RecordDispatcher.PollResult<String, String>> got = new AtomicReference<>();
+      Thread worker = new Thread(() -> got.set(d.poll(10, TimeUnit.SECONDS)));
+      worker.start();
+      Thread.sleep(100);
+      long start = System.nanoTime();
+      d.release(old);
+      worker.join(5_000);
+      assertNotNull(got.get());
+      assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(2), "worker was not woken");
     }
   }
 }

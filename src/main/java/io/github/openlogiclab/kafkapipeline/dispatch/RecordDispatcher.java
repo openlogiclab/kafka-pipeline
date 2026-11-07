@@ -15,13 +15,11 @@
  */
 package io.github.openlogiclab.kafkapipeline.dispatch;
 
-import java.util.ArrayList;
+import io.github.openlogiclab.kafkapipeline.ProcessingOrder;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -31,8 +29,8 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
 
 /**
- * Routes records from the Poller to per-partition {@link BlockingQueue}s. Workers pull from these
- * queues for processing.
+ * Routes records from the Poller to per-partition queues. Workers pull from these queues for
+ * processing.
  *
  * <p>Thread-safe: the Poller thread dispatches, worker threads poll, and rebalance callbacks
  * add/remove queues.
@@ -45,6 +43,12 @@ public final class RecordDispatcher<K, V> {
   private static final System.Logger logger = System.getLogger(RecordDispatcher.class.getName());
 
   private final ConcurrentHashMap<TopicPartition, Lane<K, V>> queues = new ConcurrentHashMap<>();
+  // In-flight state that outlives a partition's queue: a record still running from before a revoke
+  // keeps counting against the partition (and keeps its key busy) after the partition comes back.
+  private final ConcurrentHashMap<TopicPartition, AtomicInteger> activeByPartition =
+      new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<TopicPartition, KeyedLaneQueue.KeyGuard> keyGuards =
+      new ConcurrentHashMap<>();
 
   private final int queueCapacity;
   // Configured max records of one partition being processed at once; 0 means unlimited.
@@ -54,6 +58,9 @@ public final class RecordDispatcher<K, V> {
   // Limit actually enforced: max(configured, ceil(concurrency / assigned partitions)). Recomputed
   // whenever partitions are added or removed. 0 means unlimited.
   private volatile int effectiveLimit;
+  private final ProcessingOrder order;
+  // Whether in-flight records per partition are counted (a limit or strict partition order).
+  private final boolean limited;
   private final Set<Thread> waitingWorkers = ConcurrentHashMap.newKeySet();
 
   // Approximate number of queued records, used to decide whether to wake another worker. It can
@@ -81,13 +88,14 @@ public final class RecordDispatcher<K, V> {
    */
   public static final class Lane<K, V> {
     private final TopicPartition tp;
-    private final BlockingQueue<ConsumerRecord<K, V>> queue;
-    private final AtomicInteger active = new AtomicInteger();
+    private final LaneQueue<K, V> queue;
+    private final AtomicInteger active;
     private final long generation;
 
-    private Lane(TopicPartition tp, int capacity, long generation) {
+    private Lane(TopicPartition tp, LaneQueue<K, V> queue, AtomicInteger active, long generation) {
       this.tp = tp;
-      this.queue = new LinkedBlockingQueue<>(capacity);
+      this.queue = queue;
+      this.active = active;
       this.generation = generation;
     }
 
@@ -160,6 +168,23 @@ public final class RecordDispatcher<K, V> {
    * @param concurrency number of workers, for the fair-share floor; 0 disables the floor
    */
   public RecordDispatcher(int queueCapacity, int maxConcurrencyPerPartition, int concurrency) {
+    this(queueCapacity, maxConcurrencyPerPartition, concurrency, ProcessingOrder.UNORDERED);
+  }
+
+  /**
+   * Creates a record dispatcher with an ordering guarantee. With {@link ProcessingOrder#KEY}, at
+   * most one record per key is handed out at a time, in offset order. With {@link
+   * ProcessingOrder#PARTITION}, at most one record per partition is handed out at a time,
+   * regardless of {@code maxConcurrencyPerPartition}.
+   *
+   * @param queueCapacity capacity of each per-partition queue
+   * @param maxConcurrencyPerPartition max records of one partition in processing at once; 0 means
+   *     unlimited
+   * @param concurrency number of workers, for the fair-share floor; 0 disables the floor
+   * @param order the ordering guarantee
+   */
+  public RecordDispatcher(
+      int queueCapacity, int maxConcurrencyPerPartition, int concurrency, ProcessingOrder order) {
     if (queueCapacity <= 0) {
       throw new IllegalArgumentException("queueCapacity must be positive, got " + queueCapacity);
     }
@@ -173,7 +198,9 @@ public final class RecordDispatcher<K, V> {
     this.queueCapacity = queueCapacity;
     this.maxConcurrencyPerPartition = maxConcurrencyPerPartition;
     this.concurrency = concurrency;
-    this.effectiveLimit = maxConcurrencyPerPartition;
+    this.order = java.util.Objects.requireNonNull(order, "order");
+    this.limited = order == ProcessingOrder.PARTITION || maxConcurrencyPerPartition > 0;
+    this.effectiveLimit = order == ProcessingOrder.PARTITION ? 1 : maxConcurrencyPerPartition;
   }
 
   /**
@@ -193,7 +220,18 @@ public final class RecordDispatcher<K, V> {
    * @param generation the offset-tracker generation of this assignment
    */
   public void addPartition(TopicPartition tp, long generation) {
-    queues.putIfAbsent(tp, new Lane<>(tp, queueCapacity, generation));
+    queues.computeIfAbsent(
+        tp,
+        t -> {
+          LaneQueue<K, V> queue =
+              order == ProcessingOrder.KEY
+                  ? new KeyedLaneQueue<>(
+                      queueCapacity,
+                      keyGuards.computeIfAbsent(t, x -> new KeyedLaneQueue.KeyGuard()))
+                  : new FifoLaneQueue<>(queueCapacity);
+          AtomicInteger active = activeByPartition.computeIfAbsent(t, x -> new AtomicInteger());
+          return new Lane<>(t, queue, active, generation);
+        });
     rebuildSnapshot();
     logger.log(System.Logger.Level.DEBUG, "Added dispatch queue for {0}", tp);
   }
@@ -208,10 +246,14 @@ public final class RecordDispatcher<K, V> {
     Lane<K, V> lane = queues.remove(tp);
     rebuildSnapshot();
     if (lane == null) return List.of();
-    BlockingQueue<ConsumerRecord<K, V>> queue = lane.queue;
-    List<ConsumerRecord<K, V>> drained = new ArrayList<>(queue.size());
-    queue.drainTo(drained);
+    List<ConsumerRecord<K, V>> drained = lane.queue.drain();
     queued.addAndGet(-drained.size());
+    // Keep the partition's in-flight state only while something from it is still running, so a
+    // consumer that sees many partitions over its life does not keep state for each of them. The
+    // queue is drained, so nothing new can be taken from it after this check.
+    if (lane.active.get() == 0) activeByPartition.remove(tp, lane.active);
+    KeyedLaneQueue.KeyGuard guard = keyGuards.get(tp);
+    if (guard != null && guard.idle()) keyGuards.remove(tp, guard);
     logger.log(
         System.Logger.Level.DEBUG,
         "Removed dispatch queue for {0}, discarded {1} records",
@@ -224,7 +266,7 @@ public final class RecordDispatcher<K, V> {
   private void rebuildSnapshot() {
     Lane<K, V>[] snap = queues.values().toArray(new Lane[0]);
     partitionSnapshot = snap;
-    if (maxConcurrencyPerPartition > 0) {
+    if (order != ProcessingOrder.PARTITION && maxConcurrencyPerPartition > 0) {
       int fairShare = snap.length == 0 ? 0 : (concurrency + snap.length - 1) / snap.length;
       effectiveLimit = Math.max(maxConcurrencyPerPartition, fairShare);
     }
@@ -238,7 +280,7 @@ public final class RecordDispatcher<K, V> {
    * @return true if {@link #dispatch} will not find the queue full
    */
   public boolean hasRoom(TopicPartition tp) {
-    BlockingQueue<ConsumerRecord<K, V>> queue = queueOf(tp);
+    LaneQueue<K, V> queue = queueOf(tp);
     return queue != null && queue.remainingCapacity() > 0;
   }
 
@@ -250,7 +292,7 @@ public final class RecordDispatcher<K, V> {
    * @return true if the queue is at most half full (or no longer exists)
    */
   public boolean hasDrained(TopicPartition tp) {
-    BlockingQueue<ConsumerRecord<K, V>> queue = queueOf(tp);
+    LaneQueue<K, V> queue = queueOf(tp);
     return queue == null || queue.size() <= queueCapacity / 2;
   }
 
@@ -264,7 +306,7 @@ public final class RecordDispatcher<K, V> {
    * @throws IllegalStateException if the partition has no queue or the queue is full
    */
   public void dispatch(TopicPartition tp, ConsumerRecord<K, V> record) {
-    BlockingQueue<ConsumerRecord<K, V>> queue = queueOf(tp);
+    LaneQueue<K, V> queue = queueOf(tp);
     if (queue == null) {
       throw new IllegalStateException(
           "No queue for partition " + tp + ". Was addPartition() called?");
@@ -365,13 +407,13 @@ public final class RecordDispatcher<K, V> {
     int start = ThreadLocalRandom.current().nextInt(len);
     for (int i = 0; i < len; i++) {
       Lane<K, V> lane = snap[(start + i) % len];
-      if (limit == 0) {
+      if (!limited) {
         ConsumerRecord<K, V> record = lane.queue.poll();
         if (record != null) {
           queued.decrementAndGet();
           return new PollResult<>(lane.tp, record, lane);
         }
-      } else if (lane.queue.peek() != null && tryAcquire(lane, limit)) {
+      } else if (lane.queue.hasReady() && tryAcquire(lane, limit)) {
         ConsumerRecord<K, V> record = lane.queue.poll();
         if (record != null) {
           queued.decrementAndGet();
@@ -399,12 +441,21 @@ public final class RecordDispatcher<K, V> {
    * @param result the poll result whose record finished
    */
   public void release(PollResult<K, V> result) {
-    if (maxConcurrencyPerPartition == 0) return;
     Lane<K, V> lane = result.lane();
-    lane.active.decrementAndGet();
-    // Records of this partition may be waiting only because the partition was at its limit, so no
-    // dispatch will wake a worker for them.
-    if (!lane.queue.isEmpty()) {
+    boolean freed = false;
+    if (order == ProcessingOrder.KEY) {
+      lane.queue.release(result.record());
+      freed = true;
+    }
+    if (limited) {
+      lane.active.decrementAndGet();
+      freed = true;
+    }
+    // Records of this partition may be waiting only because their key or the partition was busy,
+    // so no dispatch will wake a worker for them. Check the partition's current queue: the record
+    // may come from one that was replaced after a revoke.
+    Lane<K, V> current = queues.get(lane.tp);
+    if (freed && current != null && current.queue.hasReady()) {
       wakeOneWorker();
     }
   }
@@ -430,7 +481,14 @@ public final class RecordDispatcher<K, V> {
     return lane != null ? lane.active.get() : 0;
   }
 
-  private BlockingQueue<ConsumerRecord<K, V>> queueOf(TopicPartition tp) {
+  /** Partitions with in-flight state kept outside their queue; for tests. */
+  int retainedPartitionState() {
+    Set<TopicPartition> all = new java.util.HashSet<>(activeByPartition.keySet());
+    all.addAll(keyGuards.keySet());
+    return all.size();
+  }
+
+  private LaneQueue<K, V> queueOf(TopicPartition tp) {
     Lane<K, V> lane = queues.get(tp);
     return lane != null ? lane.queue : null;
   }
@@ -455,7 +513,7 @@ public final class RecordDispatcher<K, V> {
    * @return queued count
    */
   public int queuedRecords(TopicPartition tp) {
-    BlockingQueue<ConsumerRecord<K, V>> queue = queueOf(tp);
+    LaneQueue<K, V> queue = queueOf(tp);
     return queue != null ? queue.size() : 0;
   }
 

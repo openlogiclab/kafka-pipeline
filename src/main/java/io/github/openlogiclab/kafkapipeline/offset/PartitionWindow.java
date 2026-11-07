@@ -16,7 +16,9 @@
 package io.github.openlogiclab.kafkapipeline.offset;
 
 import java.time.Duration;
+import java.util.BitSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
@@ -61,6 +63,13 @@ final class PartitionWindow {
   private final AtomicInteger failureCount = new AtomicInteger(0);
   private volatile boolean failed = false;
 
+  // Crash replay: offsets the previous owner finished beyond its committed offset (relative to
+  // baseOffset, read-only after construction), and whether to encode our own finished offsets.
+  private volatile boolean trackCompleted;
+  private final BitSet preDone;
+  private final Object commitMonitor = new Object();
+  private String committedMetadata; // guarded by commitMonitor
+
   PartitionWindow(long startOffset) {
     this(startOffset, DEFAULT_MAX_WINDOW_SIZE);
   }
@@ -70,6 +79,25 @@ final class PartitionWindow {
   }
 
   PartitionWindow(long startOffset, int maxWindowSize, long generation) {
+    this(startOffset, maxWindowSize, generation, false, new BitSet());
+  }
+
+  /**
+   * Creates a window.
+   *
+   * @param startOffset first offset this consumer will fetch
+   * @param maxWindowSize capacity
+   * @param generation rebalance generation
+   * @param trackCompleted whether commit points carry the finished offsets beyond the committed one
+   * @param preDone offsets (relative to {@code startOffset}) that a previous owner already
+   *     finished; they are registered as DONE and never dispatched
+   */
+  PartitionWindow(
+      long startOffset,
+      int maxWindowSize,
+      long generation,
+      boolean trackCompleted,
+      BitSet preDone) {
     if (maxWindowSize <= 0) {
       throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
     }
@@ -78,6 +106,91 @@ final class PartitionWindow {
     this.committableOffset = new AtomicLong(startOffset);
     this.committedOffset = new AtomicLong(startOffset);
     this.maxWindowSize = maxWindowSize;
+    this.trackCompleted = trackCompleted;
+    this.preDone = trackCompleted ? (BitSet) preDone.clone() : new BitSet();
+    this.committedMetadata = CompletedOffsetsCodec.encode(startOffset, this.preDone);
+  }
+
+  /** Stops recording finished offsets in commit points; later points carry no metadata. */
+  void stopTrackingCompleted() {
+    trackCompleted = false;
+  }
+
+  /** True if a previous owner already finished this offset, so it must not be processed again. */
+  boolean isPreDone(long offset) {
+    long rel = offset - baseOffset;
+    // preDone.length() is at most CompletedOffsetsCodec.MAX_SPAN, so the cast is safe.
+    return rel > 0 && rel < preDone.length() && preDone.get((int) rel);
+  }
+
+  /**
+   * Registers an offset, or records it as DONE right away if a previous owner already finished it.
+   *
+   * @return true if the record must be processed, false if it was already done
+   */
+  boolean registerUnlessDone(long offset) {
+    if (!isPreDone(offset)) {
+      register(offset);
+      return true;
+    }
+    registerLock.lock();
+    try {
+      validateWindowCapacity(1);
+      if (entries.containsKey(offset)) {
+        throw new IllegalStateException("Offset " + offset + " already tracked in window");
+      }
+      entries.put(offset, OffsetStatus.DONE);
+      windowSize.incrementAndGet();
+      updateHighestRegistered(offset);
+      completedCount.incrementAndGet();
+    } finally {
+      registerLock.unlock();
+    }
+    tryShrink();
+    return false;
+  }
+
+  /**
+   * Registers a batch, recording offsets a previous owner already finished as DONE.
+   *
+   * @return the offsets that must be processed, in order (empty if all were already done)
+   */
+  long[] registerBatchUnlessDone(long[] offsets) {
+    int skip = 0;
+    for (long offset : offsets) {
+      if (isPreDone(offset)) skip++;
+    }
+    if (skip == 0) {
+      registerBatch(offsets);
+      return offsets;
+    }
+    long[] todo = new long[offsets.length - skip];
+    registerLock.lock();
+    try {
+      validateWindowCapacity(offsets.length);
+      for (long offset : offsets) {
+        if (entries.containsKey(offset)) {
+          throw new IllegalStateException("Offset " + offset + " already tracked in window");
+        }
+      }
+      int t = 0;
+      for (long offset : offsets) {
+        boolean done = isPreDone(offset);
+        entries.put(offset, done ? OffsetStatus.DONE : OffsetStatus.REGISTERED);
+        windowSize.incrementAndGet();
+        updateHighestRegistered(offset);
+        if (done) {
+          completedCount.incrementAndGet();
+        } else {
+          pendingCount.incrementAndGet();
+          todo[t++] = offset;
+        }
+      }
+    } finally {
+      registerLock.unlock();
+    }
+    tryShrink();
+    return todo;
   }
 
   void register(long offset) {
@@ -259,11 +372,92 @@ final class PartitionWindow {
   }
 
   /**
+   * Returns the commit point if it changed since the last confirmed commit: the committable offset
+   * advanced, or (when tracking completed offsets) the set of finished offsets beyond it changed.
+   */
+  Optional<CommitPoint> getUncommittedCommitPoint() {
+    CommitPoint point = commitPoint();
+    synchronized (commitMonitor) {
+      long committed = committedOffset.get();
+      if (point.offset() > committed
+          || (point.offset() == committed && !point.metadata().equals(committedMetadata))) {
+        return Optional.of(point);
+      }
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Returns the current commit point, or empty if there is nothing worth committing (no progress
+   * past the start offset and no finished offsets to record).
+   */
+  Optional<CommitPoint> getCommitPoint() {
+    CommitPoint point = commitPoint();
+    if (point.offset() > baseOffset || !point.metadata().isEmpty()) {
+      return Optional.of(point);
+    }
+    return Optional.empty();
+  }
+
+  /** Records that this commit point was confirmed committed to Kafka. */
+  void markCommitted(CommitPoint point) {
+    synchronized (commitMonitor) {
+      long committed = committedOffset.get();
+      if (point.offset() > committed) {
+        committedOffset.set(point.offset());
+        committedMetadata = point.metadata();
+      } else if (point.offset() == committed) {
+        committedMetadata = point.metadata();
+      }
+    }
+  }
+
+  /**
+   * Builds the offset to commit and the finished offsets beyond it from one consistent view: the
+   * committable offset cannot move while the shrink lock is held.
+   */
+  private CommitPoint commitPoint() {
+    shrinkLock.lock();
+    try {
+      shrinkWindow();
+      long c = committableOffset.get();
+      if (!trackCompleted) {
+        return new CommitPoint(c, "");
+      }
+      // Records the previous owner finished right at the committable offset need not be fetched
+      // again before the commit can move past them.
+      while (isPreDone(c)) {
+        c++;
+      }
+      BitSet done = new BitSet();
+      for (Map.Entry<Long, OffsetStatus> e : entries.tailMap(c, false).entrySet()) {
+        if (e.getValue() == OffsetStatus.DONE) {
+          long rel = e.getKey() - c;
+          if (rel >= CompletedOffsetsCodec.MAX_SPAN) break; // sorted: the rest are further
+          done.set((int) rel);
+        }
+      }
+      // Offsets the previous owner finished that we have not fetched again yet are still done.
+      long from = Math.max(1, c - baseOffset + 1);
+      if (from < preDone.length()) {
+        for (int i = preDone.nextSetBit((int) from); i >= 0; i = preDone.nextSetBit(i + 1)) {
+          // c >= baseOffset, so rel <= i < MAX_SPAN: the decoder never yields more bits.
+          done.set((int) (baseOffset + i - c));
+        }
+      }
+      // Built on every commit tick: at most one window of entries plus a small deflate.
+      return new CommitPoint(c, CompletedOffsetsCodec.encode(c, done));
+    } finally {
+      shrinkLock.unlock();
+    }
+  }
+
+  /**
    * Marks an offset as confirmed committed to Kafka. Called from async commit callback. Uses max()
    * to handle out-of-order callbacks safely.
    */
   void markCommitted(long offset) {
-    committedOffset.updateAndGet(current -> Math.max(current, offset));
+    markCommitted(new CommitPoint(offset, ""));
   }
 
   PartitionDrainResult drain(Duration timeout) {

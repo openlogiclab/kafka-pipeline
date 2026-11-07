@@ -129,7 +129,7 @@ flowchart TB
 
 1. A single poll loop fetches records and registers each offset with the tracker.
 2. Records are dispatched to per-partition queues (partition ordering preserved within each queue).
-3. Workers pull from queues and run your handler. Processing across partitions (and within a partition) is concurrent and unordered.
+3. Workers pull from queues and run your handler. Processing across partitions (and within a partition) is concurrent and unordered by default; see [Ordering](#ordering) to keep records of a key or partition in order.
 4. As records complete, a sliding-window tracker figures out which offsets are safe to commit — only contiguous completed offsets advance the commit position, so you never skip over in-flight work.
 5. A periodic committer pushes offsets to Kafka asynchronously, with a final sync commit on shutdown and rebalance.
 
@@ -362,6 +362,28 @@ The limit never drops below a fair share of the pool: the enforced value is `max
 | 20 or more | 20 |
 
 So a pod that ends up with a single partition still uses every worker, and the cap only bites once there are enough partitions to compete. Applies to per-record mode only; batch mode submits at most one batch per partition per poll.
+
+### Ordering
+
+By default records are processed concurrently in any order, even within a partition. When order matters, choose a `ProcessingOrder`:
+
+```java
+.ordering(ProcessingOrder.KEY)
+```
+
+| Mode | Guarantee | Parallelism |
+|---|---|---|
+| `UNORDERED` (default) | None | Every worker on any record |
+| `KEY` | Records with the same key run one at a time, in offset order | Across keys, even within one partition |
+| `PARTITION` | Records of a partition run one at a time, in offset order | One worker per partition |
+
+`KEY` gives the guarantee most services need (all events of one order, account or device in sequence) while still running different keys of a hot partition in parallel. Records with a `null` key have no key to order by and run unordered. `byte[]` keys are compared by content.
+
+In both ordered modes a record that fails and is retried keeps its key (or partition) blocked until it finishes, is sent to the DLQ, or falls back, so a later record never overtakes it. A slow key only holds back records of that key; the poll thread keeps fetching and other keys keep running until the partition's window fills (see [Sliding Window](#sliding-window)).
+
+In batch mode, `KEY` and `PARTITION` both mean one batch per partition in flight at a time: the next batch of a partition is fetched again once the previous one finishes.
+
+Ordering applies within this consumer. If a partition is revoked while a record is still running (past `drainTimeout`) and then assigned back to this same consumer, the redelivered records of that key (or partition, in `PARTITION` mode) wait for it to finish. A partition that moves to another consumer cannot be fenced that way: a record still running here can overlap with its redelivery there. Across a rebalance or restart, records after the committed offset are redelivered to the new owner, so a key's records can run again in order there (see [The Duplicate Processing Problem](#the-duplicate-processing-problem)).
 
 ### Error Handling
 
@@ -643,6 +665,8 @@ pipeline.awaitShutdown();
 | `pollTimeout` | 100ms | Kafka consumer poll timeout |
 | `dispatchQueueCapacity` | 500 | Bounded queue capacity for pending work (see below) |
 | `maxConcurrencyPerPartition` | 0 (unlimited) | Max records of one partition processed at once, so a slow partition can't take every worker (per-record mode; see [Noisy partitions](#noisy-partitions)) |
+| `ordering` | `UNORDERED` | `KEY` or `PARTITION` to keep records in order (see [Ordering](#ordering)) |
+| `skipCompletedOnRestart` | `true` | Record finished offsets past the committed one in commit metadata and skip them on the next assignment (see [The Duplicate Processing Problem](#the-duplicate-processing-problem)) |
 
 ### Tuning `dispatchQueueCapacity`
 
@@ -717,6 +741,8 @@ kafkaProps.put("partition.assignment.strategy",
 kafkaProps.put("group.instance.id", System.getenv("POD_NAME"));
 kafkaProps.put("session.timeout.ms", "45000"); // longer than a pod restart takes
 ```
+
+If your brokers set `offset.metadata.max.bytes` below the default 4096, raise it to at least 4096. Otherwise the first commit whose metadata is too large is rejected; the pipeline then logs a warning, stops recording finished offsets, and commits plain offsets from then on.
 
 `max.poll.interval.ms` does not need to cover handler time. The poll thread keeps calling `poll()` while records are processed, and pauses partitions instead of blocking when queues or windows fill up. It only has to cover `drainTimeout` (default 30s), which runs inside `poll()` during a rebalance.
 
@@ -796,9 +822,20 @@ The sliding window guarantees that the committed offset never jumps past in-flig
   → Offset 4 was already processed successfully — it gets processed again.
 ```
 
-This is inherent to at-least-once delivery with concurrent processing. The library commits conservatively (only contiguous completions), which minimizes the blast radius — but any completed record sitting behind an in-flight record will be redelivered after a crash.
+To shrink this, every commit also records which offsets after the committed one have already finished, in the commit's metadata field. The next owner of the partition (after a restart, a rebalance or a crash) reads it and skips those records:
 
-No amount of offset tracking can fix this. The only real solution is **idempotent processing** on the consumer side.
+```
+  commit: offset=3, metadata="kp1:3:<bitmap of finished offsets after 3>"   (4 is marked done)
+  → New consumer starts from offset 3, processes 3 and 5, skips 4.
+```
+
+How it behaves:
+
+- **Small.** The finished offsets are a compressed bitmap relative to the committed offset: one stuck record with 10,000 finished ones behind it takes well under 100 bytes. If a set ever exceeds 4,000 characters (Kafka's default `offset.metadata.max.bytes` is 4,096) it is not recorded, and those records are reprocessed as before. Only offsets within 1,048,576 of the committed one are recorded, so memory stays bounded (at most 128 KB per partition) even on compacted topics where offsets are far apart.
+- **Safe to ignore.** The metadata is used only when the new owner starts exactly at the offset it was written for. After an offset reset, a seek, or metadata written by another tool, it is ignored and everything after the committed offset is processed.
+- **Turned off with** `.skipCompletedOnRestart(false)`.
+
+It narrows the problem but cannot close it. Records that finished after the last commit (up to `commitInterval` of work, 5s by default) are still reprocessed after a crash, and a record whose handler had a side effect but crashed before it was acked runs again. The only real solution is **idempotent processing** on the consumer side.
 
 The library doesn't try to solve idempotency for you — that's deeply tied to your downstream system. Instead, it gives you the `ProcessingLifecycleHook` as an extension point. Use `beforeProcess` to check a dedup store, `afterProcess` to mark completion. Common strategies:
 

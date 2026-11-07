@@ -55,6 +55,9 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
  * @param maxWindowSize max tracked offsets per partition before that partition is paused
  * @param maxConcurrencyPerPartition max records of one partition processed at once (per-record
  *     mode); 0 means unlimited
+ * @param ordering ordering guarantee for records of the same partition
+ * @param skipCompletedOnRestart record finished-but-uncommitted offsets in commit metadata and skip
+ *     them when the partition is consumed again
  */
 public record PipelineConfig<K, V>(
     Properties consumerProperties,
@@ -75,7 +78,9 @@ public record PipelineConfig<K, V>(
     Duration pollTimeout,
     int dispatchQueueCapacity,
     int maxWindowSize,
-    int maxConcurrencyPerPartition) {
+    int maxConcurrencyPerPartition,
+    ProcessingOrder ordering,
+    boolean skipCompletedOnRestart) {
   /** Validates configuration constraints. */
   public PipelineConfig {
     Objects.requireNonNull(consumerProperties, "consumerProperties");
@@ -87,6 +92,7 @@ public record PipelineConfig<K, V>(
     Objects.requireNonNull(customSensors, "customSensors");
     Objects.requireNonNull(errorStrategy, "errorStrategy");
     Objects.requireNonNull(lifecycleHook, "lifecycleHook");
+    Objects.requireNonNull(ordering, "ordering");
 
     if (handler == null && batchHandler == null) {
       throw new IllegalArgumentException("Either handler or batchHandler must be set");
@@ -173,6 +179,8 @@ public record PipelineConfig<K, V>(
     private Duration pollTimeout = Duration.ofMillis(100);
     private int dispatchQueueCapacity = 500;
     private int maxConcurrencyPerPartition = 0;
+    private ProcessingOrder ordering = ProcessingOrder.UNORDERED;
+    private boolean skipCompletedOnRestart = true;
     private int maxWindowSize = 10_000;
 
     private Builder() {}
@@ -495,6 +503,51 @@ public record PipelineConfig<K, V>(
     }
 
     /**
+     * Ordering guarantee for records of the same partition.
+     *
+     * <ul>
+     *   <li>{@link ProcessingOrder#UNORDERED} (default): maximum parallelism, records may finish in
+     *       any order.
+     *   <li>{@link ProcessingOrder#KEY}: records with the same key run one at a time, in offset
+     *       order; different keys run in parallel. Records with a null key are unordered.
+     *   <li>{@link ProcessingOrder#PARTITION}: records of a partition run strictly one at a time.
+     * </ul>
+     *
+     * <p>In batch mode, {@code KEY} and {@code PARTITION} both mean at most one batch per partition
+     * in flight.
+     *
+     * @param ordering the ordering guarantee
+     * @return this builder
+     */
+    public Builder<K, V> ordering(ProcessingOrder ordering) {
+      this.ordering = ordering;
+      return this;
+    }
+
+    /**
+     * Whether to skip records that already finished before a crash or rebalance.
+     *
+     * <p>Records complete out of order, but Kafka stores one committed offset per partition: the
+     * oldest record not yet done. Without this, every record after it is processed again when the
+     * partition is consumed again, including ones that had already finished (up to {@link
+     * #maxWindowSize} per partition). With it, each commit also stores which later offsets are
+     * done, as a compressed bitmap in the commit's metadata, and those records are skipped on
+     * restart. If the bitmap does not fit Kafka's metadata limit, the commit is made without it.
+     *
+     * <p>Requires the broker's {@code offset.metadata.max.bytes} to be at least 4096 (the default).
+     * Turn it off if something else writes metadata on this consumer group's commits.
+     *
+     * <p>Default: {@code true}.
+     *
+     * @param skip whether to record and skip completed offsets
+     * @return this builder
+     */
+    public Builder<K, V> skipCompletedOnRestart(boolean skip) {
+      this.skipCompletedOnRestart = skip;
+      return this;
+    }
+
+    /**
      * Builds an immutable {@link PipelineConfig}.
      *
      * @return the built configuration
@@ -526,7 +579,9 @@ public record PipelineConfig<K, V>(
           pollTimeout,
           dispatchQueueCapacity,
           maxWindowSize,
-          maxConcurrencyPerPartition);
+          maxConcurrencyPerPartition,
+          ordering,
+          skipCompletedOnRestart);
     }
   }
 }

@@ -371,6 +371,8 @@ class KafkaPipelineDataLossTest {
             .concurrency(ThreadMode.PLATFORM, 2)
             .maxWindowSize(8)
             .drainTimeout(Duration.ofMillis(200))
+            // This test is about resuming a paused partition; replay skipping is tested separately.
+            .skipCompletedOnRestart(false)
             .handler(
                 record -> {
                   blockOnFirstRecord(TP0, record);
@@ -401,6 +403,48 @@ class KafkaPipelineDataLossTest {
     await(() -> processed.keySet().containsAll(rangeSet(0, 20)), "Expected 0..19 after reassign");
     assertFalse(mockConsumer.paused().contains(TP0));
     await(() -> committedAt(TP0, 20L), "TP0 should commit through 19 after reassign");
+  }
+
+  @Test
+  void revokedWithStuckHead_reassigned_skipsRecordsThatAlreadyFinished() throws Exception {
+    Map<Long, AtomicInteger> processed = new ConcurrentHashMap<>();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 2)
+            .maxWindowSize(8)
+            .drainTimeout(Duration.ofMillis(200))
+            .handler(
+                record -> {
+                  blockOnFirstRecord(TP0, record);
+                  processed
+                      .computeIfAbsent(record.offset(), o -> new AtomicInteger())
+                      .incrementAndGet();
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+
+    serveLog(TP0, 20, 5);
+    await(() -> mockConsumer.paused().contains(TP0), "TP0 should be window-paused");
+    await(() -> processed.keySet().containsAll(rangeSet(1, 8)), "1..7 should finish");
+
+    // Revoke while offset 0 is stuck: the commit stays at 0 but records that 1..7 are done.
+    mockConsumer.rebalance(List.of());
+    Thread.sleep(300);
+    OffsetAndMetadata committed = mockConsumer.committed(Set.of(TP0)).get(TP0);
+    assertEquals(0L, committed.offset());
+    // (MockConsumer hides metadata of unassigned partitions, so the effect is checked below.)
+    release.countDown();
+
+    // Reassigned: only the stuck record and the ones never processed run.
+    processed.clear();
+    mockConsumer.rebalance(List.of(TP0));
+    await(() -> committedAt(TP0, 20L), "TP0 should commit through 19 after reassign");
+    Set<Long> expected = rangeSet(0, 20);
+    expected.removeAll(rangeSet(1, 8));
+    assertEquals(expected, processed.keySet());
+    // Offset 0 may count twice: the released first attempt can finish after the clear above.
+    processed.forEach((o, n) -> assertTrue(o == 0 || n.get() == 1, "offset " + o + " ran " + n));
   }
 
   private static Set<Long> rangeSet(long from, long to) {

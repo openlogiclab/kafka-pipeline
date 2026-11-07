@@ -158,7 +158,8 @@ public final class KafkaPipeline<K, V> {
     this.consumer = null;
     this.ownsConsumer = true;
 
-    this.offsetTracker = new UnorderedOffsetTracker(config.maxWindowSize());
+    this.offsetTracker =
+        new UnorderedOffsetTracker(config.maxWindowSize(), config.skipCompletedOnRestart());
     this.counter = new InFlightCounter();
     this.backpressure = buildBackpressureController(config, counter);
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
@@ -167,7 +168,8 @@ public final class KafkaPipeline<K, V> {
         new RecordDispatcher<>(
             config.dispatchQueueCapacity(),
             config.maxConcurrencyPerPartition(),
-            config.concurrency());
+            config.concurrency(),
+            config.ordering());
     this.workerPool =
         buildWorkerPool(
             config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
@@ -191,7 +193,8 @@ public final class KafkaPipeline<K, V> {
     this.consumer = consumer;
     this.ownsConsumer = ownsConsumer;
 
-    this.offsetTracker = new UnorderedOffsetTracker(config.maxWindowSize());
+    this.offsetTracker =
+        new UnorderedOffsetTracker(config.maxWindowSize(), config.skipCompletedOnRestart());
     this.counter = new InFlightCounter();
     this.backpressure = buildBackpressureController(config, counter);
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
@@ -200,7 +203,8 @@ public final class KafkaPipeline<K, V> {
         new RecordDispatcher<>(
             config.dispatchQueueCapacity(),
             config.maxConcurrencyPerPartition(),
-            config.concurrency());
+            config.concurrency(),
+            config.ordering());
     this.workerPool =
         buildWorkerPool(
             config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
@@ -334,7 +338,8 @@ public final class KafkaPipeline<K, V> {
           offsetTracker,
           counter,
           config.dispatchQueueCapacity(),
-          metricsCollector);
+          metricsCollector,
+          config.ordering());
     }
     return new SingleRecordWorkerPool<>(
         config.concurrency(),
@@ -369,7 +374,8 @@ public final class KafkaPipeline<K, V> {
             counter,
             consumer,
             config.drainTimeout(),
-            metricsCollector);
+            metricsCollector,
+            config.skipCompletedOnRestart());
 
     consumer.subscribe(config.topics(), rebalanceListener);
   }

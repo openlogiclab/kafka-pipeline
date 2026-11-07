@@ -16,15 +16,19 @@
 package io.github.openlogiclab.kafkapipeline.worker;
 
 import io.github.openlogiclab.kafkapipeline.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.ProcessingOrder;
 import io.github.openlogiclab.kafkapipeline.RecordSize;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -50,6 +54,9 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   // Virtual-thread executors start a thread per task with no upper bound, so concurrency is
   // enforced here instead. Null for platform threads, where the fixed-size pool already bounds it.
   private final Semaphore handlerPermits;
+  // Ordered modes: partitions with a batch submitted and not yet finished.
+  private final boolean ordered;
+  private final Set<TopicPartition> batchInFlight = ConcurrentHashMap.newKeySet();
 
   /**
    * Creates a new batch worker pool.
@@ -74,7 +81,46 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       InFlightCounter counter,
       int taskQueueCapacity,
       PipelineMetricsCollector metricsCollector) {
+    this(
+        concurrency,
+        threadMode,
+        handler,
+        retryExecutor,
+        offsetTracker,
+        counter,
+        taskQueueCapacity,
+        metricsCollector,
+        ProcessingOrder.UNORDERED);
+  }
+
+  /**
+   * Creates a batch worker pool with an ordering guarantee. With {@link ProcessingOrder#KEY} or
+   * {@link ProcessingOrder#PARTITION}, at most one batch per partition is in flight: records
+   * fetched for a partition whose previous batch is still running are fetched again once it
+   * finishes.
+   *
+   * @param concurrency number of worker threads
+   * @param threadMode platform or virtual threads
+   * @param handler the batch handler
+   * @param retryExecutor retry executor
+   * @param offsetTracker offset tracker
+   * @param counter in-flight counter
+   * @param taskQueueCapacity executor task queue capacity (platform threads)
+   * @param metricsCollector metrics collector
+   * @param order ordering guarantee
+   */
+  public BatchWorkerPool(
+      int concurrency,
+      ThreadMode threadMode,
+      BatchRecordHandler<K, V> handler,
+      RetryExecutor<K, V> retryExecutor,
+      OffsetTracker offsetTracker,
+      InFlightCounter counter,
+      int taskQueueCapacity,
+      PipelineMetricsCollector metricsCollector,
+      ProcessingOrder order) {
     super(concurrency, threadMode, "kafka-pipeline-batch-", taskQueueCapacity);
+    this.ordered = order != ProcessingOrder.UNORDERED;
     this.handler = handler;
     this.retryExecutor = retryExecutor;
     this.offsetTracker = offsetTracker;
@@ -110,6 +156,12 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         batchBytes += RecordSize.estimateBytes(record);
       }
 
+      if (ordered && batchInFlight.contains(tp)) {
+        // Keep partition order: this batch waits until the previous one of the partition is done.
+        if (rejected.isEmpty()) rejected = new HashMap<>();
+        rejected.put(tp, offsets[0]);
+        continue;
+      }
       if (!hasTaskQueueRoom()) {
         // Never block the poll thread on a full task queue: fetch the batch again once it drains.
         reportTaskQueueFull(tp);
@@ -117,12 +169,23 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         rejected.put(tp, offsets[0]);
         continue;
       }
+      long[] todo;
       try {
-        offsetTracker.registerBatch(tp, offsets);
+        todo = offsetTracker.registerBatchUnlessDone(tp, offsets);
       } catch (WindowFullException e) {
         if (rejected.isEmpty()) rejected = new HashMap<>();
         rejected.put(tp, offsets[0]);
         continue;
+      }
+      if (todo.length != offsets.length) {
+        // Some records were already processed before a crash or rebalance: leave them out.
+        if (todo.length == 0) continue;
+        batch = withoutDone(batch, todo);
+        offsets = todo;
+        batchBytes = 0;
+        for (ConsumerRecord<K, V> record : batch) {
+          batchBytes += RecordSize.estimateBytes(record);
+        }
       }
       counter.registered(batch.size(), batchBytes);
 
@@ -130,14 +193,17 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       // Captured on the poll thread, where rebalance callbacks also run, so it is exactly the
       // generation the batch was registered under.
       long generation = offsetTracker.generation(tp);
-      executor.submit(() -> processBatch(tp, batch, offsets, totalBytes, generation));
+      if (ordered) batchInFlight.add(tp);
+      List<ConsumerRecord<K, V>> toProcess = batch;
+      long[] toAck = offsets;
+      executor.submit(() -> processBatch(tp, toProcess, toAck, totalBytes, generation));
     }
     return rejected;
   }
 
   @Override
   public boolean canResume(TopicPartition tp) {
-    return taskQueueDrained();
+    return taskQueueDrained() && !(ordered && batchInFlight.contains(tp));
   }
 
   private void processBatch(
@@ -152,6 +218,11 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       } else {
         handlerPermits.acquire();
         try {
+          if (!running.get()) {
+            // Stopped while this batch waited: a batch that held the permit can release it before
+            // the shutdown interrupt reaches this thread. Not started, so leave it for redelivery.
+            return;
+          }
           process(tp, batch, offsets, generation);
         } finally {
           handlerPermits.release();
@@ -165,6 +236,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       // Always release the in-flight slots, even if the partition was revoked mid-processing and
       // the ack below failed; otherwise backpressure would never drain.
       counter.completed(batch.size(), totalBytes);
+      if (ordered) batchInFlight.remove(tp);
     }
   }
 
@@ -235,5 +307,18 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
           e.getMessage());
       return false;
     }
+  }
+
+  private static <K, V> List<ConsumerRecord<K, V>> withoutDone(
+      List<ConsumerRecord<K, V>> batch, long[] todo) {
+    List<ConsumerRecord<K, V>> kept = new ArrayList<>(todo.length);
+    int t = 0;
+    for (ConsumerRecord<K, V> record : batch) {
+      if (t < todo.length && record.offset() == todo[t]) {
+        kept.add(record);
+        t++;
+      }
+    }
+    return kept;
   }
 }

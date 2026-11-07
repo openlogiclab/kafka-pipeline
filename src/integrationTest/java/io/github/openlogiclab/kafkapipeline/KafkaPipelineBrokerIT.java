@@ -246,6 +246,154 @@ class KafkaPipelineBrokerIT {
     assertTrue(pipeline.metrics().rebalanceCount() >= 1, "the kick-out should have happened");
   }
 
+  @Test
+  void keyOrdering_eachKeyProcessedInProduceOrder_oneAtATime() throws Exception {
+    String topic = createTopic();
+    String group = "g-" + UUID.randomUUID();
+    int keys = 20;
+    int perKey = 100;
+    // Values are "<key>:<seq>", produced in seq order for each key.
+    Properties props = producerProps();
+    try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+      for (int seq = 0; seq < perKey; seq++) {
+        for (int k = 0; k < keys; k++) {
+          producer.send(new ProducerRecord<>(topic, "key" + k, "key" + k + ":" + seq));
+        }
+      }
+      producer.flush();
+    }
+
+    Map<String, List<Integer>> orderByKey = new ConcurrentHashMap<>();
+    Map<String, AtomicInteger> activeByKey = new ConcurrentHashMap<>();
+    AtomicInteger maxActivePerKey = new AtomicInteger();
+    AtomicInteger active = new AtomicInteger();
+    AtomicInteger maxActive = new AtomicInteger();
+    AtomicInteger processed = new AtomicInteger();
+    start(
+        group,
+        topic,
+        record -> {
+          AtomicInteger perKeyActive =
+              activeByKey.computeIfAbsent(record.key(), k -> new AtomicInteger());
+          maxActivePerKey.accumulateAndGet(perKeyActive.incrementAndGet(), Math::max);
+          maxActive.accumulateAndGet(active.incrementAndGet(), Math::max);
+          try {
+            Thread.sleep(ThreadLocalRandom.current().nextInt(0, 4));
+            int seq = Integer.parseInt(record.value().substring(record.value().indexOf(':') + 1));
+            orderByKey
+                .computeIfAbsent(
+                    record.key(),
+                    k -> java.util.Collections.synchronizedList(new java.util.ArrayList<>()))
+                .add(seq);
+          } finally {
+            active.decrementAndGet();
+            perKeyActive.decrementAndGet();
+            processed.incrementAndGet();
+          }
+        },
+        Map.of(),
+        b -> b.ordering(ProcessingOrder.KEY));
+
+    await(() -> processed.get() == keys * perKey, () -> "processed " + processed.get());
+    assertEquals(1, maxActivePerKey.get(), "two records of one key ran at the same time");
+    assertTrue(maxActive.get() > 1, "different keys should run in parallel");
+    orderByKey.forEach(
+        (key, seqs) -> {
+          for (int i = 0; i < seqs.size(); i++) {
+            assertEquals(i, seqs.get(i), "out of order for " + key + ": " + seqs);
+          }
+        });
+    await(() -> committedToEnd(group, topic), () -> "committed " + committed(group, topic));
+  }
+
+  @Test
+  void restartWithAStuckRecord_recordsFinishedAfterItAreNotProcessedAgain() throws Exception {
+    String topic = createTopic();
+    String group = "g-" + UUID.randomUUID();
+    produce(topic, 0, 1_000);
+    TopicPartition stuckPartition = new TopicPartition(topic, 0);
+
+    // First run: offset 0 of partition 0 never finishes, everything else does.
+    Set<TopicPartitionOffset> firstRun = ConcurrentHashMap.newKeySet();
+    java.util.concurrent.CountDownLatch never = new java.util.concurrent.CountDownLatch(1);
+    KafkaPipeline<String, String> first =
+        start(
+            group,
+            topic,
+            record -> {
+              if (record.partition() == 0 && record.offset() == 0) never.await();
+              firstRun.add(new TopicPartitionOffset(record.partition(), record.offset()));
+            },
+            Map.of(),
+            b -> b.shutdownTimeout(Duration.ofSeconds(2)));
+    await(() -> firstRun.size() == 999, () -> "first run processed " + firstRun.size());
+    // The periodic commit keeps the stuck partition at 0 and lists what finished after it.
+    await(
+        () -> {
+          OffsetAndMetadata om = committedWithMetadata(group).get(stuckPartition);
+          return om != null && om.offset() == 0 && !om.metadata().isEmpty();
+        },
+        () -> "committed " + committedWithMetadata(group));
+    first.stop();
+    first.awaitShutdown();
+    pipelines.remove(first);
+
+    // Second run: only the stuck record is processed again.
+    Set<TopicPartitionOffset> secondRun = ConcurrentHashMap.newKeySet();
+    AtomicInteger secondCount = new AtomicInteger();
+    start(
+        group,
+        topic,
+        record -> {
+          secondRun.add(new TopicPartitionOffset(record.partition(), record.offset()));
+          secondCount.incrementAndGet();
+        });
+    await(() -> committedToEnd(group, topic), () -> "committed " + committed(group, topic));
+    assertEquals(Set.of(new TopicPartitionOffset(0, 0)), secondRun);
+    assertEquals(1, secondCount.get());
+  }
+
+  @Test
+  void restartWithSkippingDisabled_reprocessesEverythingAfterTheStuckRecord() throws Exception {
+    String topic = createTopic();
+    String group = "g-" + UUID.randomUUID();
+    produce(topic, 0, 400);
+
+    AtomicInteger firstRun = new AtomicInteger();
+    java.util.concurrent.CountDownLatch never = new java.util.concurrent.CountDownLatch(1);
+    KafkaPipeline<String, String> first =
+        start(
+            group,
+            topic,
+            record -> {
+              if (record.partition() == 0 && record.offset() == 0) never.await();
+              firstRun.incrementAndGet();
+            },
+            Map.of(),
+            b -> b.skipCompletedOnRestart(false).shutdownTimeout(Duration.ofSeconds(2)));
+    await(() -> firstRun.get() == 399, () -> "first run processed " + firstRun.get());
+    // The stuck partition has nothing to commit; the other three commit to the end.
+    await(
+        () -> committed(group, topic).size() == PARTITIONS - 1,
+        () -> "committed " + committed(group, topic));
+    first.stop();
+    first.awaitShutdown();
+    pipelines.remove(first);
+    assertNull(committedWithMetadata(group).get(new TopicPartition(topic, 0)));
+
+    Set<Long> secondRun = ConcurrentHashMap.newKeySet();
+    start(
+        group,
+        topic,
+        record -> {
+          if (record.partition() == 0) secondRun.add(record.offset());
+        },
+        Map.of(),
+        b -> b.skipCompletedOnRestart(false));
+    await(() -> committedToEnd(group, topic), () -> "committed " + committed(group, topic));
+    assertTrue(secondRun.size() > 1, "every record of partition 0 should run again");
+  }
+
   private record TopicPartitionOffset(int partition, long offset) {}
 
   // ── helpers ───────────────────────────────────────────────────
@@ -275,6 +423,15 @@ class KafkaPipelineBrokerIT {
       String topic,
       io.github.openlogiclab.kafkapipeline.handler.RecordHandler<String, String> handler,
       Map<String, String> extraProps) {
+    return start(group, topic, handler, extraProps, b -> {});
+  }
+
+  private KafkaPipeline<String, String> start(
+      String group,
+      String topic,
+      io.github.openlogiclab.kafkapipeline.handler.RecordHandler<String, String> handler,
+      Map<String, String> extraProps,
+      java.util.function.Consumer<PipelineConfig.Builder<String, String>> customize) {
     Properties props = new Properties();
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
     props.put(ConsumerConfig.GROUP_ID_CONFIG, group);
@@ -282,17 +439,17 @@ class KafkaPipelineBrokerIT {
     props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
     props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
     props.putAll(extraProps);
-    KafkaPipeline<String, String> pipeline =
-        new KafkaPipeline<>(
-            KafkaPipeline.<String, String>builder()
-                .consumerProperties(props)
-                .topic(topic)
-                .handler(handler)
-                .concurrency(ThreadMode.VIRTUAL, 50)
-                .commitInterval(Duration.ofMillis(200))
-                .drainTimeout(Duration.ofSeconds(2))
-                .shutdownTimeout(Duration.ofSeconds(10))
-                .build());
+    PipelineConfig.Builder<String, String> builder =
+        KafkaPipeline.<String, String>builder()
+            .consumerProperties(props)
+            .topic(topic)
+            .handler(handler)
+            .concurrency(ThreadMode.VIRTUAL, 50)
+            .commitInterval(Duration.ofMillis(200))
+            .drainTimeout(Duration.ofSeconds(2))
+            .shutdownTimeout(Duration.ofSeconds(10));
+    customize.accept(builder);
+    KafkaPipeline<String, String> pipeline = new KafkaPipeline<>(builder.build());
     pipelines.add(pipeline);
     pipeline.startAsync();
     return pipeline;
@@ -306,12 +463,16 @@ class KafkaPipelineBrokerIT {
     return topic;
   }
 
-  private static void produce(String topic, int from, int to) throws Exception {
+  private static Properties producerProps() {
     Properties props = new Properties();
     props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
     props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
     props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-    try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+    return props;
+  }
+
+  private static void produce(String topic, int from, int to) throws Exception {
+    try (KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps())) {
       for (int i = from; i < to; i++) {
         producer.send(new ProducerRecord<>(topic, "k" + i, "v" + i));
       }
@@ -334,6 +495,14 @@ class KafkaPipelineBrokerIT {
             if (tp.topic().equals(topic) && om != null) result.put(tp, om.offset());
           });
       return result;
+    } catch (Exception e) {
+      return Map.of();
+    }
+  }
+
+  private static Map<TopicPartition, OffsetAndMetadata> committedWithMetadata(String group) {
+    try (Admin admin = admin()) {
+      return admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata().get();
     } catch (Exception e) {
       return Map.of();
     }
