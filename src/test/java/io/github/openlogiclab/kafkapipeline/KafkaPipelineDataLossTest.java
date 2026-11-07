@@ -582,12 +582,16 @@ class KafkaPipelineDataLossTest {
     pipeline = new KafkaPipeline<>(config, mockConsumer);
     start(TP0);
 
-    // The single worker is stuck on offset 0, so the queue (5) fills: poll 1 queues 1..4,
-    // poll 2 queues 5 and sends 6..9 back with a seek.
+    // The single worker is stuck on offset 0, so the queue (5) fills on the second poll and the
+    // rest of that poll is sent back with a seek. Whether the worker took offset 0 off the queue
+    // before that poll is a race, so the seek lands on 5 (queue held 0..4) or 6 (queue held 1..5).
     serveLog(TP0, 30, 5);
     await(
         () -> mockConsumer.paused().contains(TP0), "TP0 should be paused while its queue is full");
-    assertEquals(6L, mockConsumer.position(TP0), "rest of the poll should be fetched again later");
+    long position = mockConsumer.position(TP0);
+    assertTrue(
+        position == 5L || position == 6L,
+        "rest of the poll should be fetched again later, position=" + position);
 
     release.countDown();
 
