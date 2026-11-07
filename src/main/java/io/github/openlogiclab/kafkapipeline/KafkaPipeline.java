@@ -20,6 +20,7 @@ import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.ByteSizeSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.HeapSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
+import io.github.openlogiclab.kafkapipeline.dispatch.PartitionPauseController;
 import io.github.openlogiclab.kafkapipeline.dispatch.PeriodicCommitter;
 import io.github.openlogiclab.kafkapipeline.dispatch.PipelineRebalanceListener;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
@@ -141,6 +142,7 @@ public final class KafkaPipeline<K, V> {
 
   private Consumer<K, V> consumer;
   private PeriodicCommitter committer;
+  private PartitionPauseController pauseController;
   private PipelineRebalanceListener rebalanceListener;
   private Thread shutdownHook;
 
@@ -154,7 +156,7 @@ public final class KafkaPipeline<K, V> {
     this.consumer = null;
     this.ownsConsumer = true;
 
-    this.offsetTracker = new UnorderedOffsetTracker();
+    this.offsetTracker = new UnorderedOffsetTracker(config.maxWindowSize());
     this.counter = new InFlightCounter();
     this.backpressure = buildBackpressureController(config, counter);
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
@@ -183,7 +185,7 @@ public final class KafkaPipeline<K, V> {
     this.consumer = consumer;
     this.ownsConsumer = ownsConsumer;
 
-    this.offsetTracker = new UnorderedOffsetTracker();
+    this.offsetTracker = new UnorderedOffsetTracker(config.maxWindowSize());
     this.counter = new InFlightCounter();
     this.backpressure = buildBackpressureController(config, counter);
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
@@ -343,6 +345,8 @@ public final class KafkaPipeline<K, V> {
       consumer = new KafkaConsumer<>(props);
     }
 
+    pauseController = new PartitionPauseController(consumer, offsetTracker);
+
     committer =
         new PeriodicCommitter(offsetTracker, consumer, config.commitInterval(), metricsCollector);
 
@@ -360,37 +364,25 @@ public final class KafkaPipeline<K, V> {
   }
 
   private void pollLoop() {
-    boolean paused = false;
+    boolean throttled = false;
 
     while (running.get()) {
       try {
         // Perform any pending periodic commits on the poll thread (thread-safe)
         committer.maybeCommitAsync();
 
-        if (backpressure.shouldThrottle()) {
-          if (!paused) {
-            consumer.pause(consumer.assignment());
-            paused = true;
-            metricsCollector.recordThrottle();
-            logger.log(
-                System.Logger.Level.DEBUG,
-                "Backpressure: paused. {0}",
-                backpressure.statusSummary());
-          }
-          consumer.poll(config.pollTimeout());
-          metricsCollector.recordPoll();
-          metricsCollector.recordEmptyPoll();
-          continue;
-        }
-
-        if (paused) {
-          consumer.resume(consumer.assignment());
-          paused = false;
+        boolean shouldThrottle = backpressure.shouldThrottle();
+        if (shouldThrottle != throttled) {
+          throttled = shouldThrottle;
+          if (throttled) metricsCollector.recordThrottle();
           logger.log(
               System.Logger.Level.DEBUG,
-              "Backpressure: resumed. {0}",
+              "Backpressure: {0}. {1}",
+              throttled ? "paused" : "resumed",
               backpressure.statusSummary());
         }
+        // Reapplied before every poll so partitions assigned by a rebalance are paused too.
+        pauseController.apply(throttled);
 
         ConsumerRecords<K, V> records = consumer.poll(config.pollTimeout());
         metricsCollector.recordPoll();
@@ -399,7 +391,9 @@ public final class KafkaPipeline<K, V> {
           continue;
         }
 
-        workerPool.dispatch(records);
+        // Never drop polled records: the consumer position has already moved past them. Records
+        // that do not fit in their partition's window are fetched again after a seek.
+        pauseController.seekBack(workerPool.dispatch(records));
       } catch (org.apache.kafka.common.errors.WakeupException e) {
         if (running.get()) {
           logger.log(System.Logger.Level.WARNING, "Unexpected wakeup in poll loop");

@@ -673,7 +673,18 @@ As workers complete records, the left edge of the window slides forward:
   16 completes → committable = 17         (window fully drained)
 ```
 
-This gives you **at-least-once delivery** guarantees with fully concurrent, unordered processing. The window is bounded — when it fills up, backpressure kicks in and the poll loop pauses until workers catch up.
+This gives you **at-least-once delivery** guarantees with fully concurrent, unordered processing.
+
+The window is bounded per partition (`maxWindowSize`, default 10,000). A slow record at the head of a partition keeps everything behind it in the window, even records that already finished, so the window can fill up while overall in-flight counts stay low. When a partition's window reaches 80% of `maxWindowSize`, the pipeline pauses **that partition only** and resumes it once the window drains to 50%; other partitions keep flowing. If a single poll still overshoots the window, the records that do not fit are not dropped: the consumer seeks back to the first of them and fetches them again once there is room.
+
+```java
+KafkaPipeline.<String, String>builder()
+    // ...
+    .maxWindowSize(5_000) // must be >= max.poll.records
+    .build();
+```
+
+A larger window gives slow records more slack before the partition pauses, but uses more memory (roughly 50 bytes per entry) and means more records are reprocessed after a crash.
 
 On rebalance, the pipeline drains in-flight records (up to `drainTimeout`), does a final sync commit, then hands the partition off cleanly.
 

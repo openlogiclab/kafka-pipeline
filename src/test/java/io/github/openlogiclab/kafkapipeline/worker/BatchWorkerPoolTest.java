@@ -284,4 +284,43 @@ class BatchWorkerPoolTest {
     }
     return true;
   }
+
+  @Nested
+  class FullWindow {
+
+    @Test
+    void dispatch_rejectsWholeBatchPerFullPartition_andReportsBatchStart() {
+      TopicPartition tp1 = new TopicPartition("test", 1);
+      TopicPartition tp2 = new TopicPartition("test", 2);
+      tracker = new UnorderedOffsetTracker(3);
+      tracker.initPartition(TP0, 0);
+      tracker.initPartition(tp1, 0);
+      tracker.initPartition(tp2, 0);
+      AtomicInteger handled = new AtomicInteger();
+
+      BatchWorkerPool<String, String> pool =
+          new BatchWorkerPool<>(
+              1,
+              ThreadMode.PLATFORM,
+              (tp, records) -> handled.addAndGet(records.size()),
+              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              tracker,
+              counter,
+              0,
+              NoOpMetricsCollector.INSTANCE);
+
+      Map<TopicPartition, List<ConsumerRecord<String, String>>> map = new HashMap<>();
+      map.put(TP0, buildRecords(TP0, 0, 4).records(TP0)); // 5 records > window of 3
+      map.put(tp1, buildRecords(tp1, 7, 10).records(tp1)); // 4 records > window of 3
+      map.put(tp2, buildRecords(tp2, 0, 1).records(tp2)); // fits
+      Map<TopicPartition, Long> rejected = pool.dispatch(new ConsumerRecords<>(map, Map.of()));
+
+      assertEquals(Map.of(TP0, 0L, tp1, 7L), rejected);
+      assertEquals(0, tracker.windowSize(TP0));
+      assertEquals(0, tracker.windowSize(tp1));
+      pool.stop(5_000); // waits for tp2's batch, which fit
+      assertEquals(2, handled.get());
+      assertEquals(0, counter.records());
+    }
+  }
 }
