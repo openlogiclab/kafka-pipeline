@@ -635,4 +635,85 @@ class KafkaPipelineDataLossTest {
         System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5),
         "shutdown should finish shortly after shutdownTimeout");
   }
+
+  @Test
+  void lateAckAfterReassignToSameConsumer_doesNotCompleteTheNewAttempt() throws Exception {
+    CountDownLatch firstStarted = new CountDownLatch(1);
+    CountDownLatch secondStarted = new CountDownLatch(1);
+    CountDownLatch releaseFirst = new CountDownLatch(1);
+    CountDownLatch releaseSecond = new CountDownLatch(1);
+    AtomicInteger attempts = new AtomicInteger();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 2)
+            .drainTimeout(Duration.ofMillis(100))
+            .handler(
+                record -> {
+                  if (attempts.incrementAndGet() == 1) {
+                    firstStarted.countDown();
+                    releaseFirst.await(10, TimeUnit.SECONDS);
+                  } else {
+                    secondStarted.countDown();
+                    releaseSecond.await(10, TimeUnit.SECONDS);
+                  }
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    mockConsumer.schedulePollTask(() -> addRecords(TP0, 0, 1));
+    assertTrue(firstStarted.await(5, TimeUnit.SECONDS));
+
+    // Revoke (drain times out while offset 0 is still running), then assign TP0 back to this
+    // consumer: offset 0 is fetched again and a second attempt starts.
+    mockConsumer.schedulePollTask(() -> mockConsumer.rebalance(List.of()));
+    mockConsumer.schedulePollTask(
+        () -> {
+          mockConsumer.rebalance(List.of(TP0));
+          mockConsumer.seek(TP0, 0L);
+        });
+    mockConsumer.schedulePollTask(() -> addRecords(TP0, 0, 1));
+    assertTrue(secondStarted.await(5, TimeUnit.SECONDS), "offset 0 should be retried");
+
+    // The first attempt finishes now. Its ack belongs to the old assignment and must not mark
+    // offset 0 done while the second attempt is still running.
+    releaseFirst.countDown();
+    Thread.sleep(300);
+    assertFalse(committedAt(TP0, 1L), "stale ack committed offset 0 under the new assignment");
+
+    releaseSecond.countDown();
+    await(() -> committedAt(TP0, 1L), "offset 0 should commit once the second attempt finishes");
+  }
+
+  @Test
+  void afterProcessHookThrowing_doesNotRerunTheHandler() throws Exception {
+    AtomicInteger handled = new AtomicInteger();
+    AtomicInteger afterCalls = new AtomicInteger();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .errorStrategy(
+                io.github.openlogiclab.kafkapipeline.error.ErrorStrategy.<String, String>builder()
+                    .maxRetries(3)
+                    .retryBackoff(Duration.ofMillis(1))
+                    .build())
+            .lifecycleHook(
+                new io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook<>() {
+                  @Override
+                  public void afterProcess(
+                      ConsumerRecord<String, String> record,
+                      io.github.openlogiclab.kafkapipeline.handler.ProcessingContext ctx) {
+                    afterCalls.incrementAndGet();
+                    throw new IllegalStateException("hook bug");
+                  }
+                })
+            .handler(record -> handled.incrementAndGet())
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    mockConsumer.schedulePollTask(() -> addRecords(TP0, 0, 3));
+
+    await(() -> committedAt(TP0, 3L), "records should be acked despite the hook throwing");
+    assertEquals(3, handled.get(), "each record handled exactly once");
+    assertEquals(3, afterCalls.get());
+  }
 }

@@ -45,6 +45,7 @@ final class PartitionWindow {
   static final int DEFAULT_MAX_WINDOW_SIZE = 10_000;
 
   private final long baseOffset;
+  private final long generation;
   private final int maxWindowSize;
   private final AtomicLong committableOffset;
   private final AtomicLong highestRegistered = new AtomicLong(-1);
@@ -65,10 +66,15 @@ final class PartitionWindow {
   }
 
   PartitionWindow(long startOffset, int maxWindowSize) {
+    this(startOffset, maxWindowSize, OffsetTracker.NO_GENERATION);
+  }
+
+  PartitionWindow(long startOffset, int maxWindowSize, long generation) {
     if (maxWindowSize <= 0) {
       throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
     }
     this.baseOffset = startOffset;
+    this.generation = generation;
     this.committableOffset = new AtomicLong(startOffset);
     this.committedOffset = new AtomicLong(startOffset);
     this.maxWindowSize = maxWindowSize;
@@ -108,6 +114,10 @@ final class PartitionWindow {
     } finally {
       registerLock.unlock();
     }
+  }
+
+  long generation() {
+    return generation;
   }
 
   void markInProgress(long offset) {

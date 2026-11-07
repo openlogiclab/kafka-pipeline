@@ -53,10 +53,12 @@ public interface ProcessingLifecycleHook<K, V> {
   }
 
   /**
-   * Called after the {@link RecordHandler} completes successfully.
+   * Called once after the {@link RecordHandler} completes successfully, after any retries. The
+   * context carries the attempt that succeeded.
    *
    * <p>Use this to record the successful processing in a dedup store, emit metrics, or close
-   * tracing spans.
+   * tracing spans. If it throws, the exception is logged and the record is still acked; the handler
+   * is not run again.
    *
    * @param record the record that was processed
    * @param context metadata (partition, offset, attempt number)

@@ -960,4 +960,74 @@ class UnorderedOffsetTrackerTest {
       assertEquals(3, small.windowSize(tp));
     }
   }
+
+  @Nested
+  class Generations {
+
+    private final TopicPartition gp = new TopicPartition("gen", 0);
+
+    @Test
+    void eachInitGetsANewGeneration_andUntrackedHasNone() {
+      UnorderedOffsetTracker t = new UnorderedOffsetTracker();
+      assertEquals(OffsetTracker.NO_GENERATION, t.generation(gp));
+      t.initPartition(gp, 0);
+      long first = t.generation(gp);
+      t.clearPartition(gp);
+      t.initPartition(gp, 0);
+      assertNotEquals(first, t.generation(gp));
+    }
+
+    @Test
+    void lateAckFromAnEarlierAssignment_isRejectedAndLeavesTheNewWindowAlone() {
+      UnorderedOffsetTracker t = new UnorderedOffsetTracker();
+      t.initPartition(gp, 0);
+      long old = t.generation(gp);
+      t.register(gp, 0);
+      t.markInProgress(gp, 0, old);
+
+      // Revoked, then assigned back to this consumer: offset 0 is fetched and started again.
+      t.clearPartition(gp);
+      t.initPartition(gp, 0);
+      long current = t.generation(gp);
+      t.register(gp, 0);
+      t.markInProgress(gp, 0, current);
+
+      assertThrows(IllegalStateException.class, () -> t.ack(gp, 0, old));
+      assertEquals(1, t.inProgressCount(gp), "new attempt must still be in progress");
+      assertNotEquals(OptionalLong.of(1L), t.getCommittableOffset(gp), "stale ack must not commit");
+
+      t.ack(gp, 0, current);
+      assertEquals(1L, t.getCommittableOffset(gp).getAsLong());
+    }
+
+    @Test
+    void staleGeneration_isRejectedForMarkInProgressAndBatches() {
+      UnorderedOffsetTracker t = new UnorderedOffsetTracker();
+      t.initPartition(gp, 0);
+      long old = t.generation(gp);
+      t.clearPartition(gp);
+      t.initPartition(gp, 0);
+      t.registerBatch(gp, new long[] {0, 1});
+
+      assertThrows(IllegalStateException.class, () -> t.markInProgress(gp, 0, old));
+      assertThrows(
+          IllegalStateException.class, () -> t.markBatchInProgress(gp, new long[] {0, 1}, old));
+      assertEquals(0, t.inProgressCount(gp));
+
+      long current = t.generation(gp);
+      assertEquals(2, t.markBatchInProgress(gp, new long[] {0, 1}, current));
+      assertThrows(IllegalStateException.class, () -> t.ackBatch(gp, new long[] {0, 1}, old));
+      assertEquals(2, t.ackBatch(gp, new long[] {0, 1}, current));
+    }
+
+    @Test
+    void noGeneration_skipsTheCheck() {
+      UnorderedOffsetTracker t = new UnorderedOffsetTracker();
+      t.initPartition(gp, 0);
+      t.register(gp, 0);
+      t.markInProgress(gp, 0, OffsetTracker.NO_GENERATION);
+      t.ack(gp, 0, OffsetTracker.NO_GENERATION);
+      assertEquals(1L, t.getCommittableOffset(gp).getAsLong());
+    }
+  }
 }

@@ -83,10 +83,21 @@ public final class RecordDispatcher<K, V> {
     private final TopicPartition tp;
     private final BlockingQueue<ConsumerRecord<K, V>> queue;
     private final AtomicInteger active = new AtomicInteger();
+    private final long generation;
 
-    private Lane(TopicPartition tp, int capacity) {
+    private Lane(TopicPartition tp, int capacity, long generation) {
       this.tp = tp;
       this.queue = new LinkedBlockingQueue<>(capacity);
+      this.generation = generation;
+    }
+
+    /**
+     * Returns the offset-tracker generation of the assignment this queue belongs to.
+     *
+     * @return the generation, or {@code OffsetTracker.NO_GENERATION} if none was given
+     */
+    public long generation() {
+      return generation;
     }
   }
 
@@ -98,10 +109,22 @@ public final class RecordDispatcher<K, V> {
    * @param <V> the record value type
    * @param partition the topic-partition the record belongs to
    * @param record the consumer record
-   * @param lane internal handle to pass back via {@link #release}; null if no per-partition limit
+   * @param lane internal handle to pass back via {@link #release}
    */
   public record PollResult<K, V>(
-      TopicPartition partition, ConsumerRecord<K, V> record, Lane<K, V> lane) {}
+      TopicPartition partition, ConsumerRecord<K, V> record, Lane<K, V> lane) {
+
+    /**
+     * Returns the offset-tracker generation of the assignment the record was fetched under. Pass it
+     * to the tracker's generation-checked methods so a record from before a revoke cannot complete
+     * the same offset after the partition is re-assigned.
+     *
+     * @return the generation
+     */
+    public long generation() {
+      return lane.generation();
+    }
+  }
 
   /**
    * Creates a record dispatcher.
@@ -159,7 +182,18 @@ public final class RecordDispatcher<K, V> {
    * @param tp the partition to add
    */
   public void addPartition(TopicPartition tp) {
-    queues.putIfAbsent(tp, new Lane<>(tp, queueCapacity));
+    addPartition(tp, -1L);
+  }
+
+  /**
+   * Adds a partition for dispatching, tagging its queue with the offset tracker's generation for
+   * this assignment. Records polled from it report that generation.
+   *
+   * @param tp the partition to add
+   * @param generation the offset-tracker generation of this assignment
+   */
+  public void addPartition(TopicPartition tp, long generation) {
+    queues.putIfAbsent(tp, new Lane<>(tp, queueCapacity, generation));
     rebuildSnapshot();
     logger.log(System.Logger.Level.DEBUG, "Added dispatch queue for {0}", tp);
   }
@@ -335,7 +369,7 @@ public final class RecordDispatcher<K, V> {
         ConsumerRecord<K, V> record = lane.queue.poll();
         if (record != null) {
           queued.decrementAndGet();
-          return new PollResult<>(lane.tp, record, null);
+          return new PollResult<>(lane.tp, record, lane);
         }
       } else if (lane.queue.peek() != null && tryAcquire(lane, limit)) {
         ConsumerRecord<K, V> record = lane.queue.poll();
@@ -365,8 +399,8 @@ public final class RecordDispatcher<K, V> {
    * @param result the poll result whose record finished
    */
   public void release(PollResult<K, V> result) {
+    if (maxConcurrencyPerPartition == 0) return;
     Lane<K, V> lane = result.lane();
-    if (lane == null) return;
     lane.active.decrementAndGet();
     // Records of this partition may be waiting only because the partition was at its limit, so no
     // dispatch will wake a worker for them.
