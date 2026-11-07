@@ -476,8 +476,11 @@ public record PipelineConfig<K, V>(
      * partitions wait in their queues. With a limit of {@code n}, at most {@code n} workers work on
      * one partition; the rest stay available to the others.
      *
-     * <p>A good starting point is about {@code 2 × concurrency / assignedPartitions}. Setting it
-     * too low leaves workers idle when only a few partitions have traffic.
+     * <p>The limit never drops below a fair share of the pool: the enforced value is {@code
+     * max(max, ceil(concurrency / assignedPartitions))}, recomputed on every rebalance. So with a
+     * single assigned partition all workers can still be used, and the configured value only bites
+     * once there are enough partitions to share the pool. A good starting point is about {@code 2 ×
+     * concurrency / expectedPartitionsPerInstance}.
      *
      * <p>Ignored in batch mode, where each poll submits at most one batch per partition.
      *

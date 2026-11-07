@@ -162,7 +162,10 @@ public final class KafkaPipeline<K, V> {
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
     this.retryExecutor = new RetryExecutor<>(config.errorStrategy(), metricsCollector);
     this.dispatcher =
-        new RecordDispatcher<>(config.dispatchQueueCapacity(), config.maxConcurrencyPerPartition());
+        new RecordDispatcher<>(
+            config.dispatchQueueCapacity(),
+            config.maxConcurrencyPerPartition(),
+            config.concurrency());
     this.workerPool =
         buildWorkerPool(
             config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
@@ -192,7 +195,10 @@ public final class KafkaPipeline<K, V> {
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
     this.retryExecutor = new RetryExecutor<>(config.errorStrategy(), metricsCollector);
     this.dispatcher =
-        new RecordDispatcher<>(config.dispatchQueueCapacity(), config.maxConcurrencyPerPartition());
+        new RecordDispatcher<>(
+            config.dispatchQueueCapacity(),
+            config.maxConcurrencyPerPartition(),
+            config.concurrency());
     this.workerPool =
         buildWorkerPool(
             config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);

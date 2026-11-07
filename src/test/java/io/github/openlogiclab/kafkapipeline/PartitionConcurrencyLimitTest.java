@@ -86,24 +86,25 @@ class PartitionConcurrencyLimitTest {
                     })
                 .build(),
             mockConsumer);
-    start();
+    start(SLOW, FAST);
 
-    // Enough slow records to occupy all 4 workers if nothing limited them.
+    // Enough slow records to occupy all 4 workers if nothing limited them. With 2 partitions
+    // assigned, the enforced limit is max(1, ceil(4 / 2)) = 2.
     addRecords(SLOW, 10);
-    await(() -> slowActive.get() == 1, "a worker should pick up the slow partition");
+    await(() -> slowActive.get() == 2, "workers should pick up the slow partition");
     Thread.sleep(200); // give idle workers the chance to (wrongly) take more slow records
 
     addRecords(FAST, 20);
     await(() -> fastDone.get() == 20, "fast partition starved: " + fastDone.get() + "/20");
-    assertEquals(1, slowMaxActive.get(), "slow partition exceeded its limit");
+    assertEquals(2, slowMaxActive.get(), "slow partition exceeded its limit");
 
     release.countDown();
     await(() -> slowDone.get() == 10, "slow partition should finish once released");
-    assertEquals(1, slowMaxActive.get());
+    assertEquals(2, slowMaxActive.get());
   }
 
   @Test
-  void limitAboveOne_allowsThatManyRecordsOfOnePartitionInParallel() throws Exception {
+  void singleAssignedPartition_canUseTheWholePool() throws Exception {
     AtomicInteger active = new AtomicInteger();
     AtomicInteger maxActive = new AtomicInteger();
     AtomicInteger done = new AtomicInteger();
@@ -112,7 +113,7 @@ class PartitionConcurrencyLimitTest {
         new KafkaPipeline<>(
             builder()
                 .concurrency(ThreadMode.PLATFORM, 8)
-                .maxConcurrencyPerPartition(3)
+                .maxConcurrencyPerPartition(2)
                 .handler(
                     record -> {
                       maxActive.accumulateAndGet(active.incrementAndGet(), Math::max);
@@ -125,12 +126,13 @@ class PartitionConcurrencyLimitTest {
                     })
                 .build(),
             mockConsumer);
-    start();
+    start(SLOW);
 
+    // Nothing to protect, so the fair-share floor lifts the limit of 2 to all 8 workers.
     addRecords(SLOW, 12);
-    await(() -> active.get() == 3, "expected 3 records in parallel, got " + active.get());
+    await(() -> active.get() == 8, "expected all 8 workers busy, got " + active.get());
     Thread.sleep(200);
-    assertEquals(3, maxActive.get());
+    assertEquals(8, maxActive.get());
 
     release.countDown();
     await(() -> done.get() == 12, "all records should finish, got " + done.get());
@@ -149,14 +151,13 @@ class PartitionConcurrencyLimitTest {
         .shutdownTimeout(Duration.ofSeconds(5));
   }
 
-  private void start() throws InterruptedException {
+  private void start(TopicPartition... tps) throws InterruptedException {
     pipeline.startAsync();
     Thread.sleep(100);
     Map<TopicPartition, Long> beginning = new HashMap<>();
-    beginning.put(SLOW, 0L);
-    beginning.put(FAST, 0L);
+    for (TopicPartition tp : tps) beginning.put(tp, 0L);
     mockConsumer.updateBeginningOffsets(beginning);
-    mockConsumer.rebalance(List.of(SLOW, FAST));
+    mockConsumer.rebalance(List.of(tps));
   }
 
   private void addRecords(TopicPartition tp, int count) {

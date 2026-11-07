@@ -62,6 +62,50 @@ class RecordDispatcherTest {
     }
 
     @Test
+    void fairShareFloor_tracksAssignedPartitions() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 2, 10);
+      assertEquals(2, d.effectivePartitionLimit(), "no partitions yet");
+      d.addPartition(TP0);
+      assertEquals(10, d.effectivePartitionLimit(), "one partition gets the whole pool");
+      d.addPartition(TP1);
+      assertEquals(5, d.effectivePartitionLimit());
+      d.addPartition(TP2);
+      assertEquals(4, d.effectivePartitionLimit(), "ceil(10 / 3)");
+      d.removePartition(TP2);
+      assertEquals(5, d.effectivePartitionLimit());
+    }
+
+    @Test
+    void fairShareFloor_neverBelowConfiguredLimit() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 3, 4);
+      d.addPartition(TP0);
+      d.addPartition(TP1);
+      d.addPartition(TP2);
+      assertEquals(3, d.effectivePartitionLimit(), "ceil(4 / 3) = 2 < 3");
+    }
+
+    @Test
+    void singlePartition_withFloor_handsOutUpToConcurrencyRecords() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 1, 3);
+      d.addPartition(TP0);
+      for (long i = 0; i < 5; i++) d.dispatch(TP0, record(TP0, i));
+      for (int i = 0; i < 3; i++) assertNotNull(d.poll(10, TimeUnit.MILLISECONDS));
+      assertNull(d.poll(10, TimeUnit.MILLISECONDS), "limit is 3 with one partition");
+    }
+
+    @Test
+    void withoutALimit_fairShareIsNotApplied() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 0, 10);
+      d.addPartition(TP0);
+      assertEquals(0, d.effectivePartitionLimit());
+    }
+
+    @Test
+    void rejectsNegativeConcurrency() {
+      assertThrows(IllegalArgumentException.class, () -> new RecordDispatcher<>(10, 1, -1));
+    }
+
+    @Test
     void rejectsNegativeLimit() {
       assertThrows(IllegalArgumentException.class, () -> new RecordDispatcher<>(10, -1));
     }

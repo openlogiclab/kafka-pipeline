@@ -351,7 +351,17 @@ All partitions in a pipeline share one worker pool. If one partition's records a
 .maxConcurrencyPerPartition(20)   // ~2 × 200 workers / 20 partitions
 ```
 
-A worker skips a partition that is already at its limit and takes the next partition with work, so the cap costs nothing while traffic is spread evenly. Set it too low and workers sit idle when only a few partitions have traffic. Applies to per-record mode only; batch mode submits at most one batch per partition per poll.
+A worker skips a partition that is already at its limit and takes the next partition with work, so the cap costs nothing while traffic is spread evenly.
+
+The limit never drops below a fair share of the pool: the enforced value is `max(n, ⌈concurrency ÷ assigned partitions⌉)`, recomputed on every rebalance. With `concurrency(200)` and `maxConcurrencyPerPartition(20)`:
+
+| Partitions assigned to this instance | Enforced limit |
+|---|---|
+| 1 | 200 (the whole pool) |
+| 4 | 50 |
+| 20 or more | 20 |
+
+So a pod that ends up with a single partition still uses every worker, and the cap only bites once there are enough partitions to compete. Applies to per-record mode only; batch mode submits at most one batch per partition per poll.
 
 ### Error Handling
 

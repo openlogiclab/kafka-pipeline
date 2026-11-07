@@ -47,8 +47,13 @@ public final class RecordDispatcher<K, V> {
   private final ConcurrentHashMap<TopicPartition, Lane<K, V>> queues = new ConcurrentHashMap<>();
 
   private final int queueCapacity;
-  // Max records of one partition being processed at once; 0 means unlimited.
+  // Configured max records of one partition being processed at once; 0 means unlimited.
   private final int maxConcurrencyPerPartition;
+  // Worker count, used so the limit never drops below a fair share of the pool.
+  private final int concurrency;
+  // Limit actually enforced: max(configured, ceil(concurrency / assigned partitions)). Recomputed
+  // whenever partitions are added or removed. 0 means unlimited.
+  private volatile int effectiveLimit;
   private final Set<Thread> waitingWorkers = ConcurrentHashMap.newKeySet();
 
   // Approximate number of queued records, used to decide whether to wake another worker. It can
@@ -117,6 +122,21 @@ public final class RecordDispatcher<K, V> {
    *     unlimited
    */
   public RecordDispatcher(int queueCapacity, int maxConcurrencyPerPartition) {
+    this(queueCapacity, maxConcurrencyPerPartition, 0);
+  }
+
+  /**
+   * Creates a record dispatcher with a per-partition limit that never drops below a fair share of
+   * the worker pool: the enforced limit is {@code max(maxConcurrencyPerPartition, ceil(concurrency
+   * / assignedPartitions))}. With a single assigned partition it can use every worker; with many,
+   * none can take more than its slice.
+   *
+   * @param queueCapacity capacity of each per-partition queue
+   * @param maxConcurrencyPerPartition max records of one partition in processing at once; 0 means
+   *     unlimited
+   * @param concurrency number of workers, for the fair-share floor; 0 disables the floor
+   */
+  public RecordDispatcher(int queueCapacity, int maxConcurrencyPerPartition, int concurrency) {
     if (queueCapacity <= 0) {
       throw new IllegalArgumentException("queueCapacity must be positive, got " + queueCapacity);
     }
@@ -124,8 +144,13 @@ public final class RecordDispatcher<K, V> {
       throw new IllegalArgumentException(
           "maxConcurrencyPerPartition must be >= 0, got " + maxConcurrencyPerPartition);
     }
+    if (concurrency < 0) {
+      throw new IllegalArgumentException("concurrency must be >= 0, got " + concurrency);
+    }
     this.queueCapacity = queueCapacity;
     this.maxConcurrencyPerPartition = maxConcurrencyPerPartition;
+    this.concurrency = concurrency;
+    this.effectiveLimit = maxConcurrencyPerPartition;
   }
 
   /**
@@ -163,7 +188,12 @@ public final class RecordDispatcher<K, V> {
 
   @SuppressWarnings("unchecked")
   private void rebuildSnapshot() {
-    partitionSnapshot = queues.values().toArray(new Lane[0]);
+    Lane<K, V>[] snap = queues.values().toArray(new Lane[0]);
+    partitionSnapshot = snap;
+    if (maxConcurrencyPerPartition > 0) {
+      int fairShare = snap.length == 0 ? 0 : (concurrency + snap.length - 1) / snap.length;
+      effectiveLimit = Math.max(maxConcurrencyPerPartition, fairShare);
+    }
   }
 
   /**
@@ -297,16 +327,17 @@ public final class RecordDispatcher<K, V> {
     int len = snap.length;
     if (len == 0) return null;
 
+    int limit = effectiveLimit;
     int start = ThreadLocalRandom.current().nextInt(len);
     for (int i = 0; i < len; i++) {
       Lane<K, V> lane = snap[(start + i) % len];
-      if (maxConcurrencyPerPartition == 0) {
+      if (limit == 0) {
         ConsumerRecord<K, V> record = lane.queue.poll();
         if (record != null) {
           queued.decrementAndGet();
           return new PollResult<>(lane.tp, record, null);
         }
-      } else if (lane.queue.peek() != null && tryAcquire(lane)) {
+      } else if (lane.queue.peek() != null && tryAcquire(lane, limit)) {
         ConsumerRecord<K, V> record = lane.queue.poll();
         if (record != null) {
           queued.decrementAndGet();
@@ -318,10 +349,10 @@ public final class RecordDispatcher<K, V> {
     return null;
   }
 
-  private boolean tryAcquire(Lane<K, V> lane) {
+  private boolean tryAcquire(Lane<K, V> lane, int limit) {
     while (true) {
       int active = lane.active.get();
-      if (active >= maxConcurrencyPerPartition) return false;
+      if (active >= limit) return false;
       if (lane.active.compareAndSet(active, active + 1)) return true;
     }
   }
@@ -342,6 +373,15 @@ public final class RecordDispatcher<K, V> {
     if (!lane.queue.isEmpty()) {
       wakeOneWorker();
     }
+  }
+
+  /**
+   * Returns the per-partition limit currently enforced, after applying the fair-share floor.
+   *
+   * @return records of one partition allowed in processing at once, or 0 if unlimited
+   */
+  public int effectivePartitionLimit() {
+    return effectiveLimit;
   }
 
   /**
