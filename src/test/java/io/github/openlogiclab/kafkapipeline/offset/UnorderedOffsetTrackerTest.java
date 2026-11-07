@@ -923,4 +923,41 @@ class UnorderedOffsetTrackerTest {
       assertEquals(0, tracker.failureCount(TP1));
     }
   }
+
+  @Nested
+  class WindowCapacity {
+
+    @Test
+    void nonPositiveMaxWindowSize_throws() {
+      assertThrows(IllegalArgumentException.class, () -> new UnorderedOffsetTracker(0));
+      assertThrows(IllegalArgumentException.class, () -> new UnorderedOffsetTracker(-1));
+    }
+
+    @Test
+    void maxWindowSize_isConfigurable() {
+      assertEquals(10_000, new UnorderedOffsetTracker().maxWindowSize());
+      assertEquals(3, new UnorderedOffsetTracker(3).maxWindowSize());
+    }
+
+    @Test
+    void windowSize_isZeroForUnknownPartition() {
+      UnorderedOffsetTracker small = new UnorderedOffsetTracker(3);
+      assertEquals(0, small.windowSize(new TopicPartition("unknown", 0)));
+    }
+
+    @Test
+    void register_beyondCapacity_throwsWindowFull() {
+      UnorderedOffsetTracker small = new UnorderedOffsetTracker(3);
+      TopicPartition tp = new TopicPartition("t", 0);
+      small.initPartition(tp, 0);
+      small.register(tp, 0);
+      small.register(tp, 1);
+      small.register(tp, 2);
+
+      assertEquals(3, small.windowSize(tp));
+      assertThrows(WindowFullException.class, () -> small.register(tp, 3));
+      assertThrows(WindowFullException.class, () -> small.registerBatch(tp, new long[] {3, 4}));
+      assertEquals(3, small.windowSize(tp));
+    }
+  }
 }

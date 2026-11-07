@@ -27,11 +27,15 @@ import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
@@ -352,6 +356,48 @@ class WorkerPoolTest {
 
       assertEquals(1, processed.size());
       assertEquals(3, attempts.get());
+    }
+  }
+
+  @Nested
+  class FullWindow {
+
+    @Test
+    void dispatch_stopsAtFullWindowPerPartition_andReportsFirstUndispatchedOffset() {
+      TopicPartition tp1 = new TopicPartition("test", 1);
+      tracker = new UnorderedOffsetTracker(3);
+      tracker.initPartition(TP0, 0);
+      tracker.initPartition(tp1, 10);
+      dispatcher.addPartition(tp1);
+
+      Map<TopicPartition, List<ConsumerRecord<String, String>>> map = new HashMap<>();
+      map.put(TP0, records(TP0, 0, 5));
+      map.put(tp1, records(tp1, 10, 15));
+
+      Map<TopicPartition, Long> rejected =
+          pool(r -> {}).dispatch(new ConsumerRecords<>(map, Map.of()));
+
+      assertEquals(Map.of(TP0, 3L, tp1, 13L), rejected);
+      assertEquals(3, dispatcher.queuedRecords(TP0));
+      assertEquals(3, dispatcher.queuedRecords(tp1));
+      assertEquals(6, counter.records());
+    }
+
+    @Test
+    void dispatch_returnsEmptyMapWhenEverythingFits() {
+      Map<TopicPartition, List<ConsumerRecord<String, String>>> map =
+          Map.of(TP0, records(TP0, 0, 5));
+
+      assertTrue(pool(r -> {}).dispatch(new ConsumerRecords<>(map, Map.of())).isEmpty());
+      assertEquals(5, dispatcher.queuedRecords(TP0));
+    }
+
+    private List<ConsumerRecord<String, String>> records(TopicPartition tp, long from, long to) {
+      List<ConsumerRecord<String, String>> list = new java.util.ArrayList<>();
+      for (long o = from; o < to; o++) {
+        list.add(new ConsumerRecord<>(tp.topic(), tp.partition(), o, "k", "v-" + o));
+      }
+      return list;
     }
   }
 }
