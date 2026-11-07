@@ -150,7 +150,7 @@ public final class PeriodicCommitter {
               committedOffsets.forEach(
                   (tp, meta) ->
                       offsetTracker.markCommitted(
-                          tp, new CommitPoint(meta.offset(), metadataOf(meta))));
+                          tp, new CommitPoint(meta.offset(), meta.metadata())));
               metricsCollector.recordCommitSuccess();
               logger.log(System.Logger.Level.DEBUG, "Committed offsets: {0}", committedOffsets);
             }
@@ -180,7 +180,7 @@ public final class PeriodicCommitter {
       // Mark as committed
       offsets.forEach(
           (tp, meta) ->
-              offsetTracker.markCommitted(tp, new CommitPoint(meta.offset(), metadataOf(meta))));
+              offsetTracker.markCommitted(tp, new CommitPoint(meta.offset(), meta.metadata())));
       metricsCollector.recordCommitSuccess();
       logger.log(System.Logger.Level.INFO, "Sync committed offsets: {0}", offsets);
     } catch (Exception e) {
@@ -234,9 +234,5 @@ public final class PeriodicCommitter {
     Map<TopicPartition, OffsetAndMetadata> result = new HashMap<>(points.size());
     points.forEach((tp, p) -> result.put(tp, new OffsetAndMetadata(p.offset(), p.metadata())));
     return result;
-  }
-
-  private static String metadataOf(OffsetAndMetadata meta) {
-    return meta.metadata() == null ? "" : meta.metadata();
   }
 }

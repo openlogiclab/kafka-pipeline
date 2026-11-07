@@ -99,4 +99,20 @@ class KeyedLaneQueueTest {
     assertFalse(q.hasReady());
     assertNull(q.poll());
   }
+
+  @Test
+  void onlyUnkeyedRecordsWaiting_isReady() {
+    KeyedLaneQueue<String, String> q = new KeyedLaneQueue<>(10);
+    q.offer(new ConsumerRecord<>("t", 0, 0, null, "v"));
+    assertTrue(q.hasReady());
+  }
+
+  @Test
+  void fifoLane_releaseIsANoOp() {
+    FifoLaneQueue<String, String> q = new FifoLaneQueue<>(2);
+    ConsumerRecord<String, String> r = new ConsumerRecord<>("t", 0, 0, "k", "v");
+    q.offer(r);
+    q.release(r);
+    assertEquals(1, q.size());
+  }
 }

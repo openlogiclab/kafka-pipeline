@@ -256,4 +256,80 @@ class PipelineRebalanceListenerTest {
       assertDoesNotThrow(() -> listener.shutdown());
     }
   }
+
+  @Nested
+  class CommittedMetadataOnAssign {
+
+    private PipelineRebalanceListener replayListener(MockConsumer<String, String> consumer) {
+      tracker = new UnorderedOffsetTracker(100, true);
+      return new PipelineRebalanceListener(
+          tracker,
+          dispatcher,
+          commitSyncCalls::incrementAndGet,
+          counter,
+          consumer,
+          Duration.ofSeconds(5),
+          NoOpMetricsCollector.INSTANCE,
+          true);
+    }
+
+    /** Metadata of a previous owner whose offset 10 was stuck while 11 and 12 finished. */
+    private String finishedElevenAndTwelve() {
+      UnorderedOffsetTracker previous = new UnorderedOffsetTracker(100, true);
+      previous.initPartition(TP0, 10, null);
+      for (long o = 10; o <= 12; o++) previous.register(TP0, o);
+      for (long o = 11; o <= 12; o++) {
+        previous.markInProgress(TP0, o);
+        previous.ack(TP0, o);
+      }
+      return previous.getAllCommitPoints().get(TP0).metadata();
+    }
+
+    @Test
+    void metadataForTheResumeOffset_skipsFinishedRecords() {
+      mockConsumer.assign(List.of(TP0));
+      mockConsumer.commitSync(
+          Map.of(
+              TP0,
+              new org.apache.kafka.clients.consumer.OffsetAndMetadata(
+                  10, finishedElevenAndTwelve())));
+      mockConsumer.seek(TP0, 10);
+      PipelineRebalanceListener l = replayListener(mockConsumer);
+      l.onPartitionsAssigned(List.of(TP0));
+      assertFalse(tracker.registerUnlessDone(TP0, 11));
+      assertTrue(tracker.registerUnlessDone(TP0, 13));
+    }
+
+    @Test
+    void resumingFromAnotherOffset_ignoresTheMetadata() {
+      mockConsumer.assign(List.of(TP0));
+      mockConsumer.commitSync(
+          Map.of(
+              TP0,
+              new org.apache.kafka.clients.consumer.OffsetAndMetadata(
+                  10, finishedElevenAndTwelve())));
+      mockConsumer.seek(TP0, 5); // e.g. an offset reset
+      PipelineRebalanceListener l = replayListener(mockConsumer);
+      l.onPartitionsAssigned(List.of(TP0));
+      assertTrue(tracker.registerUnlessDone(TP0, 11));
+    }
+
+    @Test
+    void failingToReadCommittedMetadata_assignsWithoutSkipping() {
+      MockConsumer<String, String> broken =
+          new MockConsumer<>("earliest") {
+            @Override
+            public synchronized Map<
+                    TopicPartition, org.apache.kafka.clients.consumer.OffsetAndMetadata>
+                committed(java.util.Set<TopicPartition> partitions) {
+              throw new org.apache.kafka.common.errors.TimeoutException("coordinator unavailable");
+            }
+          };
+      broken.assign(List.of(TP0));
+      broken.updateBeginningOffsets(Map.of(TP0, 0L));
+      PipelineRebalanceListener l = replayListener(broken);
+      assertDoesNotThrow(() -> l.onPartitionsAssigned(List.of(TP0)));
+      assertTrue(tracker.registerUnlessDone(TP0, 0));
+    }
+  }
 }
