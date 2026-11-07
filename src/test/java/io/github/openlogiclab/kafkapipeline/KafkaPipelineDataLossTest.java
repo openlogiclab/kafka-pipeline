@@ -563,4 +563,75 @@ class KafkaPipelineDataLossTest {
         () -> pipeline.metrics().inFlightRecords() == 0,
         "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
   }
+
+  @Test
+  void fullDispatchQueue_pausesPartitionInsteadOfBlockingPollThread() throws Exception {
+    Map<Long, AtomicInteger> processed = new ConcurrentHashMap<>();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .dispatchQueueCapacity(5)
+            .handler(
+                record -> {
+                  blockOnFirstRecord(TP0, record);
+                  processed
+                      .computeIfAbsent(record.offset(), o -> new AtomicInteger())
+                      .incrementAndGet();
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+
+    // The single worker is stuck on offset 0, so the queue (5) fills on the second poll and the
+    // rest of that poll is sent back with a seek. Whether the worker took offset 0 off the queue
+    // before that poll is a race, so the seek lands on 5 (queue held 0..4) or 6 (queue held 1..5).
+    serveLog(TP0, 30, 5);
+    await(
+        () -> mockConsumer.paused().contains(TP0), "TP0 should be paused while its queue is full");
+    long position = mockConsumer.position(TP0);
+    assertTrue(
+        position == 5L || position == 6L,
+        "rest of the poll should be fetched again later, position=" + position);
+
+    release.countDown();
+
+    await(() -> processed.size() == 30, "Expected 0..29, got " + processed.keySet());
+    processed.values().forEach(c -> assertEquals(1, c.get()));
+    await(() -> committedAt(TP0, 30L), "Offsets through 29 should be committed");
+  }
+
+  @Test
+  void stopWithFullQueueAndHungHandler_shutsDownWithinShutdownTimeout() throws Exception {
+    CountDownLatch neverReleased = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .dispatchQueueCapacity(2)
+            .shutdownTimeout(Duration.ofMillis(500))
+            .handler(record -> neverReleased.await(60, TimeUnit.SECONDS))
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    serveLog(TP0, 20, 5);
+    await(() -> mockConsumer.paused().contains(TP0), "queue should fill while the handler hangs");
+
+    long start = System.nanoTime();
+    pipeline.stop();
+    Thread waiter =
+        Thread.ofPlatform()
+            .start(
+                () -> {
+                  try {
+                    pipeline.awaitShutdown();
+                  } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                  }
+                });
+    waiter.join(10_000);
+
+    assertFalse(waiter.isAlive(), "shutdown hung behind a blocked poll thread");
+    assertTrue(
+        System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5),
+        "shutdown should finish shortly after shutdownTimeout");
+  }
 }

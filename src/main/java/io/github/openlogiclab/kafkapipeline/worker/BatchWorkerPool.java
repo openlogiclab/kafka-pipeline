@@ -110,6 +110,13 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         batchBytes += RecordSize.estimateBytes(record);
       }
 
+      if (!hasTaskQueueRoom()) {
+        // Never block the poll thread on a full task queue: fetch the batch again once it drains.
+        reportTaskQueueFull(tp);
+        if (rejected.isEmpty()) rejected = new HashMap<>();
+        rejected.put(tp, offsets[0]);
+        continue;
+      }
       try {
         offsetTracker.registerBatch(tp, offsets);
       } catch (WindowFullException e) {
@@ -123,6 +130,11 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       executor.submit(() -> processBatch(tp, batch, offsets, totalBytes));
     }
     return rejected;
+  }
+
+  @Override
+  public boolean canResume(TopicPartition tp) {
+    return taskQueueDrained();
   }
 
   private void processBatch(
