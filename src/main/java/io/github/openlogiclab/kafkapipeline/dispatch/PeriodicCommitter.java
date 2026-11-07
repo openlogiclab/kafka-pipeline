@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.WakeupException;
 
 /**
  * Timer-based offset committer that periodically reads committable offsets from the {@link
@@ -162,7 +163,15 @@ public final class PeriodicCommitter {
       Map<TopicPartition, OffsetAndMetadata> offsets = buildAllCommittableMap();
       if (offsets.isEmpty()) return;
 
-      consumer.commitSync(offsets);
+      try {
+        consumer.commitSync(offsets);
+      } catch (WakeupException e) {
+        // stop() calls wakeup(), and a wakeup that lands while the poll thread is outside poll()
+        // fires on the next blocking call, which can be this final commit. The wakeup is
+        // consumed by the exception, so retrying once commits normally.
+        logger.log(System.Logger.Level.DEBUG, "Sync commit interrupted by wakeup, retrying");
+        consumer.commitSync(offsets);
+      }
       // Mark as committed
       offsets.forEach((tp, meta) -> offsetTracker.markCommitted(tp, meta.offset()));
       metricsCollector.recordCommitSuccess();

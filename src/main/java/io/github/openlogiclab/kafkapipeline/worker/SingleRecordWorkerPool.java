@@ -142,8 +142,17 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   }
 
   private void processRecord(TopicPartition tp, ConsumerRecord<K, V> record) {
+    try {
+      process(tp, record);
+    } finally {
+      // Always release the in-flight slot, even if the partition was revoked mid-processing and
+      // the ack below failed; otherwise backpressure would never drain.
+      counter.completed(1, RecordSize.estimateBytes(record));
+    }
+  }
+
+  private void process(TopicPartition tp, ConsumerRecord<K, V> record) {
     long offset = record.offset();
-    long recordBytes = RecordSize.estimateBytes(record);
     ProcessingContext ctx = new ProcessingContext(tp, offset, 0);
 
     try {
@@ -155,7 +164,6 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
           offset,
           tp,
           e.getMessage());
-      counter.completed(1, recordBytes);
       return;
     }
 
@@ -171,8 +179,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     }
 
     if (shouldSkipViaHook) {
-      offsetTracker.ack(tp, offset);
-      counter.completed(1, recordBytes);
+      ack(tp, offset);
       metricsCollector.recordSkipped(1);
       return;
     }
@@ -194,8 +201,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
             desc);
 
     if (lastError == null) {
-      offsetTracker.ack(tp, offset);
-      counter.completed(1, recordBytes);
+      ack(tp, offset);
       metricsCollector.recordProcessed(1);
       return;
     }
@@ -208,7 +214,6 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
           "Interrupted while processing {0}:{1}, not acking",
           tp,
           offset);
-      counter.completed(1, recordBytes);
       return;
     }
 
@@ -216,10 +221,31 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     RetryExecutor.FailureResolution resolution =
         retryExecutor.handleFailure(List.of(record), tp, lastError, desc);
     if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
-      offsetTracker.markFailed(tp);
       metricsCollector.recordFailed(1);
+      if (ack(tp, offset)) offsetTracker.markFailed(tp);
+    } else {
+      ack(tp, offset);
     }
-    offsetTracker.ack(tp, offset);
-    counter.completed(1, recordBytes);
+  }
+
+  /**
+   * Acks an offset. Returns false if the partition is no longer tracked, which happens when a
+   * record finishes after its partition was revoked and the drain timeout expired. The new owner
+   * re-consumes it from the last committed offset, so there is nothing more to do here.
+   */
+  private boolean ack(TopicPartition tp, long offset) {
+    try {
+      offsetTracker.ack(tp, offset);
+      return true;
+    } catch (IllegalStateException e) {
+      logger.log(
+          System.Logger.Level.INFO,
+          "Finished {0}:{1} but could not ack it ({2}); the partition was likely revoked and the"
+              + " record will be redelivered to its new owner",
+          tp,
+          offset,
+          e.getMessage());
+      return false;
+    }
   }
 }
