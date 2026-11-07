@@ -266,7 +266,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       return true;
     } catch (IllegalStateException e) {
       logger.log(
-          System.Logger.Level.INFO,
+          System.Logger.Level.DEBUG,
           "Finished {0}:{1} but could not ack it ({2}); the partition was likely revoked and the"
               + " record will be redelivered to its new owner",
           tp,

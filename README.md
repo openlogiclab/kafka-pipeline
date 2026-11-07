@@ -779,6 +779,8 @@ A larger window gives slow records more slack before the partition pauses, but u
 
 On rebalance, the pipeline drains in-flight records (up to `drainTimeout`), does a final sync commit, then hands the partition off cleanly. A record that is still running when `drainTimeout` expires is not acked when it finishes, even if the partition has come back to this same consumer in the meantime: each assignment gets its own generation, and results from an older one are discarded. That record is redelivered from the committed offset instead.
 
+If the consumer is kicked out of the group instead (missed heartbeats, or removed by an admin), Kafka reports the partitions as *lost* rather than revoked. Other members may already own them, so the pipeline does not drain or commit: it drops queued records, discards acks from records still running, and rejoins. Everything after the last committed offset is redelivered.
+
 ### The Duplicate Processing Problem
 
 The sliding window guarantees that the committed offset never jumps past in-flight work. But there's one scenario it **cannot** prevent:

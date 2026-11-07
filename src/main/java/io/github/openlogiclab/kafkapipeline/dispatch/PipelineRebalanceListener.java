@@ -88,19 +88,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
 
     logger.log(System.Logger.Level.INFO, "Partitions revoked: {0}", partitions);
     metricsCollector.recordRebalance();
-
-    for (TopicPartition tp : partitions) {
-      metricsCollector.partitionRevoked(tp);
-      List<? extends ConsumerRecord<?, ?>> abandoned = dispatcher.removePartition(tp);
-      if (!abandoned.isEmpty()) {
-        long abandonedBytes = 0;
-        for (ConsumerRecord<?, ?> record : abandoned) {
-          abandonedBytes += RecordSize.estimateBytes(record);
-        }
-        counter.completed(abandoned.size(), abandonedBytes);
-        metricsCollector.recordAbandoned(abandoned.size());
-      }
-    }
+    dropQueued(partitions);
 
     if (drainExecutor.isShutdown()) {
       // Pipeline shutdown: consumer.close() revokes the partitions after the workers have stopped
@@ -142,6 +130,47 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
 
     for (TopicPartition tp : partitions) {
       offsetTracker.clearPartition(tp);
+    }
+  }
+
+  /**
+   * Called when this consumer lost its partitions without a normal revoke, typically because the
+   * group coordinator kicked it out (missed heartbeats, exceeded {@code max.poll.interval.ms}, or
+   * removed by an admin). Other members may already own the partitions, so committing is not
+   * possible and draining would only delay rejoining. Queued records are dropped and partition
+   * state is cleared; records still running finish, but their acks belong to the old assignment and
+   * are discarded. Everything after the last committed offset is redelivered.
+   *
+   * @param partitions the partitions that were lost
+   */
+  @Override
+  public void onPartitionsLost(Collection<TopicPartition> partitions) {
+    if (partitions.isEmpty()) return;
+
+    logger.log(
+        System.Logger.Level.WARNING,
+        "Partitions lost (consumer was removed from the group): {0}. Uncommitted records will be"
+            + " redelivered.",
+        partitions);
+    metricsCollector.recordRebalance();
+    dropQueued(partitions);
+    for (TopicPartition tp : partitions) {
+      offsetTracker.clearPartition(tp);
+    }
+  }
+
+  private void dropQueued(Collection<TopicPartition> partitions) {
+    for (TopicPartition tp : partitions) {
+      metricsCollector.partitionRevoked(tp);
+      List<? extends ConsumerRecord<?, ?>> abandoned = dispatcher.removePartition(tp);
+      if (!abandoned.isEmpty()) {
+        long abandonedBytes = 0;
+        for (ConsumerRecord<?, ?> record : abandoned) {
+          abandonedBytes += RecordSize.estimateBytes(record);
+        }
+        counter.completed(abandoned.size(), abandonedBytes);
+        metricsCollector.recordAbandoned(abandoned.size());
+      }
     }
   }
 
