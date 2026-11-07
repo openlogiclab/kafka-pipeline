@@ -17,17 +17,16 @@ package io.github.openlogiclab.kafkapipeline.worker;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
-import io.github.openlogiclab.kafkapipeline.RecordSize;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
+import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
-import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
+import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
+import io.github.openlogiclab.kafkapipeline.offset.ProcessingProgress;
 import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -55,10 +54,11 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private final RecordHandler<K, V> handler;
   private final ProcessingLifecycleHook<K, V> hook;
   private final RetryExecutor<K, V> retryExecutor;
-  private final OffsetTracker offsetTracker;
+  private final ProcessingProgress offsetTracker;
   private final RecordDispatcher<K, V> dispatcher;
   private final InFlightCounter counter;
   private final PipelineMetricsCollector metricsCollector;
+  private final FailureResolver<K, V> failures;
 
   /**
    * Creates a single-record worker pool.
@@ -79,7 +79,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       RecordHandler<K, V> handler,
       ProcessingLifecycleHook<K, V> hook,
       RetryExecutor<K, V> retryExecutor,
-      OffsetTracker offsetTracker,
+      ProcessingProgress offsetTracker,
       RecordDispatcher<K, V> dispatcher,
       InFlightCounter counter,
       PipelineMetricsCollector metricsCollector) {
@@ -91,6 +91,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     this.dispatcher = dispatcher;
     this.counter = counter;
     this.metricsCollector = metricsCollector;
+    this.failures = new FailureResolver<>(retryExecutor, offsetTracker, metricsCollector);
   }
 
   @Override
@@ -117,8 +118,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         if (!dispatcher.hasRoom(tp)) {
           // Never block the poll thread on a full queue: fetch the rest again once it drains.
           dispatcher.reportFull(tp);
-          if (rejected.isEmpty()) rejected = new HashMap<>();
-          rejected.put(tp, record.offset());
+          rejected = reject(rejected, tp, record.offset());
           break;
         }
         try {
@@ -127,8 +127,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
             continue;
           }
         } catch (WindowFullException e) {
-          if (rejected.isEmpty()) rejected = new HashMap<>();
-          rejected.put(tp, record.offset());
+          rejected = reject(rejected, tp, record.offset());
           break;
         }
         counter.registered(1, RecordSize.estimateBytes(record));
@@ -174,8 +173,6 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
 
   private void process(TopicPartition tp, ConsumerRecord<K, V> record, long generation) {
     long offset = record.offset();
-    ProcessingContext ctx = new ProcessingContext(tp, offset, 0);
-
     try {
       offsetTracker.markInProgress(tp, offset, generation);
     } catch (IllegalStateException e) {
@@ -188,18 +185,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       return;
     }
 
-    boolean shouldSkipViaHook = false;
-    try {
-      shouldSkipViaHook = !hook.beforeProcess(record, ctx);
-    } catch (Exception e) {
-      logger.log(
-          System.Logger.Level.WARNING,
-          "beforeProcess hook threw for {0}:{1}, proceeding with handler",
-          tp,
-          offset);
-    }
-
-    if (shouldSkipViaHook) {
+    if (skippedByHook(record, new ProcessingContext(tp, offset, 0))) {
       ack(tp, offset, generation);
       metricsCollector.recordSkipped(1);
       return;
@@ -211,50 +197,57 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         retryExecutor.executeWithRetries(
             attempt -> {
               lastAttempt[0] = attempt;
-              try {
-                handler.handle(record);
-              } catch (Exception ex) {
-                hook.onError(record, new ProcessingContext(tp, offset, attempt), ex);
-                throw ex;
-              }
+              handleOnce(record, new ProcessingContext(tp, offset, attempt));
             },
             tp,
             desc);
 
     if (lastError == null) {
       // Outside the retry loop: a hook that throws must not re-run a handler that succeeded.
-      try {
-        hook.afterProcess(record, new ProcessingContext(tp, offset, lastAttempt[0]));
-      } catch (Exception e) {
-        logger.log(
-            System.Logger.Level.WARNING,
-            "afterProcess hook threw for " + tp + ":" + offset + "; the record is still acked",
-            e);
-      }
+      notifyAfterProcess(record, new ProcessingContext(tp, offset, lastAttempt[0]));
       ack(tp, offset, generation);
       metricsCollector.recordProcessed(1);
       return;
     }
 
-    if (Thread.currentThread().isInterrupted()) {
-      // Interrupted by shutdown, not a processing failure: leave the offset unacked so it is
-      // not committed and the record is redelivered.
-      logger.log(
-          System.Logger.Level.DEBUG,
-          "Interrupted while processing {0}:{1}, not acking",
-          tp,
-          offset);
-      return;
-    }
+    failures.resolve(List.of(record), tp, lastError, desc, () -> ack(tp, offset, generation));
+  }
 
-    // Best-effort: DLQ or skip, always ack and continue
-    RetryExecutor.FailureResolution resolution =
-        retryExecutor.handleFailure(List.of(record), tp, lastError, desc);
-    if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
-      metricsCollector.recordFailed(1);
-      if (ack(tp, offset, generation)) offsetTracker.markFailed(tp);
-    } else {
-      ack(tp, offset, generation);
+  /** Asks the hook whether to skip the record; a hook that throws does not skip it. */
+  private boolean skippedByHook(ConsumerRecord<K, V> record, ProcessingContext ctx) {
+    try {
+      return !hook.beforeProcess(record, ctx);
+    } catch (Exception e) {
+      logger.log(
+          System.Logger.Level.WARNING,
+          "beforeProcess hook threw for {0}:{1}, proceeding with handler",
+          ctx.partition(),
+          ctx.offset());
+      return false;
+    }
+  }
+
+  private void handleOnce(ConsumerRecord<K, V> record, ProcessingContext ctx) throws Exception {
+    try {
+      handler.handle(record);
+    } catch (Exception e) {
+      hook.onError(record, ctx, e);
+      throw e;
+    }
+  }
+
+  private void notifyAfterProcess(ConsumerRecord<K, V> record, ProcessingContext ctx) {
+    try {
+      hook.afterProcess(record, ctx);
+    } catch (Exception e) {
+      logger.log(
+          System.Logger.Level.WARNING,
+          "afterProcess hook threw for "
+              + ctx.partition()
+              + ":"
+              + ctx.offset()
+              + "; the record is still acked",
+          e);
     }
   }
 

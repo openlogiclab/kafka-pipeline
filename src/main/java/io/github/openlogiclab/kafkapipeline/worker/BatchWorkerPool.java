@@ -15,16 +15,15 @@
  */
 package io.github.openlogiclab.kafkapipeline.worker;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.ProcessingOrder;
-import io.github.openlogiclab.kafkapipeline.RecordSize;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
+import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
-import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
+import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
+import io.github.openlogiclab.kafkapipeline.offset.ProcessingProgress;
 import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -47,9 +46,10 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
 
   private final BatchRecordHandler<K, V> handler;
   private final RetryExecutor<K, V> retryExecutor;
-  private final OffsetTracker offsetTracker;
+  private final ProcessingProgress offsetTracker;
   private final InFlightCounter counter;
   private final PipelineMetricsCollector metricsCollector;
+  private final FailureResolver<K, V> failures;
 
   // Virtual-thread executors start a thread per task with no upper bound, so concurrency is
   // enforced here instead. Null for platform threads, where the fixed-size pool already bounds it.
@@ -77,7 +77,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       ThreadMode threadMode,
       BatchRecordHandler<K, V> handler,
       RetryExecutor<K, V> retryExecutor,
-      OffsetTracker offsetTracker,
+      ProcessingProgress offsetTracker,
       InFlightCounter counter,
       int taskQueueCapacity,
       PipelineMetricsCollector metricsCollector) {
@@ -114,7 +114,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       ThreadMode threadMode,
       BatchRecordHandler<K, V> handler,
       RetryExecutor<K, V> retryExecutor,
-      OffsetTracker offsetTracker,
+      ProcessingProgress offsetTracker,
       InFlightCounter counter,
       int taskQueueCapacity,
       PipelineMetricsCollector metricsCollector,
@@ -126,6 +126,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     this.offsetTracker = offsetTracker;
     this.counter = counter;
     this.metricsCollector = metricsCollector;
+    this.failures = new FailureResolver<>(retryExecutor, offsetTracker, metricsCollector);
     this.handlerPermits = threadMode == ThreadMode.VIRTUAL ? new Semaphore(concurrency) : null;
   }
 
@@ -145,60 +146,45 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   public Map<TopicPartition, Long> dispatch(ConsumerRecords<K, V> records) {
     Map<TopicPartition, Long> rejected = Map.of();
     for (TopicPartition tp : records.partitions()) {
-      List<ConsumerRecord<K, V>> batch = records.records(tp);
-
-      // Extract actual offsets from batch - don't assume consecutive offsets
-      long[] offsets = new long[batch.size()];
-      long batchBytes = 0;
-      for (int i = 0; i < batch.size(); i++) {
-        ConsumerRecord<K, V> record = batch.get(i);
-        offsets[i] = record.offset();
-        batchBytes += RecordSize.estimateBytes(record);
-      }
+      List<ConsumerRecord<K, V>> polled = records.records(tp);
+      // Offsets are not assumed consecutive (compaction, transaction markers).
+      long[] offsets = polled.stream().mapToLong(ConsumerRecord::offset).toArray();
 
       if (ordered && batchInFlight.contains(tp)) {
         // Keep partition order: this batch waits until the previous one of the partition is done.
-        if (rejected.isEmpty()) rejected = new HashMap<>();
-        rejected.put(tp, offsets[0]);
+        rejected = reject(rejected, tp, offsets[0]);
         continue;
       }
       if (!hasTaskQueueRoom()) {
         // Never block the poll thread on a full task queue: fetch the batch again once it drains.
         reportTaskQueueFull(tp);
-        if (rejected.isEmpty()) rejected = new HashMap<>();
-        rejected.put(tp, offsets[0]);
+        rejected = reject(rejected, tp, offsets[0]);
         continue;
       }
       long[] todo;
       try {
         todo = offsetTracker.registerBatchUnlessDone(tp, offsets);
       } catch (WindowFullException e) {
-        if (rejected.isEmpty()) rejected = new HashMap<>();
-        rejected.put(tp, offsets[0]);
+        rejected = reject(rejected, tp, offsets[0]);
         continue;
       }
-      if (todo.length != offsets.length) {
-        // Some records were already processed before a crash or rebalance: leave them out.
-        if (todo.length == 0) continue;
-        batch = withoutDone(batch, todo);
-        offsets = todo;
-        batchBytes = 0;
-        for (ConsumerRecord<K, V> record : batch) {
-          batchBytes += RecordSize.estimateBytes(record);
-        }
-      }
-      counter.registered(batch.size(), batchBytes);
-
-      long totalBytes = batchBytes;
-      // Captured on the poll thread, where rebalance callbacks also run, so it is exactly the
-      // generation the batch was registered under.
-      long generation = offsetTracker.generation(tp);
-      if (ordered) batchInFlight.add(tp);
-      List<ConsumerRecord<K, V>> toProcess = batch;
-      long[] toAck = offsets;
-      executor.submit(() -> processBatch(tp, toProcess, toAck, totalBytes, generation));
+      // Records already processed before a crash or rebalance are left out.
+      if (todo.length == 0) continue;
+      List<ConsumerRecord<K, V>> batch =
+          todo.length == offsets.length ? polled : withoutDone(polled, todo);
+      submit(tp, batch, todo);
     }
     return rejected;
+  }
+
+  private void submit(TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets) {
+    long bytes = RecordSize.estimateBytes(batch);
+    counter.registered(batch.size(), bytes);
+    // Captured on the poll thread, where rebalance callbacks also run, so it is exactly the
+    // generation the batch was registered under.
+    long generation = offsetTracker.generation(tp);
+    if (ordered) batchInFlight.add(tp);
+    executor.submit(() -> processBatch(tp, batch, offsets, bytes, generation));
   }
 
   @Override
@@ -269,23 +255,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       return;
     }
 
-    if (Thread.currentThread().isInterrupted()) {
-      // Interrupted by shutdown, not a processing failure: leave the offsets unacked so they are
-      // not committed and the batch is redelivered.
-      logger.log(
-          System.Logger.Level.DEBUG, "Interrupted while processing {0} {1}, not acking", tp, desc);
-      return;
-    }
-
-    // Best-effort: DLQ or skip, always ack and continue
-    RetryExecutor.FailureResolution resolution =
-        retryExecutor.handleFailure(batch, tp, lastError, desc);
-    if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
-      metricsCollector.recordFailed(batch.size());
-      if (ackBatch(tp, offsets, generation, desc)) offsetTracker.markFailed(tp);
-    } else {
-      ackBatch(tp, offsets, generation, desc);
-    }
+    failures.resolve(batch, tp, lastError, desc, () -> ackBatch(tp, offsets, generation, desc));
   }
 
   /**

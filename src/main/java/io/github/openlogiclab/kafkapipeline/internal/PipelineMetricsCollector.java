@@ -15,10 +15,10 @@
  */
 package io.github.openlogiclab.kafkapipeline.internal;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
-import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
+import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.offset.OffsetStats;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
@@ -43,7 +43,7 @@ public class PipelineMetricsCollector {
 
   private final InFlightCounter inFlightCounter;
   private final BackpressureController backpressureController;
-  private final OffsetTracker offsetTracker;
+  private final OffsetStats offsetTracker;
 
   // ── Throughput counters ────────────────────────────────────────
   private final LongAdder recordsProcessed = new LongAdder();
@@ -81,7 +81,7 @@ public class PipelineMetricsCollector {
   public PipelineMetricsCollector(
       InFlightCounter inFlightCounter,
       BackpressureController backpressureController,
-      OffsetTracker offsetTracker) {
+      OffsetStats offsetTracker) {
     this.inFlightCounter = inFlightCounter;
     this.backpressureController = backpressureController;
     this.offsetTracker = offsetTracker;

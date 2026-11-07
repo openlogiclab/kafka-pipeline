@@ -35,6 +35,9 @@ import org.apache.kafka.common.TopicPartition;
  */
 public final class UnorderedOffsetTracker implements OffsetTracker {
 
+  private static final System.Logger logger =
+      System.getLogger(UnorderedOffsetTracker.class.getName());
+
   private final ConcurrentHashMap<TopicPartition, PartitionWindow> partitions =
       new ConcurrentHashMap<>();
 
@@ -157,30 +160,6 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
-  public Map<TopicPartition, Long> getAllCommittableOffsets() {
-    Map<TopicPartition, Long> result = new HashMap<>();
-    for (Map.Entry<TopicPartition, PartitionWindow> entry : partitions.entrySet()) {
-      entry
-          .getValue()
-          .getCommittableOffset()
-          .ifPresent(offset -> result.put(entry.getKey(), offset));
-    }
-    return result;
-  }
-
-  @Override
-  public Map<TopicPartition, Long> getUncommittedOffsets() {
-    Map<TopicPartition, Long> result = new HashMap<>();
-    for (Map.Entry<TopicPartition, PartitionWindow> entry : partitions.entrySet()) {
-      entry
-          .getValue()
-          .getUncommittedOffset()
-          .ifPresent(offset -> result.put(entry.getKey(), offset));
-    }
-    return result;
-  }
-
-  @Override
   public Map<TopicPartition, CommitPoint> getUncommittedCommitPoints() {
     Map<TopicPartition, CommitPoint> result = new HashMap<>();
     partitions.forEach(
@@ -206,14 +185,6 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
     PartitionWindow window = partitions.get(tp);
     if (window != null) {
       window.markCommitted(point);
-    }
-  }
-
-  @Override
-  public void markCommitted(TopicPartition tp, long offset) {
-    PartitionWindow window = partitions.get(tp);
-    if (window != null) {
-      window.markCommitted(offset);
     }
   }
 
@@ -255,9 +226,6 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
     }
     return window.drain(timeout);
   }
-
-  private static final System.Logger logger =
-      System.getLogger(UnorderedOffsetTracker.class.getName());
 
   @Override
   public void clearPartition(TopicPartition tp) {

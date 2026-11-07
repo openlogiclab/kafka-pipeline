@@ -17,11 +17,11 @@ package io.github.openlogiclab.kafkapipeline.internal;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureStatus;
+import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;

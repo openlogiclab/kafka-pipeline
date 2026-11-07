@@ -17,7 +17,7 @@ package io.github.openlogiclab.kafkapipeline.backpressure;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
@@ -158,21 +158,21 @@ class ByteSizeSensorTest {
     @Test
     void estimateBytes_returnsNonNegative() {
       ConsumerRecord<String, String> record = new ConsumerRecord<>("topic", 0, 0, "key", "value");
-      long bytes = io.github.openlogiclab.kafkapipeline.RecordSize.estimateBytes(record);
+      long bytes = RecordSize.estimateBytes(record);
       assertTrue(bytes >= 0, "Estimated bytes should be non-negative, got " + bytes);
     }
 
     @Test
     void estimateBytes_handlesNullKey() {
       ConsumerRecord<String, String> record = new ConsumerRecord<>("topic", 0, 0, null, "value");
-      long bytes = io.github.openlogiclab.kafkapipeline.RecordSize.estimateBytes(record);
+      long bytes = RecordSize.estimateBytes(record);
       assertTrue(bytes >= 0, "Estimated bytes should be non-negative");
     }
 
     @Test
     void estimateBytes_handlesNullValue() {
       ConsumerRecord<String, String> record = new ConsumerRecord<>("topic", 0, 0, "key", null);
-      long bytes = io.github.openlogiclab.kafkapipeline.RecordSize.estimateBytes(record);
+      long bytes = RecordSize.estimateBytes(record);
       assertTrue(bytes >= 0, "Estimated bytes should be non-negative");
     }
   }

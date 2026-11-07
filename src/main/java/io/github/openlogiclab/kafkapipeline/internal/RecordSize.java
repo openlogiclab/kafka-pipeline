@@ -13,8 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.github.openlogiclab.kafkapipeline;
+package io.github.openlogiclab.kafkapipeline.internal;
 
+import java.util.Collection;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
 /**
@@ -36,5 +37,19 @@ public final class RecordSize {
    */
   public static long estimateBytes(ConsumerRecord<?, ?> record) {
     return Math.max(0, record.serializedKeySize()) + Math.max(0, record.serializedValueSize());
+  }
+
+  /**
+   * Estimates the total serialized byte size of some records.
+   *
+   * @param records the consumer records
+   * @return the sum of {@link #estimateBytes(ConsumerRecord)} over the records
+   */
+  public static long estimateBytes(Collection<? extends ConsumerRecord<?, ?>> records) {
+    long total = 0;
+    for (ConsumerRecord<?, ?> record : records) {
+      total += estimateBytes(record);
+    }
+    return total;
   }
 }

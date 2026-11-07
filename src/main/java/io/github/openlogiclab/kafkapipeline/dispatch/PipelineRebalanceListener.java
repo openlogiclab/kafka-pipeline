@@ -15,11 +15,11 @@
  */
 package io.github.openlogiclab.kafkapipeline.dispatch;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
-import io.github.openlogiclab.kafkapipeline.RecordSize;
+import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
-import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
+import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
 import io.github.openlogiclab.kafkapipeline.offset.PartitionDrainResult;
+import io.github.openlogiclab.kafkapipeline.offset.PartitionLifecycle;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.HashSet;
@@ -45,7 +45,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
   private static final System.Logger logger =
       System.getLogger(PipelineRebalanceListener.class.getName());
 
-  private final OffsetTracker offsetTracker;
+  private final PartitionLifecycle offsetTracker;
   private final RecordDispatcher<?, ?> dispatcher;
   private final Runnable commitSync;
   private final InFlightCounter counter;
@@ -67,7 +67,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
    * @param metricsCollector the metrics collector
    */
   public PipelineRebalanceListener(
-      OffsetTracker offsetTracker,
+      PartitionLifecycle offsetTracker,
       RecordDispatcher<?, ?> dispatcher,
       Runnable commitSync,
       InFlightCounter counter,
@@ -99,7 +99,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
    *     partitions, so records the previous owner already finished are skipped
    */
   public PipelineRebalanceListener(
-      OffsetTracker offsetTracker,
+      PartitionLifecycle offsetTracker,
       RecordDispatcher<?, ?> dispatcher,
       Runnable commitSync,
       InFlightCounter counter,
@@ -131,41 +131,35 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     if (drainExecutor.isShutdown()) {
       // Pipeline shutdown: consumer.close() revokes the partitions after the workers have stopped
       // and the final commit has run, so there is nothing left to drain or commit.
-      for (TopicPartition tp : partitions) {
-        offsetTracker.clearPartition(tp);
-      }
+      clearTracking(partitions);
       return;
     }
 
-    CompletableFuture<?>[] drainFutures =
+    CompletableFuture<?>[] drains =
         partitions.stream()
-            .map(
-                tp ->
-                    CompletableFuture.runAsync(
-                        () -> {
-                          try {
-                            PartitionDrainResult result =
-                                offsetTracker.drainPartition(tp, drainTimeout);
-                            if (!result.allCompleted()) {
-                              metricsCollector.recordDrainTimeout();
-                              metricsCollector.recordAbandoned(result.abandonedCount());
-                            }
-                            logger.log(System.Logger.Level.INFO, "Drained {0}: {1}", tp, result);
-                          } catch (Exception e) {
-                            logger.log(
-                                System.Logger.Level.ERROR,
-                                "Error draining partition {0}: {1}",
-                                tp,
-                                e.getMessage());
-                          }
-                        },
-                        drainExecutor))
+            .map(tp -> CompletableFuture.runAsync(() -> drain(tp), drainExecutor))
             .toArray(CompletableFuture<?>[]::new);
-
-    CompletableFuture.allOf(drainFutures).join();
+    CompletableFuture.allOf(drains).join();
 
     commitSync.run();
+    clearTracking(partitions);
+  }
 
+  private void drain(TopicPartition tp) {
+    try {
+      PartitionDrainResult result = offsetTracker.drainPartition(tp, drainTimeout);
+      if (!result.allCompleted()) {
+        metricsCollector.recordDrainTimeout();
+        metricsCollector.recordAbandoned(result.abandonedCount());
+      }
+      logger.log(System.Logger.Level.INFO, "Drained {0}: {1}", tp, result);
+    } catch (Exception e) {
+      logger.log(
+          System.Logger.Level.ERROR, "Error draining partition {0}: {1}", tp, e.getMessage());
+    }
+  }
+
+  private void clearTracking(Collection<TopicPartition> partitions) {
     for (TopicPartition tp : partitions) {
       offsetTracker.clearPartition(tp);
     }
@@ -192,9 +186,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
         partitions);
     metricsCollector.recordRebalance();
     dropQueued(partitions);
-    for (TopicPartition tp : partitions) {
-      offsetTracker.clearPartition(tp);
-    }
+    clearTracking(partitions);
   }
 
   private void dropQueued(Collection<TopicPartition> partitions) {
@@ -202,11 +194,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       metricsCollector.partitionRevoked(tp);
       List<? extends ConsumerRecord<?, ?>> abandoned = dispatcher.removePartition(tp);
       if (!abandoned.isEmpty()) {
-        long abandonedBytes = 0;
-        for (ConsumerRecord<?, ?> record : abandoned) {
-          abandonedBytes += RecordSize.estimateBytes(record);
-        }
-        counter.completed(abandoned.size(), abandonedBytes);
+        counter.completed(abandoned.size(), RecordSize.estimateBytes(abandoned));
         metricsCollector.recordAbandoned(abandoned.size());
       }
     }

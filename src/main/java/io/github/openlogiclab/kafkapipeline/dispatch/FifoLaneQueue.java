@@ -40,7 +40,9 @@ final class FifoLaneQueue<K, V> implements LaneQueue<K, V> {
   }
 
   @Override
-  public void release(ConsumerRecord<K, V> record) {}
+  public boolean release(ConsumerRecord<K, V> record) {
+    return false; // records never wait on each other
+  }
 
   @Override
   public boolean hasReady() {

@@ -17,7 +17,6 @@ package io.github.openlogiclab.kafkapipeline.backpressure;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import java.util.List;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;

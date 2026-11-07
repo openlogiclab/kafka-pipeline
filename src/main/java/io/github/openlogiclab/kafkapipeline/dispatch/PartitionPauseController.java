@@ -15,7 +15,7 @@
  */
 package io.github.openlogiclab.kafkapipeline.dispatch;
 
-import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
+import io.github.openlogiclab.kafkapipeline.offset.OffsetStats;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -46,7 +46,7 @@ public final class PartitionPauseController {
   static final int RESUME_RATIO_PERCENT = 50;
 
   private final Consumer<?, ?> consumer;
-  private final OffsetTracker offsetTracker;
+  private final OffsetStats offsetTracker;
   private final int pauseAt;
   private final int resumeAt;
   private final Predicate<TopicPartition> hasRoom;
@@ -61,7 +61,7 @@ public final class PartitionPauseController {
    * @param consumer the Kafka consumer whose partitions are paused and resumed
    * @param offsetTracker source of per-partition window sizes
    */
-  public PartitionPauseController(Consumer<?, ?> consumer, OffsetTracker offsetTracker) {
+  public PartitionPauseController(Consumer<?, ?> consumer, OffsetStats offsetTracker) {
     this(consumer, offsetTracker, tp -> true);
   }
 
@@ -74,7 +74,7 @@ public final class PartitionPauseController {
    *     sent back because its queue was full
    */
   public PartitionPauseController(
-      Consumer<?, ?> consumer, OffsetTracker offsetTracker, Predicate<TopicPartition> hasRoom) {
+      Consumer<?, ?> consumer, OffsetStats offsetTracker, Predicate<TopicPartition> hasRoom) {
     this.hasRoom = hasRoom;
     this.consumer = consumer;
     this.offsetTracker = offsetTracker;

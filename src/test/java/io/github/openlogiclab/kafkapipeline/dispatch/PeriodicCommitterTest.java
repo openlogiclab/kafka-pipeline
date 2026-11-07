@@ -78,7 +78,8 @@ class PeriodicCommitterTest {
 
       assertEquals(2, attempts.get());
       assertEquals(1L, captured.get().get(TP0).offset());
-      assertTrue(tracker.getUncommittedOffsets().isEmpty(), "offset should be marked committed");
+      assertTrue(
+          tracker.getUncommittedCommitPoints().isEmpty(), "offset should be marked committed");
     }
 
     @Test

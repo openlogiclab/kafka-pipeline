@@ -15,8 +15,6 @@
  */
 package io.github.openlogiclab.kafkapipeline.backpressure;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
-
 /**
  * Backpressure sensor based on in-flight record count.
  *

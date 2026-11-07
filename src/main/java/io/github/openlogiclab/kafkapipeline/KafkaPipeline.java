@@ -19,6 +19,7 @@ import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.ByteSizeSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.HeapSensor;
+import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
 import io.github.openlogiclab.kafkapipeline.dispatch.PartitionPauseController;
 import io.github.openlogiclab.kafkapipeline.dispatch.PeriodicCommitter;
@@ -38,14 +39,13 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 
 /**
  * Main entry point for the Kafka Pipeline library. Wraps a {@link KafkaConsumer} with concurrent
- * out-of-order processing, record-count backpressure, configurable error handling (retry → DLQ →
- * fallback), lifecycle hooks, and automatic offset management — so users only need to focus on
- * processing each record.
+ * processing (unordered, or ordered per key or partition), backpressure, configurable error
+ * handling (retry → DLQ → fallback), lifecycle hooks, and automatic offset management — so users
+ * only need to focus on processing each record.
  *
  * <h2>Architecture</h2>
  *
@@ -53,14 +53,14 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  *   KafkaConsumer.poll()              (single-threaded poll loop)
  *         │
  *         ▼
- *   RecordDispatcher                  (per-partition BlockingQueues)
+ *   RecordDispatcher                  (per-partition queues)
  *         │
  *   ┌─────┼─────┐
  *   ▼     ▼     ▼
  *  Worker Worker Worker ...           (platform or virtual threads)
  *         │
  *         ▼
- *   OffsetTracker → PeriodicCommitter (unordered sliding-window offset tracking)
+ *   OffsetTracker → PeriodicCommitter (sliding-window offset tracking)
  * </pre>
  *
  * <h2>Features</h2>
@@ -154,25 +154,7 @@ public final class KafkaPipeline<K, V> {
    * @param config the pipeline configuration
    */
   public KafkaPipeline(PipelineConfig<K, V> config) {
-    this.config = config;
-    this.consumer = null;
-    this.ownsConsumer = true;
-
-    this.offsetTracker =
-        new UnorderedOffsetTracker(config.maxWindowSize(), config.skipCompletedOnRestart());
-    this.counter = new InFlightCounter();
-    this.backpressure = buildBackpressureController(config, counter);
-    this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
-    this.retryExecutor = new RetryExecutor<>(config.errorStrategy(), metricsCollector);
-    this.dispatcher =
-        new RecordDispatcher<>(
-            config.dispatchQueueCapacity(),
-            config.maxConcurrencyPerPartition(),
-            config.concurrency(),
-            config.ordering());
-    this.workerPool =
-        buildWorkerPool(
-            config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
+    this(config, null, true);
   }
 
   /**
@@ -185,8 +167,9 @@ public final class KafkaPipeline<K, V> {
   }
 
   /**
-   * Package-private constructor for testing — allows controlling {@code ownsConsumer} to exercise
-   * the consumer close path during shutdown tests.
+   * Creates the pipeline. With a {@code null} consumer, a {@link KafkaConsumer} is created on
+   * start. Package-private so tests can control {@code ownsConsumer} to exercise the consumer close
+   * path.
    */
   KafkaPipeline(PipelineConfig<K, V> config, Consumer<K, V> consumer, boolean ownsConsumer) {
     this.config = config;
@@ -241,7 +224,15 @@ public final class KafkaPipeline<K, V> {
           config.concurrency(),
           mode);
 
-      pollLoop();
+      new PollLoop<>(
+              consumer,
+              config.pollTimeout(),
+              committer,
+              backpressure,
+              pauseController,
+              workerPool,
+              metricsCollector)
+          .run(running::get);
     } catch (Exception e) {
       logger.log(System.Logger.Level.ERROR, "Pipeline error", e);
     } finally {
@@ -378,55 +369,6 @@ public final class KafkaPipeline<K, V> {
             config.skipCompletedOnRestart());
 
     consumer.subscribe(config.topics(), rebalanceListener);
-  }
-
-  private void pollLoop() {
-    boolean throttled = false;
-
-    while (running.get()) {
-      try {
-        // Perform any pending periodic commits on the poll thread (thread-safe)
-        committer.maybeCommitAsync();
-
-        boolean shouldThrottle = backpressure.shouldThrottle();
-        if (shouldThrottle != throttled) {
-          throttled = shouldThrottle;
-          if (throttled) metricsCollector.recordThrottle();
-          logger.log(
-              System.Logger.Level.DEBUG,
-              "Backpressure: {0}. {1}",
-              throttled ? "paused" : "resumed",
-              backpressure.statusSummary());
-        }
-        // Reapplied before every poll so partitions assigned by a rebalance are paused too.
-        pauseController.apply(throttled);
-
-        ConsumerRecords<K, V> records = consumer.poll(config.pollTimeout());
-        metricsCollector.recordPoll();
-        if (records.isEmpty()) {
-          metricsCollector.recordEmptyPoll();
-          continue;
-        }
-
-        // Never drop polled records: the consumer position has already moved past them. Records
-        // that do not fit in their partition's window are fetched again after a seek.
-        pauseController.seekBack(workerPool.dispatch(records));
-      } catch (org.apache.kafka.common.errors.WakeupException e) {
-        if (running.get()) {
-          logger.log(System.Logger.Level.WARNING, "Unexpected wakeup in poll loop");
-        }
-      } catch (Exception e) {
-        logger.log(System.Logger.Level.ERROR, "Error in poll loop", e);
-        if (running.get()) {
-          try {
-            Thread.sleep(100);
-          } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            break;
-          }
-        }
-      }
-    }
   }
 
   private void shutdown() {
