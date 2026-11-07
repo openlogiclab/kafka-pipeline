@@ -17,7 +17,9 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import io.github.openlogiclab.kafkapipeline.ProcessingOrder;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
@@ -198,7 +200,7 @@ public final class RecordDispatcher<K, V> {
     this.queueCapacity = queueCapacity;
     this.maxConcurrencyPerPartition = maxConcurrencyPerPartition;
     this.concurrency = concurrency;
-    this.order = java.util.Objects.requireNonNull(order, "order");
+    this.order = Objects.requireNonNull(order, "order");
     this.limited = order == ProcessingOrder.PARTITION || maxConcurrencyPerPartition > 0;
     this.effectiveLimit = order == ProcessingOrder.PARTITION ? 1 : maxConcurrencyPerPartition;
   }
@@ -223,17 +225,20 @@ public final class RecordDispatcher<K, V> {
     queues.computeIfAbsent(
         tp,
         t -> {
-          LaneQueue<K, V> queue =
-              order == ProcessingOrder.KEY
-                  ? new KeyedLaneQueue<>(
-                      queueCapacity,
-                      keyGuards.computeIfAbsent(t, x -> new KeyedLaneQueue.KeyGuard()))
-                  : new FifoLaneQueue<>(queueCapacity);
           AtomicInteger active = activeByPartition.computeIfAbsent(t, x -> new AtomicInteger());
-          return new Lane<>(t, queue, active, generation);
+          return new Lane<>(t, newQueue(t), active, generation);
         });
     rebuildSnapshot();
     logger.log(System.Logger.Level.DEBUG, "Added dispatch queue for {0}", tp);
+  }
+
+  private LaneQueue<K, V> newQueue(TopicPartition tp) {
+    if (order == ProcessingOrder.KEY) {
+      // The key guard outlives the queue, so keys still running from before a revoke stay busy.
+      return new KeyedLaneQueue<>(
+          queueCapacity, keyGuards.computeIfAbsent(tp, x -> new KeyedLaneQueue.KeyGuard()));
+    }
+    return new FifoLaneQueue<>(queueCapacity);
   }
 
   /**
@@ -407,22 +412,24 @@ public final class RecordDispatcher<K, V> {
     int start = ThreadLocalRandom.current().nextInt(len);
     for (int i = 0; i < len; i++) {
       Lane<K, V> lane = snap[(start + i) % len];
-      if (!limited) {
-        ConsumerRecord<K, V> record = lane.queue.poll();
-        if (record != null) {
-          queued.decrementAndGet();
-          return new PollResult<>(lane.tp, record, lane);
-        }
-      } else if (lane.queue.hasReady() && tryAcquire(lane, limit)) {
-        ConsumerRecord<K, V> record = lane.queue.poll();
-        if (record != null) {
-          queued.decrementAndGet();
-          return new PollResult<>(lane.tp, record, lane);
-        }
-        lane.active.decrementAndGet();
-      }
+      PollResult<K, V> result = limited ? tryTakeLimited(lane, limit) : tryTake(lane);
+      if (result != null) return result;
     }
     return null;
+  }
+
+  private PollResult<K, V> tryTake(Lane<K, V> lane) {
+    ConsumerRecord<K, V> record = lane.queue.poll();
+    if (record == null) return null;
+    queued.decrementAndGet();
+    return new PollResult<>(lane.tp, record, lane);
+  }
+
+  private PollResult<K, V> tryTakeLimited(Lane<K, V> lane, int limit) {
+    if (!lane.queue.hasReady() || !tryAcquire(lane, limit)) return null;
+    PollResult<K, V> result = tryTake(lane);
+    if (result == null) lane.active.decrementAndGet();
+    return result;
   }
 
   private boolean tryAcquire(Lane<K, V> lane, int limit) {
@@ -442,11 +449,7 @@ public final class RecordDispatcher<K, V> {
    */
   public void release(PollResult<K, V> result) {
     Lane<K, V> lane = result.lane();
-    boolean freed = false;
-    if (order == ProcessingOrder.KEY) {
-      lane.queue.release(result.record());
-      freed = true;
-    }
+    boolean freed = lane.queue.release(result.record());
     if (limited) {
       lane.active.decrementAndGet();
       freed = true;
@@ -483,7 +486,7 @@ public final class RecordDispatcher<K, V> {
 
   /** Partitions with in-flight state kept outside their queue; for tests. */
   int retainedPartitionState() {
-    Set<TopicPartition> all = new java.util.HashSet<>(activeByPartition.keySet());
+    Set<TopicPartition> all = new HashSet<>(activeByPartition.keySet());
     all.addAll(keyGuards.keySet());
     return all.size();
   }

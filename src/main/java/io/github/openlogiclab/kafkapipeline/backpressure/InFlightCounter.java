@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.github.openlogiclab.kafkapipeline;
+package io.github.openlogiclab.kafkapipeline.backpressure;
 
 import java.util.concurrent.atomic.LongAdder;
 

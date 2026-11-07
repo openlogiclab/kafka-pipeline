@@ -17,7 +17,7 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
@@ -218,6 +218,29 @@ class PipelineRebalanceListenerTest {
 
       assertEquals(1, commitSyncCalls.get());
       assertTrue(dispatcher.partitions().isEmpty());
+    }
+
+    @Test
+    void drainThatThrows_stillCommitsAndClearsThePartition() {
+      // OffsetTracker is sealed, so make the real drain fail: a null timeout throws inside it.
+      PipelineRebalanceListener failing =
+          new PipelineRebalanceListener(
+              tracker,
+              dispatcher,
+              commitSyncCalls::incrementAndGet,
+              counter,
+              mockConsumer,
+              null,
+              NoOpMetricsCollector.INSTANCE);
+      mockConsumer.assign(List.of(TP0));
+      mockConsumer.updateBeginningOffsets(Map.of(TP0, 0L));
+      failing.onPartitionsAssigned(List.of(TP0));
+
+      failing.onPartitionsRevoked(List.of(TP0));
+
+      assertEquals(1, commitSyncCalls.get());
+      assertEquals(OffsetTracker.NO_GENERATION, tracker.generation(TP0), "no longer tracked");
+      failing.shutdown();
     }
 
     @Test

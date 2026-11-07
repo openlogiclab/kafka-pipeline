@@ -17,6 +17,7 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.CommitPoint;
+import io.github.openlogiclab.kafkapipeline.offset.CommitSource;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import java.time.Duration;
 import java.util.HashMap;
@@ -47,7 +48,7 @@ public final class PeriodicCommitter {
 
   private static final System.Logger logger = System.getLogger(PeriodicCommitter.class.getName());
 
-  private final OffsetTracker offsetTracker;
+  private final CommitSource offsetTracker;
   private final Consumer<?, ?> consumer;
   private final Duration commitInterval;
   private final ScheduledExecutorService scheduler;
@@ -64,7 +65,7 @@ public final class PeriodicCommitter {
    * @param metricsCollector the metrics collector
    */
   public PeriodicCommitter(
-      OffsetTracker offsetTracker,
+      CommitSource offsetTracker,
       Consumer<?, ?> consumer,
       Duration commitInterval,
       PipelineMetricsCollector metricsCollector) {
@@ -130,8 +131,8 @@ public final class PeriodicCommitter {
   public void commitAsync() {
     if (!running.get()) return;
     try {
-      // Only get offsets that have uncommitted progress
-      Map<TopicPartition, OffsetAndMetadata> offsets = buildUncommittedMap();
+      Map<TopicPartition, OffsetAndMetadata> offsets =
+          toKafka(offsetTracker.getUncommittedCommitPoints());
       if (offsets.isEmpty()) {
         logger.log(System.Logger.Level.DEBUG, "No uncommitted offsets, skipping commit");
         return;
@@ -146,11 +147,7 @@ public final class PeriodicCommitter {
               logger.log(
                   System.Logger.Level.WARNING, "Async commit failed: {0}", exception.getMessage());
             } else {
-              // Mark as committed in offset tracker
-              committedOffsets.forEach(
-                  (tp, meta) ->
-                      offsetTracker.markCommitted(
-                          tp, new CommitPoint(meta.offset(), meta.metadata())));
+              markCommitted(committedOffsets);
               metricsCollector.recordCommitSuccess();
               logger.log(System.Logger.Level.DEBUG, "Committed offsets: {0}", committedOffsets);
             }
@@ -164,8 +161,8 @@ public final class PeriodicCommitter {
   /** Performs a synchronous commit. Must be called from the poll thread. */
   public void commitSync() {
     try {
-      // For sync commits (drain/shutdown), always commit current position
-      Map<TopicPartition, OffsetAndMetadata> offsets = buildAllCommittableMap();
+      // Drain and shutdown commit every partition's current position, not only changed ones.
+      Map<TopicPartition, OffsetAndMetadata> offsets = toKafka(offsetTracker.getAllCommitPoints());
       if (offsets.isEmpty()) return;
 
       try {
@@ -177,10 +174,7 @@ public final class PeriodicCommitter {
         logger.log(System.Logger.Level.DEBUG, "Sync commit interrupted by wakeup, retrying");
         consumer.commitSync(offsets);
       }
-      // Mark as committed
-      offsets.forEach(
-          (tp, meta) ->
-              offsetTracker.markCommitted(tp, new CommitPoint(meta.offset(), meta.metadata())));
+      markCommitted(offsets);
       metricsCollector.recordCommitSuccess();
       logger.log(System.Logger.Level.INFO, "Sync committed offsets: {0}", offsets);
     } catch (Exception e) {
@@ -221,12 +215,10 @@ public final class PeriodicCommitter {
     return false;
   }
 
-  private Map<TopicPartition, OffsetAndMetadata> buildUncommittedMap() {
-    return toKafka(offsetTracker.getUncommittedCommitPoints());
-  }
-
-  private Map<TopicPartition, OffsetAndMetadata> buildAllCommittableMap() {
-    return toKafka(offsetTracker.getAllCommitPoints());
+  private void markCommitted(Map<TopicPartition, OffsetAndMetadata> committed) {
+    committed.forEach(
+        (tp, meta) ->
+            offsetTracker.markCommitted(tp, new CommitPoint(meta.offset(), meta.metadata())));
   }
 
   private static Map<TopicPartition, OffsetAndMetadata> toKafka(

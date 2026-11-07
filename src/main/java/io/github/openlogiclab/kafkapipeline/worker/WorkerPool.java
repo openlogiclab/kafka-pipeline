@@ -16,11 +16,13 @@
 package io.github.openlogiclab.kafkapipeline.worker;
 
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -73,6 +75,22 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
     this.concurrency = concurrency;
     this.threadMode = threadMode;
     this.executor = createExecutor(threadMode, concurrency, threadNamePrefix, taskQueueCapacity);
+  }
+
+  /**
+   * Records that a partition's records from {@code offset} on were not dispatched, so the caller
+   * seeks back to it. Allocates the map only on the first rejection of a poll.
+   *
+   * @param rejected the rejections so far ({@code Map.of()} when none)
+   * @param tp the partition
+   * @param offset the first offset not dispatched
+   * @return the map holding the rejection
+   */
+  protected static Map<TopicPartition, Long> reject(
+      Map<TopicPartition, Long> rejected, TopicPartition tp, long offset) {
+    Map<TopicPartition, Long> result = rejected.isEmpty() ? new HashMap<>() : rejected;
+    result.put(tp, offset);
+    return result;
   }
 
   /** Starts the worker threads. */
@@ -175,14 +193,13 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
       ThreadMode mode, int concurrency, String namePrefix, int taskQueueCapacity) {
     return switch (mode) {
       case PLATFORM -> {
-        var factory =
-            (java.util.concurrent.ThreadFactory)
-                r -> {
-                  Thread t = new Thread(r);
-                  t.setName(namePrefix + t.threadId());
-                  t.setDaemon(true);
-                  return t;
-                };
+        ThreadFactory factory =
+            r -> {
+              Thread t = new Thread(r);
+              t.setName(namePrefix + t.threadId());
+              t.setDaemon(true);
+              return t;
+            };
         if (taskQueueCapacity > 0) {
           var queue = new LinkedBlockingQueue<Runnable>(taskQueueCapacity);
           yield new ThreadPoolExecutor(

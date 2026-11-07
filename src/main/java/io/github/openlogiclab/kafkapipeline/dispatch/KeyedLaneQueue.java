@@ -143,9 +143,9 @@ final class KeyedLaneQueue<K, V> implements LaneQueue<K, V> {
   }
 
   @Override
-  public void release(ConsumerRecord<K, V> record) {
+  public boolean release(ConsumerRecord<K, V> record) {
     Object key = keyOf(record);
-    if (key == null) return;
+    if (key == null) return true;
     lock.lock();
     try {
       busy.remove(key);
@@ -156,6 +156,7 @@ final class KeyedLaneQueue<K, V> implements LaneQueue<K, V> {
     } finally {
       lock.unlock();
     }
+    return true;
   }
 
   @Override

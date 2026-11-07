@@ -27,8 +27,13 @@ interface LaneQueue<K, V> {
   /** Returns the next record a worker may start now, or null if none is ready. */
   ConsumerRecord<K, V> poll();
 
-  /** Signals that a record returned by {@link #poll} finished processing. */
-  void release(ConsumerRecord<K, V> record);
+  /**
+   * Signals that a record returned by {@link #poll} finished processing.
+   *
+   * @return true if finishing it may have made other records of the partition ready, so a waiting
+   *     worker should check again
+   */
+  boolean release(ConsumerRecord<K, V> record);
 
   /** Whether {@link #poll} would currently return a record. */
   boolean hasReady();

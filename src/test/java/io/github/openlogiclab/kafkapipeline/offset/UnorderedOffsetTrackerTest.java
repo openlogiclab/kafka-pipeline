@@ -18,6 +18,7 @@ package io.github.openlogiclab.kafkapipeline.offset;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.concurrent.CountDownLatch;
@@ -539,7 +540,7 @@ class UnorderedOffsetTrackerTest {
     }
 
     @Test
-    void getAllCommittableOffsets_returnsOnlyPartitionsWithProgress() {
+    void getAllCommitPoints_returnsOnlyPartitionsWithProgress() {
       tracker.register(TP0, 100);
       tracker.markInProgress(TP0, 100);
       tracker.ack(TP0, 100);
@@ -548,7 +549,7 @@ class UnorderedOffsetTrackerTest {
       tracker.markInProgress(TP1, 200);
       tracker.ack(TP1, 200);
 
-      Map<TopicPartition, Long> offsets = tracker.getAllCommittableOffsets();
+      Map<TopicPartition, Long> offsets = offsets(tracker.getAllCommitPoints());
       assertEquals(2, offsets.size());
       assertEquals(101L, offsets.get(TP0));
       assertEquals(201L, offsets.get(TP1));
@@ -568,34 +569,34 @@ class UnorderedOffsetTrackerTest {
     }
 
     @Test
-    void getUncommittedOffsets_noProgress_empty() {
-      assertTrue(tracker.getUncommittedOffsets().isEmpty());
+    void getUncommittedCommitPoints_noProgress_empty() {
+      assertTrue(offsets(tracker.getUncommittedCommitPoints()).isEmpty());
     }
 
     @Test
-    void getUncommittedOffsets_afterAck_returnsOffset() {
+    void getUncommittedCommitPoints_afterAck_returnsOffset() {
       tracker.register(TP0, 100);
       tracker.markInProgress(TP0, 100);
       tracker.ack(TP0, 100);
 
-      Map<TopicPartition, Long> uncommitted = tracker.getUncommittedOffsets();
+      Map<TopicPartition, Long> uncommitted = offsets(tracker.getUncommittedCommitPoints());
       assertEquals(1, uncommitted.size());
       assertEquals(101L, uncommitted.get(TP0));
     }
 
     @Test
-    void getUncommittedOffsets_afterMarkCommitted_excludesPartition() {
+    void getUncommittedCommitPoints_afterMarkCommitted_excludesPartition() {
       tracker.register(TP0, 100);
       tracker.markInProgress(TP0, 100);
       tracker.ack(TP0, 100);
 
-      tracker.markCommitted(TP0, 101);
+      tracker.markCommitted(TP0, new CommitPoint(101, ""));
 
-      assertTrue(tracker.getUncommittedOffsets().isEmpty());
+      assertTrue(offsets(tracker.getUncommittedCommitPoints()).isEmpty());
     }
 
     @Test
-    void getUncommittedOffsets_multiplePartitions() {
+    void getUncommittedCommitPoints_multiplePartitions() {
       tracker.register(TP0, 100);
       tracker.markInProgress(TP0, 100);
       tracker.ack(TP0, 100);
@@ -604,14 +605,14 @@ class UnorderedOffsetTrackerTest {
       tracker.markInProgress(TP1, 200);
       tracker.ack(TP1, 200);
 
-      Map<TopicPartition, Long> uncommitted = tracker.getUncommittedOffsets();
+      Map<TopicPartition, Long> uncommitted = offsets(tracker.getUncommittedCommitPoints());
       assertEquals(2, uncommitted.size());
       assertEquals(101L, uncommitted.get(TP0));
       assertEquals(201L, uncommitted.get(TP1));
 
-      tracker.markCommitted(TP0, 101);
+      tracker.markCommitted(TP0, new CommitPoint(101, ""));
 
-      uncommitted = tracker.getUncommittedOffsets();
+      uncommitted = offsets(tracker.getUncommittedCommitPoints());
       assertEquals(1, uncommitted.size());
       assertNull(uncommitted.get(TP0));
       assertEquals(201L, uncommitted.get(TP1));
@@ -619,24 +620,24 @@ class UnorderedOffsetTrackerTest {
 
     @Test
     void markCommitted_unknownPartition_isNoOp() {
-      assertDoesNotThrow(() -> tracker.markCommitted(TP_UNKNOWN, 100));
+      assertDoesNotThrow(() -> tracker.markCommitted(TP_UNKNOWN, new CommitPoint(100, "")));
     }
 
     @Test
-    void getUncommittedOffsets_progressAfterCommit_returnsNewOffset() {
+    void getUncommittedCommitPoints_progressAfterCommit_returnsNewOffset() {
       tracker.registerBatch(TP0, range(100, 102));
       tracker.markBatchInProgress(TP0, range(100, 102));
       tracker.ackBatch(TP0, range(100, 100));
 
-      assertEquals(101L, tracker.getUncommittedOffsets().get(TP0));
+      assertEquals(101L, offsets(tracker.getUncommittedCommitPoints()).get(TP0));
 
-      tracker.markCommitted(TP0, 101);
+      tracker.markCommitted(TP0, new CommitPoint(101, ""));
 
-      assertTrue(tracker.getUncommittedOffsets().isEmpty());
+      assertTrue(offsets(tracker.getUncommittedCommitPoints()).isEmpty());
 
       tracker.ackBatch(TP0, range(101, 102));
 
-      assertEquals(103L, tracker.getUncommittedOffsets().get(TP0));
+      assertEquals(103L, offsets(tracker.getUncommittedCommitPoints()).get(TP0));
     }
   }
 
@@ -1029,5 +1030,11 @@ class UnorderedOffsetTrackerTest {
       t.ack(gp, 0, OffsetTracker.NO_GENERATION);
       assertEquals(1L, t.getCommittableOffset(gp).getAsLong());
     }
+  }
+
+  private static Map<TopicPartition, Long> offsets(Map<TopicPartition, CommitPoint> points) {
+    Map<TopicPartition, Long> result = new HashMap<>();
+    points.forEach((tp, p) -> result.put(tp, p.offset()));
+    return result;
   }
 }
