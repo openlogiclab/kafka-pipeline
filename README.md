@@ -342,6 +342,17 @@ Two options, set explicitly when you configure concurrency:
 
 > **Virtual threads on Java 21–23: watch out for pinning.** A virtual thread that blocks inside a `synchronized` block or method (for example a JDBC driver, an HTTP client, or your own code doing I/O while holding a monitor) *pins* its carrier OS thread. There are only as many carriers as CPU cores by default, so a few pinned handlers can stall every other virtual thread, including ones that would release the lock — which looks like a deadlock. Options: run on Java 24+ (JEP 491 removes this pinning), replace `synchronized` around blocking calls with `ReentrantLock`, or use `ThreadMode.PLATFORM`. Run with `-Djdk.tracePinnedThreads=short` to find pinning sites. The library's own worker code does not hold monitors while calling your handler.
 
+### Noisy partitions
+
+All partitions in a pipeline share one worker pool. If one partition's records are slow (a slow downstream, a hot key), it can end up holding every worker while records of other partitions wait. Cap how many workers one partition may use:
+
+```java
+.concurrency(ThreadMode.VIRTUAL, 200)
+.maxConcurrencyPerPartition(20)   // ~2 × 200 workers / 20 partitions
+```
+
+A worker skips a partition that is already at its limit and takes the next partition with work, so the cap costs nothing while traffic is spread evenly. Set it too low and workers sit idle when only a few partitions have traffic. Applies to per-record mode only; batch mode submits at most one batch per partition per poll.
+
 ### Error Handling
 
 The pipeline supports two error handling strategies via `Fallback`:
@@ -621,6 +632,7 @@ pipeline.awaitShutdown();
 | `shutdownTimeout` | 30s | Max wait for workers during shutdown |
 | `pollTimeout` | 100ms | Kafka consumer poll timeout |
 | `dispatchQueueCapacity` | 500 | Bounded queue capacity for pending work (see below) |
+| `maxConcurrencyPerPartition` | 0 (unlimited) | Max records of one partition processed at once, so a slow partition can't take every worker (per-record mode; see [Noisy partitions](#noisy-partitions)) |
 
 ### Tuning `dispatchQueueCapacity`
 

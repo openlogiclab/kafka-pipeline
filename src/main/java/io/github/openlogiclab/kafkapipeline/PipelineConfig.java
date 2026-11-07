@@ -53,6 +53,8 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
  * @param pollTimeout Kafka consumer poll timeout
  * @param dispatchQueueCapacity capacity of per-partition dispatch queues
  * @param maxWindowSize max tracked offsets per partition before that partition is paused
+ * @param maxConcurrencyPerPartition max records of one partition processed at once (per-record
+ *     mode); 0 means unlimited
  */
 public record PipelineConfig<K, V>(
     Properties consumerProperties,
@@ -72,7 +74,8 @@ public record PipelineConfig<K, V>(
     Duration shutdownTimeout,
     Duration pollTimeout,
     int dispatchQueueCapacity,
-    int maxWindowSize) {
+    int maxWindowSize,
+    int maxConcurrencyPerPartition) {
   /** Validates configuration constraints. */
   public PipelineConfig {
     Objects.requireNonNull(consumerProperties, "consumerProperties");
@@ -99,6 +102,10 @@ public record PipelineConfig<K, V>(
     }
     if (dispatchQueueCapacity <= 0) {
       throw new IllegalArgumentException("dispatchQueueCapacity must be positive");
+    }
+    if (maxConcurrencyPerPartition < 0) {
+      throw new IllegalArgumentException(
+          "maxConcurrencyPerPartition must be >= 0, got " + maxConcurrencyPerPartition);
     }
     if (maxWindowSize <= 0) {
       throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
@@ -165,6 +172,7 @@ public record PipelineConfig<K, V>(
     private Duration shutdownTimeout = Duration.ofSeconds(30);
     private Duration pollTimeout = Duration.ofMillis(100);
     private int dispatchQueueCapacity = 500;
+    private int maxConcurrencyPerPartition = 0;
     private int maxWindowSize = 10_000;
 
     private Builder() {}
@@ -460,6 +468,30 @@ public record PipelineConfig<K, V>(
     }
 
     /**
+     * Maximum number of records from the same partition that may be processed at the same time
+     * (per-record mode only).
+     *
+     * <p>All partitions share one worker pool. Without a limit, a partition whose records are slow
+     * (a slow downstream, a hot key range) can occupy every worker while records of other
+     * partitions wait in their queues. With a limit of {@code n}, at most {@code n} workers work on
+     * one partition; the rest stay available to the others.
+     *
+     * <p>A good starting point is about {@code 2 × concurrency / assignedPartitions}. Setting it
+     * too low leaves workers idle when only a few partitions have traffic.
+     *
+     * <p>Ignored in batch mode, where each poll submits at most one batch per partition.
+     *
+     * <p>Default: {@code 0} (unlimited).
+     *
+     * @param max the per-partition limit, or 0 for no limit
+     * @return this builder
+     */
+    public Builder<K, V> maxConcurrencyPerPartition(int max) {
+      this.maxConcurrencyPerPartition = max;
+      return this;
+    }
+
+    /**
      * Builds an immutable {@link PipelineConfig}.
      *
      * @return the built configuration
@@ -490,7 +522,8 @@ public record PipelineConfig<K, V>(
           shutdownTimeout,
           pollTimeout,
           dispatchQueueCapacity,
-          maxWindowSize);
+          maxWindowSize,
+          maxConcurrencyPerPartition);
     }
   }
 }

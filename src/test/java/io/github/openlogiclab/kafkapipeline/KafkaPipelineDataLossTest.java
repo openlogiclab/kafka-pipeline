@@ -498,7 +498,8 @@ class KafkaPipelineDataLossTest {
             .build();
     pipeline = new KafkaPipeline<>(config, mockConsumer);
     start(TP0);
-    addRecords(TP0, 0, 3);
+    // Add all three inside one poll, so the batch can't start with only some of them.
+    mockConsumer.schedulePollTask(() -> addRecords(TP0, 0, 3));
     assertTrue(started.await(5, TimeUnit.SECONDS));
 
     mockConsumer.rebalance(List.of());
