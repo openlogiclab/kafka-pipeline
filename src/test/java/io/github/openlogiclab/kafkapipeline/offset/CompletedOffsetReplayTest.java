@@ -238,4 +238,33 @@ class CompletedOffsetReplayTest {
     assertFalse(next.registerUnlessDone(TP, 5));
     assertTrue(next.registerUnlessDone(TP, 1_000_000_000L));
   }
+
+  @Test
+  void registerBatchUnlessDone_rejectsNull() {
+    OffsetTracker tracker = new UnorderedOffsetTracker(100, true);
+    tracker.initPartition(TP, 0, null);
+    assertThrows(IllegalArgumentException.class, () -> tracker.registerBatchUnlessDone(TP, null));
+  }
+
+  @Test
+  void offsetsOutsideThePreviousOwnersRange_areNotSkipped() {
+    CommitPoint point = stuckHeadCommit(); // 100 stuck, 101..110 done
+    OffsetTracker next = new UnorderedOffsetTracker(1000, true);
+    next.initPartition(TP, 100, point.metadata());
+    assertTrue(next.registerUnlessDone(TP, 100), "the start offset is never done");
+    assertFalse(next.registerUnlessDone(TP, 101));
+    assertTrue(next.registerUnlessDone(TP, 5_000), "beyond the recorded range");
+  }
+
+  @Test
+  void commitConfirmedAheadOfThisWindow_isNotRecommitted() {
+    OffsetTracker tracker = new UnorderedOffsetTracker(1000, true);
+    tracker.initPartition(TP, 0, null);
+    tracker.register(TP, 0);
+    tracker.register(TP, 1);
+    process(tracker, 1);
+    // A late callback for a commit further ahead (e.g. from before a reassign).
+    tracker.markCommitted(TP, new CommitPoint(50, ""));
+    assertTrue(tracker.getUncommittedCommitPoints().isEmpty());
+  }
 }

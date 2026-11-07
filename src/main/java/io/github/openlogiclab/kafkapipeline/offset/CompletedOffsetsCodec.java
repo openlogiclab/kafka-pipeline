@@ -15,12 +15,13 @@
  */
 package io.github.openlogiclab.kafkapipeline.offset;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.util.Base64;
 import java.util.BitSet;
-import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
-import java.util.zip.Inflater;
+import java.util.zip.InflaterInputStream;
 
 /**
  * Encodes the offsets that finished beyond the committed offset into commit metadata, so a consumer
@@ -111,29 +112,19 @@ final class CompletedOffsetsCodec {
         return new BitSet();
       }
       byte[] compressed = Base64.getUrlDecoder().decode(metadata.substring(sep + 1));
-      Inflater inflater = new Inflater();
-      try {
-        inflater.setInput(compressed);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buf = new byte[1024];
-        while (!inflater.finished()) {
-          int n = inflater.inflate(buf);
-          if (n == 0 && (inflater.needsInput() || inflater.needsDictionary())) {
-            return new BitSet();
-          }
-          out.write(buf, 0, n);
-          if (out.size() > MAX_DECODED_BYTES) {
-            return new BitSet();
-          }
-        }
-        BitSet done = BitSet.valueOf(out.toByteArray());
-        // Offset `base` itself is the first unfinished record, so it can never be done.
-        done.clear(0);
-        return done;
-      } finally {
-        inflater.end();
+      byte[] raw;
+      try (InflaterInputStream in = new InflaterInputStream(new ByteArrayInputStream(compressed))) {
+        // Truncated input fails with EOFException, a preset dictionary with ZipException.
+        raw = in.readNBytes(MAX_DECODED_BYTES + 1);
       }
-    } catch (IllegalArgumentException | DataFormatException e) {
+      if (raw.length > MAX_DECODED_BYTES) {
+        return new BitSet();
+      }
+      BitSet done = BitSet.valueOf(raw);
+      // Offset `base` itself is the first unfinished record, so it can never be done.
+      done.clear(0);
+      return done;
+    } catch (IllegalArgumentException | IOException e) {
       return new BitSet();
     }
   }

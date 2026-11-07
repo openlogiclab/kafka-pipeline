@@ -521,6 +521,25 @@ class PeriodicCommitterTest {
     }
 
     @Test
+    void syncCommit_givesUpAfterOneRetry() {
+      stuckHeadWithFinishedRecordsBehindIt();
+      AtomicInteger attempts = new AtomicInteger();
+      MockConsumer<String, String> alwaysRejects =
+          new MockConsumer<>("earliest") {
+            @Override
+            public void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+              attempts.incrementAndGet();
+              throw new org.apache.kafka.common.errors.OffsetMetadataTooLarge("too large");
+            }
+          };
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, alwaysRejects, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      assertDoesNotThrow(c::commitSync);
+      assertEquals(2, attempts.get());
+    }
+
+    @Test
     void syncCommit_retriesWithoutMetadataSoTheFinalCommitLands() {
       stuckHeadWithFinishedRecordsBehindIt();
       TinyMetadataBroker broker = new TinyMetadataBroker();

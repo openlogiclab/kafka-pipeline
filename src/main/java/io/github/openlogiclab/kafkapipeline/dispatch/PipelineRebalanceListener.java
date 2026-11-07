@@ -239,9 +239,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       return Map.of();
     }
     try {
-      Map<TopicPartition, OffsetAndMetadata> committed =
-          consumer.committed(new HashSet<>(partitions));
-      return committed != null ? committed : Map.of();
+      return consumer.committed(new HashSet<>(partitions));
     } catch (Exception e) {
       // Only an optimisation: without it, records finished after the committed offset are
       // processed again, exactly as they would be without completed-offset tracking.
