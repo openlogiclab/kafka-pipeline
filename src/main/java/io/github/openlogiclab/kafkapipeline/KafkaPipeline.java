@@ -88,7 +88,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  * KafkaPipeline<String, String> pipeline = new KafkaPipeline<>(
  *     KafkaPipeline.<String, String>builder()
  *         .consumerProperties(kafkaProps)
- *         .topics("orders", "payments")
+ *         .topic("orders")
  *         .handler(record -> myService.process(record))
  *         .concurrency(ThreadMode.VIRTUAL, 200)
  *         .errorStrategy(ErrorStrategy.<String, String>builder()

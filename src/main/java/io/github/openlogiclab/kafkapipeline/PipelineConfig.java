@@ -182,7 +182,27 @@ public record PipelineConfig<K, V>(
     }
 
     /**
-     * Topics to subscribe to. At least one is required.
+     * The topic to subscribe to. This is the recommended way to configure a pipeline: one topic per
+     * pipeline, so each topic gets its own thread pool, backpressure and consumer group.
+     *
+     * @param topic the topic
+     * @return this builder
+     * @see #topics(String...)
+     */
+    public Builder<K, V> topic(String topic) {
+      this.topics = List.of(Objects.requireNonNull(topic, "topic"));
+      return this;
+    }
+
+    /**
+     * Subscribes one pipeline to several topics. Prefer {@link #topic(String)} with one pipeline
+     * per topic.
+     *
+     * <p>Topics in the same pipeline share the worker thread pool, the global backpressure
+     * watermarks and the consumer: a slow topic can occupy every worker, and backpressure caused by
+     * one topic pauses all of them. Only use this for topics that are the same workload (for
+     * example regional shards such as {@code orders-us} and {@code orders-eu}). Run a separate
+     * pipeline, with its own {@code group.id}, for topics that need isolation.
      *
      * @param topics the topics
      * @return this builder
@@ -193,7 +213,8 @@ public record PipelineConfig<K, V>(
     }
 
     /**
-     * Topics to subscribe to. At least one is required.
+     * Subscribes one pipeline to several topics. Prefer {@link #topic(String)}; see {@link
+     * #topics(List)} for what topics in one pipeline share.
      *
      * @param topics the topics
      * @return this builder
