@@ -119,6 +119,57 @@ class BatchWorkerPoolTest {
   }
 
   @Nested
+  class SkipCompleted {
+
+    @Test
+    void recordsFinishedByThePreviousOwner_areLeftOutOfTheBatch() throws Exception {
+      // Previous owner: 0 stuck, 1, 2 and 4 finished.
+      UnorderedOffsetTracker previous = new UnorderedOffsetTracker(100, true);
+      TopicPartition tp = new TopicPartition("test", 9);
+      previous.initPartition(tp, 0, null);
+      previous.registerBatch(tp, new long[] {0, 1, 2, 3, 4});
+      previous.markBatchInProgress(tp, new long[] {1, 2, 4});
+      previous.ackBatch(tp, new long[] {1, 2, 4});
+      String metadata = previous.getAllCommitPoints().get(tp).metadata();
+
+      tracker = new UnorderedOffsetTracker(100, true);
+      tracker.initPartition(tp, 0, metadata);
+      List<Long> handled = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+      CountDownLatch done = new CountDownLatch(1);
+      BatchWorkerPool<String, String> pool =
+          new BatchWorkerPool<>(
+              2,
+              ThreadMode.PLATFORM,
+              (t, records) -> {
+                records.forEach(r -> handled.add(r.offset()));
+                done.countDown();
+              },
+              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              tracker,
+              counter,
+              10,
+              NoOpMetricsCollector.INSTANCE);
+      pool.start();
+
+      assertTrue(pool.dispatch(buildRecords(tp, 0, 0)).isEmpty());
+      assertTrue(done.await(5, TimeUnit.SECONDS));
+      // A batch made only of finished records is not submitted at all.
+      assertTrue(pool.dispatch(buildRecords(tp, 1, 2)).isEmpty());
+      // A mixed batch keeps only the unfinished ones.
+      long deadline = System.currentTimeMillis() + 5_000;
+      while (tracker.getCommittableOffset(tp).orElse(0) < 3
+          && System.currentTimeMillis() < deadline) Thread.sleep(10);
+      assertTrue(pool.dispatch(buildRecords(tp, 3, 5)).isEmpty());
+      while (tracker.getCommittableOffset(tp).orElse(0) < 6
+          && System.currentTimeMillis() < deadline) Thread.sleep(10);
+      assertEquals(List.of(0L, 3L, 5L), List.copyOf(handled));
+      assertEquals(6, tracker.getCommittableOffset(tp).getAsLong());
+      assertEquals(0, counter.records());
+      pool.stop(1000);
+    }
+  }
+
+  @Nested
   class Lifecycle {
 
     @Test

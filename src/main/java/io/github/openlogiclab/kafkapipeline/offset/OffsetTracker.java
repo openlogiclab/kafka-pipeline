@@ -56,6 +56,26 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
    */
   void registerBatch(TopicPartition tp, long[] offsets);
 
+  /**
+   * Registers an offset, unless the previous owner of the partition already finished it (see {@link
+   * #initPartition(TopicPartition, long, String)}). An already-finished offset is recorded as DONE
+   * right away and must not be dispatched.
+   *
+   * @param tp the topic partition
+   * @param offset the offset to register
+   * @return true if the record must be processed, false if it was already done
+   */
+  boolean registerUnlessDone(TopicPartition tp, long offset);
+
+  /**
+   * Batch form of {@link #registerUnlessDone(TopicPartition, long)}.
+   *
+   * @param tp the topic partition
+   * @param offsets the offsets to register
+   * @return the offsets that must be processed, in order; empty if all were already done
+   */
+  long[] registerBatchUnlessDone(TopicPartition tp, long[] offsets);
+
   // ── Worker calls ──────────────────────────────────────────────
 
   /**
@@ -134,6 +154,38 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
    */
   void markCommitted(TopicPartition tp, long offset);
 
+  /**
+   * Like {@link #getUncommittedOffsets()}, but each entry also carries commit metadata recording
+   * offsets beyond the committed one that already finished. A partition is included when its
+   * committable offset advanced or that set of finished offsets changed.
+   *
+   * @return map of partition to commit point
+   */
+  Map<TopicPartition, CommitPoint> getUncommittedCommitPoints();
+
+  /**
+   * Like {@link #getAllCommittableOffsets()}, with commit metadata. Also includes a partition that
+   * has not advanced but has finished offsets beyond its start.
+   *
+   * @return map of partition to commit point
+   */
+  Map<TopicPartition, CommitPoint> getAllCommitPoints();
+
+  /**
+   * Marks a commit point as confirmed committed to Kafka.
+   *
+   * @param tp the topic partition
+   * @param point the committed point
+   */
+  void markCommitted(TopicPartition tp, CommitPoint point);
+
+  /**
+   * Stops recording finished offsets in commit metadata, for every partition now and later. Called
+   * when the broker rejects the metadata as too large ({@code offset.metadata.max.bytes}), so
+   * commits fall back to plain offsets instead of failing every time.
+   */
+  void stopTrackingCompleted();
+
   // ── Rebalance / Lifecycle ─────────────────────────────────────
 
   /**
@@ -144,6 +196,19 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
    * @throws IllegalStateException if the partition is already initialized
    */
   void initPartition(TopicPartition tp, long startOffset);
+
+  /**
+   * Initializes tracking for a newly assigned partition, using the metadata committed with the
+   * offset the consumer resumes from. If that metadata lists offsets the previous owner already
+   * finished, those records are skipped instead of processed again. Metadata that is missing,
+   * unreadable or relative to a different offset is ignored.
+   *
+   * @param tp the topic partition
+   * @param startOffset the offset from which this consumer will start polling
+   * @param committedMetadata the metadata committed with {@code startOffset}, or null
+   * @throws IllegalStateException if the partition is already initialized
+   */
+  void initPartition(TopicPartition tp, long startOffset, String committedMetadata);
 
   /**
    * Waits for in-progress records on this partition to complete, up to the given timeout. Returns a

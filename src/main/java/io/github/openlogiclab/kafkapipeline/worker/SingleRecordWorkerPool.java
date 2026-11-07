@@ -122,7 +122,10 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
           break;
         }
         try {
-          offsetTracker.register(tp, record.offset());
+          if (!offsetTracker.registerUnlessDone(tp, record.offset())) {
+            // Already processed before a crash or rebalance; recorded as done, not dispatched.
+            continue;
+          }
         } catch (WindowFullException e) {
           if (rejected.isEmpty()) rejected = new HashMap<>();
           rejected.put(tp, record.offset());

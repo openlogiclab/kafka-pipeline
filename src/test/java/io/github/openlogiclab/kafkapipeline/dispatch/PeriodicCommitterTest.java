@@ -449,6 +449,90 @@ class PeriodicCommitterTest {
     }
   }
 
+  @Nested
+  class MetadataTooLarge {
+
+    /** A broker whose offset.metadata.max.bytes is smaller than any metadata we write. */
+    private class TinyMetadataBroker extends MockConsumer<String, String> {
+      final java.util.List<Map<TopicPartition, OffsetAndMetadata>> accepted =
+          new java.util.ArrayList<>();
+
+      TinyMetadataBroker() {
+        super("earliest");
+      }
+
+      private boolean tooLarge(Map<TopicPartition, OffsetAndMetadata> offsets) {
+        return offsets.values().stream().anyMatch(om -> !om.metadata().isEmpty());
+      }
+
+      @Override
+      public void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+        if (tooLarge(offsets)) {
+          throw new org.apache.kafka.common.errors.OffsetMetadataTooLarge("too large");
+        }
+        accepted.add(new HashMap<>(offsets));
+      }
+
+      @Override
+      public void commitAsync(
+          Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+        if (tooLarge(offsets)) {
+          callback.onComplete(
+              offsets, new org.apache.kafka.common.errors.OffsetMetadataTooLarge("too large"));
+          return;
+        }
+        accepted.add(new HashMap<>(offsets));
+        callback.onComplete(offsets, null);
+      }
+    }
+
+    private void stuckHeadWithFinishedRecordsBehindIt() {
+      tracker = new UnorderedOffsetTracker(100, true);
+      tracker.initPartition(TP0, 0, null);
+      tracker.register(TP0, 0); // stuck
+      completeRecord(TP0, 1);
+      tracker.initPartition(TP1, 0, null);
+      tracker.register(TP1, 0);
+      completeRecord(TP1, 1);
+      tracker.markInProgress(TP1, 0);
+      tracker.ack(TP1, 0);
+    }
+
+    @Test
+    void asyncCommit_fallsBackToPlainOffsets() {
+      stuckHeadWithFinishedRecordsBehindIt();
+      TinyMetadataBroker broker = new TinyMetadataBroker();
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, broker, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      try {
+        c.commitAsync(); // rejected; turns metadata off
+        assertTrue(broker.accepted.isEmpty());
+        c.commitAsync();
+        assertEquals(1, broker.accepted.size());
+        assertEquals(2L, broker.accepted.get(0).get(TP1).offset());
+        assertEquals("", broker.accepted.get(0).get(TP1).metadata());
+        assertFalse(broker.accepted.get(0).containsKey(TP0), "nothing to commit while stuck");
+        assertTrue(tracker.getUncommittedCommitPoints().isEmpty());
+      } finally {
+        c.stop();
+      }
+    }
+
+    @Test
+    void syncCommit_retriesWithoutMetadataSoTheFinalCommitLands() {
+      stuckHeadWithFinishedRecordsBehindIt();
+      TinyMetadataBroker broker = new TinyMetadataBroker();
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, broker, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.commitSync();
+      assertEquals(1, broker.accepted.size());
+      assertEquals(new OffsetAndMetadata(2L, ""), broker.accepted.get(0).get(TP1));
+    }
+  }
+
   private static class SpyConsumer extends MockConsumer<String, String> {
     private final AtomicReference<Map<TopicPartition, OffsetAndMetadata>> syncCapture;
     private final AtomicReference<Map<TopicPartition, OffsetAndMetadata>> asyncCapture;

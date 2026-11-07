@@ -22,13 +22,16 @@ import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.PartitionDrainResult;
 import java.time.Duration;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 
 /**
@@ -50,6 +53,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
   private final Duration drainTimeout;
   private final PipelineMetricsCollector metricsCollector;
   private final ExecutorService drainExecutor;
+  private final boolean readCommittedMetadata;
 
   /**
    * Creates a rebalance listener.
@@ -70,6 +74,40 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       Consumer<?, ?> consumer,
       Duration drainTimeout,
       PipelineMetricsCollector metricsCollector) {
+    this(
+        offsetTracker,
+        dispatcher,
+        commitSync,
+        counter,
+        consumer,
+        drainTimeout,
+        metricsCollector,
+        false);
+  }
+
+  /**
+   * Creates a rebalance listener.
+   *
+   * @param offsetTracker the offset tracker
+   * @param dispatcher the record dispatcher
+   * @param commitSync callback to perform sync commit
+   * @param counter the in-flight counter
+   * @param consumer the Kafka consumer
+   * @param drainTimeout timeout for draining in-flight records
+   * @param metricsCollector the metrics collector
+   * @param readCommittedMetadata whether to read the committed metadata of newly assigned
+   *     partitions, so records the previous owner already finished are skipped
+   */
+  public PipelineRebalanceListener(
+      OffsetTracker offsetTracker,
+      RecordDispatcher<?, ?> dispatcher,
+      Runnable commitSync,
+      InFlightCounter counter,
+      Consumer<?, ?> consumer,
+      Duration drainTimeout,
+      PipelineMetricsCollector metricsCollector,
+      boolean readCommittedMetadata) {
+    this.readCommittedMetadata = readCommittedMetadata;
     this.offsetTracker = offsetTracker;
     this.dispatcher = dispatcher;
     this.commitSync = commitSync;
@@ -180,13 +218,39 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
 
     logger.log(System.Logger.Level.INFO, "Partitions assigned: {0}", partitions);
 
+    Map<TopicPartition, OffsetAndMetadata> committed = committedOffsets(partitions);
     for (TopicPartition tp : partitions) {
       long position = consumer.position(tp);
-      offsetTracker.initPartition(tp, position);
+      OffsetAndMetadata last = committed.get(tp);
+      // The metadata only describes records after the committed offset, so it applies only when
+      // this consumer resumes exactly there (not after an offset reset or a seek).
+      String metadata = last != null && last.offset() == position ? last.metadata() : null;
+      offsetTracker.initPartition(tp, position, metadata);
       dispatcher.addPartition(tp, offsetTracker.generation(tp));
       metricsCollector.partitionAssigned(tp);
 
       logger.log(System.Logger.Level.DEBUG, "Initialized {0} at offset {1}", tp, position);
+    }
+  }
+
+  private Map<TopicPartition, OffsetAndMetadata> committedOffsets(
+      Collection<TopicPartition> partitions) {
+    if (!readCommittedMetadata) {
+      return Map.of();
+    }
+    try {
+      Map<TopicPartition, OffsetAndMetadata> committed =
+          consumer.committed(new HashSet<>(partitions));
+      return committed != null ? committed : Map.of();
+    } catch (Exception e) {
+      // Only an optimisation: without it, records finished after the committed offset are
+      // processed again, exactly as they would be without completed-offset tracking.
+      logger.log(
+          System.Logger.Level.WARNING,
+          "Could not read committed metadata for {0}, finished records may be processed again: {1}",
+          partitions,
+          e.toString());
+      return Map.of();
     }
   }
 
