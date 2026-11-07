@@ -102,6 +102,15 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       }
     }
 
+    if (drainExecutor.isShutdown()) {
+      // Pipeline shutdown: consumer.close() revokes the partitions after the workers have stopped
+      // and the final commit has run, so there is nothing left to drain or commit.
+      for (TopicPartition tp : partitions) {
+        offsetTracker.clearPartition(tp);
+      }
+      return;
+    }
+
     CompletableFuture<?>[] drainFutures =
         partitions.stream()
             .map(
@@ -145,14 +154,17 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     for (TopicPartition tp : partitions) {
       long position = consumer.position(tp);
       offsetTracker.initPartition(tp, position);
-      dispatcher.addPartition(tp);
+      dispatcher.addPartition(tp, offsetTracker.generation(tp));
       metricsCollector.partitionAssigned(tp);
 
       logger.log(System.Logger.Level.DEBUG, "Initialized {0} at offset {1}", tp, position);
     }
   }
 
-  /** Shuts down the drain executor. */
+  /**
+   * Shuts down the drain executor. Call before closing the consumer: the revoke that {@code
+   * close()} triggers then just clears partition state instead of waiting on stopped workers.
+   */
   public void shutdown() {
     drainExecutor.shutdownNow();
   }

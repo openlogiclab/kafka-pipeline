@@ -113,7 +113,7 @@ class PartitionPauseControllerTest {
 
     assertEquals(9L, consumer.position(TP0));
     assertTrue(consumer.paused().contains(TP0));
-    assertTrue(controller.isWindowPaused(TP0));
+    assertTrue(controller.isPaused(TP0));
 
     complete(TP0, 0, 9);
     controller.apply(false);
@@ -124,11 +124,11 @@ class PartitionPauseControllerTest {
   void forgetsRevokedPartitions() {
     fill(TP0, 0, 8);
     controller.apply(false);
-    assertTrue(controller.isWindowPaused(TP0));
+    assertTrue(controller.isPaused(TP0));
 
     consumer.assign(List.of(TP1));
     controller.apply(false);
 
-    assertFalse(controller.isWindowPaused(TP0));
+    assertFalse(controller.isPaused(TP0));
   }
 }

@@ -111,8 +111,16 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   @Override
   public Map<TopicPartition, Long> dispatch(ConsumerRecords<K, V> records) {
     Map<TopicPartition, Long> rejected = Map.of();
+    int dispatched = 0;
     for (TopicPartition tp : records.partitions()) {
       for (ConsumerRecord<K, V> record : records.records(tp)) {
+        if (!dispatcher.hasRoom(tp)) {
+          // Never block the poll thread on a full queue: fetch the rest again once it drains.
+          dispatcher.reportFull(tp);
+          if (rejected.isEmpty()) rejected = new HashMap<>();
+          rejected.put(tp, record.offset());
+          break;
+        }
         try {
           offsetTracker.register(tp, record.offset());
         } catch (WindowFullException e) {
@@ -122,10 +130,16 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         }
         counter.registered(1, RecordSize.estimateBytes(record));
         dispatcher.dispatch(tp, record);
+        dispatched++;
       }
     }
-    dispatcher.wakeWorkers();
+    dispatcher.wakeWorkers(dispatched);
     return rejected;
+  }
+
+  @Override
+  public boolean canResume(TopicPartition tp) {
+    return dispatcher.hasDrained(tp);
   }
 
   private void workerLoop() {
@@ -134,20 +148,33 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         if (Thread.currentThread().isInterrupted()) break;
         RecordDispatcher.PollResult<K, V> result = dispatcher.poll(100, MILLISECONDS);
         if (result == null) continue;
-        processRecord(result.partition(), result.record());
+        try {
+          processRecord(result.partition(), result.record(), result.generation());
+        } finally {
+          dispatcher.release(result);
+        }
       } catch (Exception e) {
         logger.log(System.Logger.Level.ERROR, "Unexpected error in worker loop", e);
       }
     }
   }
 
-  private void processRecord(TopicPartition tp, ConsumerRecord<K, V> record) {
+  private void processRecord(TopicPartition tp, ConsumerRecord<K, V> record, long generation) {
+    try {
+      process(tp, record, generation);
+    } finally {
+      // Always release the in-flight slot, even if the partition was revoked mid-processing and
+      // the ack below failed; otherwise backpressure would never drain.
+      counter.completed(1, RecordSize.estimateBytes(record));
+    }
+  }
+
+  private void process(TopicPartition tp, ConsumerRecord<K, V> record, long generation) {
     long offset = record.offset();
-    long recordBytes = RecordSize.estimateBytes(record);
     ProcessingContext ctx = new ProcessingContext(tp, offset, 0);
 
     try {
-      offsetTracker.markInProgress(tp, offset);
+      offsetTracker.markInProgress(tp, offset, generation);
     } catch (IllegalStateException e) {
       logger.log(
           System.Logger.Level.WARNING,
@@ -155,7 +182,6 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
           offset,
           tp,
           e.getMessage());
-      counter.completed(1, recordBytes);
       return;
     }
 
@@ -171,22 +197,21 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     }
 
     if (shouldSkipViaHook) {
-      offsetTracker.ack(tp, offset);
-      counter.completed(1, recordBytes);
+      ack(tp, offset, generation);
       metricsCollector.recordSkipped(1);
       return;
     }
 
     String desc = "offset " + offset;
+    int[] lastAttempt = {0};
     Exception lastError =
         retryExecutor.executeWithRetries(
             attempt -> {
-              ProcessingContext attemptCtx = new ProcessingContext(tp, offset, attempt);
+              lastAttempt[0] = attempt;
               try {
                 handler.handle(record);
-                hook.afterProcess(record, attemptCtx);
               } catch (Exception ex) {
-                hook.onError(record, attemptCtx, ex);
+                hook.onError(record, new ProcessingContext(tp, offset, attempt), ex);
                 throw ex;
               }
             },
@@ -194,8 +219,16 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
             desc);
 
     if (lastError == null) {
-      offsetTracker.ack(tp, offset);
-      counter.completed(1, recordBytes);
+      // Outside the retry loop: a hook that throws must not re-run a handler that succeeded.
+      try {
+        hook.afterProcess(record, new ProcessingContext(tp, offset, lastAttempt[0]));
+      } catch (Exception e) {
+        logger.log(
+            System.Logger.Level.WARNING,
+            "afterProcess hook threw for " + tp + ":" + offset + "; the record is still acked",
+            e);
+      }
+      ack(tp, offset, generation);
       metricsCollector.recordProcessed(1);
       return;
     }
@@ -208,7 +241,6 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
           "Interrupted while processing {0}:{1}, not acking",
           tp,
           offset);
-      counter.completed(1, recordBytes);
       return;
     }
 
@@ -216,10 +248,31 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     RetryExecutor.FailureResolution resolution =
         retryExecutor.handleFailure(List.of(record), tp, lastError, desc);
     if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
-      offsetTracker.markFailed(tp);
       metricsCollector.recordFailed(1);
+      if (ack(tp, offset, generation)) offsetTracker.markFailed(tp);
+    } else {
+      ack(tp, offset, generation);
     }
-    offsetTracker.ack(tp, offset);
-    counter.completed(1, recordBytes);
+  }
+
+  /**
+   * Acks an offset. Returns false if the partition is no longer tracked, which happens when a
+   * record finishes after its partition was revoked and the drain timeout expired. The new owner
+   * re-consumes it from the last committed offset, so there is nothing more to do here.
+   */
+  private boolean ack(TopicPartition tp, long offset, long generation) {
+    try {
+      offsetTracker.ack(tp, offset, generation);
+      return true;
+    } catch (IllegalStateException e) {
+      logger.log(
+          System.Logger.Level.INFO,
+          "Finished {0}:{1} but could not ack it ({2}); the partition was likely revoked and the"
+              + " record will be redelivered to its new owner",
+          tp,
+          offset,
+          e.getMessage());
+      return false;
+    }
   }
 }

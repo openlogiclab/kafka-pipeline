@@ -17,6 +17,7 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -46,6 +47,139 @@ class RecordDispatcherTest {
 
   private ConsumerRecord<String, String> record(TopicPartition tp, long offset) {
     return new ConsumerRecord<>(tp.topic(), tp.partition(), offset, "key", "value-" + offset);
+  }
+
+  @Nested
+  class PerPartitionLimit {
+
+    private RecordDispatcher<String, String> capped;
+
+    @BeforeEach
+    void setUp() {
+      capped = new RecordDispatcher<>(100, 2);
+      capped.addPartition(TP0);
+      capped.addPartition(TP1);
+    }
+
+    @Test
+    void fairShareFloor_tracksAssignedPartitions() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 2, 10);
+      assertEquals(2, d.effectivePartitionLimit(), "no partitions yet");
+      d.addPartition(TP0);
+      assertEquals(10, d.effectivePartitionLimit(), "one partition gets the whole pool");
+      d.addPartition(TP1);
+      assertEquals(5, d.effectivePartitionLimit());
+      d.addPartition(TP2);
+      assertEquals(4, d.effectivePartitionLimit(), "ceil(10 / 3)");
+      d.removePartition(TP2);
+      assertEquals(5, d.effectivePartitionLimit());
+    }
+
+    @Test
+    void fairShareFloor_neverBelowConfiguredLimit() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 3, 4);
+      d.addPartition(TP0);
+      d.addPartition(TP1);
+      d.addPartition(TP2);
+      assertEquals(3, d.effectivePartitionLimit(), "ceil(4 / 3) = 2 < 3");
+    }
+
+    @Test
+    void singlePartition_withFloor_handsOutUpToConcurrencyRecords() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 1, 3);
+      d.addPartition(TP0);
+      for (long i = 0; i < 5; i++) d.dispatch(TP0, record(TP0, i));
+      for (int i = 0; i < 3; i++) assertNotNull(d.poll(10, TimeUnit.MILLISECONDS));
+      assertNull(d.poll(10, TimeUnit.MILLISECONDS), "limit is 3 with one partition");
+    }
+
+    @Test
+    void withoutALimit_fairShareIsNotApplied() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 0, 10);
+      d.addPartition(TP0);
+      assertEquals(0, d.effectivePartitionLimit());
+    }
+
+    @Test
+    void rejectsNegativeConcurrency() {
+      assertThrows(IllegalArgumentException.class, () -> new RecordDispatcher<>(10, 1, -1));
+    }
+
+    @Test
+    void rejectsNegativeLimit() {
+      assertThrows(IllegalArgumentException.class, () -> new RecordDispatcher<>(10, -1));
+    }
+
+    @Test
+    void partitionAtItsLimit_isSkippedUntilARecordIsReleased() {
+      for (long i = 0; i < 5; i++) capped.dispatch(TP0, record(TP0, i));
+      capped.dispatch(TP1, record(TP1, 0));
+
+      List<RecordDispatcher.PollResult<String, String>> polled = new ArrayList<>();
+      for (int i = 0; i < 3; i++) polled.add(capped.poll(10, TimeUnit.MILLISECONDS));
+      assertEquals(
+          2, polled.stream().filter(r -> r.partition().equals(TP0)).count(), "TP0 limited to 2");
+      assertEquals(1, polled.stream().filter(r -> r.partition().equals(TP1)).count());
+      assertEquals(2, capped.activeRecords(TP0));
+
+      assertNull(capped.poll(10, TimeUnit.MILLISECONDS), "TP0 is at its limit, TP1 is empty");
+
+      RecordDispatcher.PollResult<String, String> tp0 =
+          polled.stream().filter(r -> r.partition().equals(TP0)).findFirst().orElseThrow();
+      capped.release(tp0);
+      assertEquals(1, capped.activeRecords(TP0));
+      RecordDispatcher.PollResult<String, String> next = capped.poll(10, TimeUnit.MILLISECONDS);
+      assertNotNull(next);
+      assertEquals(TP0, next.partition());
+      assertEquals(2, capped.activeRecords(TP0));
+    }
+
+    @Test
+    void release_wakesAWorkerWaitingOnALimitedPartition() throws Exception {
+      for (long i = 0; i < 3; i++) capped.dispatch(TP0, record(TP0, i));
+      RecordDispatcher.PollResult<String, String> first = capped.poll(10, TimeUnit.MILLISECONDS);
+      capped.poll(10, TimeUnit.MILLISECONDS);
+
+      AtomicReference<RecordDispatcher.PollResult<String, String>> got = new AtomicReference<>();
+      Thread waiter = Thread.ofPlatform().start(() -> got.set(capped.poll(10, TimeUnit.SECONDS)));
+      Thread.sleep(100);
+      assertNull(got.get(), "third record must wait while TP0 is at its limit");
+
+      long start = System.nanoTime();
+      capped.release(first);
+      waiter.join(5_000);
+      assertNotNull(got.get());
+      assertEquals(2L, got.get().record().offset());
+      assertTrue(
+          System.nanoTime() - start < TimeUnit.SECONDS.toNanos(2),
+          "release should wake the waiting worker, not leave it to the timeout");
+    }
+
+    @Test
+    void releaseAfterRevokeAndReassign_doesNotTouchTheNewQueuesCount() {
+      capped.dispatch(TP0, record(TP0, 0));
+      RecordDispatcher.PollResult<String, String> old = capped.poll(10, TimeUnit.MILLISECONDS);
+      capped.removePartition(TP0);
+      capped.addPartition(TP0);
+      capped.dispatch(TP0, record(TP0, 1));
+      capped.poll(10, TimeUnit.MILLISECONDS);
+      assertEquals(1, capped.activeRecords(TP0));
+
+      capped.release(old);
+      assertEquals(1, capped.activeRecords(TP0), "stale release must not free a new slot");
+    }
+
+    @Test
+    void withoutALimit_releaseIsANoOpAndActiveIsNotTracked() {
+      dispatcher.addPartition(TP0);
+      dispatcher.dispatch(TP0, record(TP0, 0));
+      RecordDispatcher.PollResult<String, String> r = dispatcher.poll(10, TimeUnit.MILLISECONDS);
+      assertEquals(-1L, r.generation(), "no generation given to addPartition");
+      assertEquals(0, dispatcher.activeRecords(TP0));
+      dispatcher.release(r);
+      assertEquals(0, dispatcher.activeRecords(TP0));
+      assertEquals(0, dispatcher.activeRecords(TP2), "unknown partition");
+    }
   }
 
   @Nested
@@ -123,6 +257,18 @@ class RecordDispatcherTest {
       dispatcher.retainOnly(Set.of(TP0, TP2));
       assertEquals(Set.of(TP0, TP2), dispatcher.partitions());
     }
+
+    @Test
+    void retainOnly_stopsPollingRemovedPartitions() {
+      dispatcher.addPartition(TP0);
+      dispatcher.addPartition(TP1);
+      dispatcher.dispatch(TP1, record(TP1, 0));
+
+      dispatcher.retainOnly(Set.of(TP0));
+
+      assertEquals(0, dispatcher.totalQueuedRecords());
+      assertNull(dispatcher.poll(10, TimeUnit.MILLISECONDS), "removed queue must not be polled");
+    }
   }
 
   @Nested
@@ -155,32 +301,30 @@ class RecordDispatcherTest {
     }
 
     @Test
-    void dispatch_blocksWhenQueueFull() throws Exception {
-      RecordDispatcher<String, String> small = new RecordDispatcher<>(2);
+    void dispatch_neverBlocks_hasRoomAndHasDrainedTrackCapacity() {
+      RecordDispatcher<String, String> small = new RecordDispatcher<>(4);
       small.addPartition(TP0);
 
-      small.dispatch(TP0, record(TP0, 0));
-      small.dispatch(TP0, record(TP0, 1));
-      assertEquals(2, small.totalQueuedRecords());
-
-      CountDownLatch blocked = new CountDownLatch(1);
-      CountDownLatch done = new CountDownLatch(1);
-      Thread producer =
-          new Thread(
-              () -> {
-                blocked.countDown();
-                small.dispatch(TP0, record(TP0, 2));
-                done.countDown();
-              });
-      producer.start();
-
-      assertTrue(blocked.await(1, TimeUnit.SECONDS));
-      Thread.sleep(100);
-      assertFalse(done.await(200, TimeUnit.MILLISECONDS), "dispatch should be blocking");
+      for (int i = 0; i < 4; i++) {
+        assertTrue(small.hasRoom(TP0));
+        small.dispatch(TP0, record(TP0, i));
+      }
+      assertFalse(small.hasRoom(TP0));
+      assertFalse(small.hasDrained(TP0));
+      assertThrows(IllegalStateException.class, () -> small.dispatch(TP0, record(TP0, 4)));
+      assertEquals(4, small.totalQueuedRecords());
 
       small.poll(10, TimeUnit.MILLISECONDS);
-      assertTrue(done.await(1, TimeUnit.SECONDS), "dispatch should unblock after poll frees space");
-      assertEquals(2, small.totalQueuedRecords());
+      assertTrue(small.hasRoom(TP0));
+      assertFalse(small.hasDrained(TP0), "3 of 4 is above half");
+      small.poll(10, TimeUnit.MILLISECONDS);
+      assertTrue(small.hasDrained(TP0), "2 of 4 is half");
+    }
+
+    @Test
+    void hasRoom_falseAndHasDrained_trueForUnknownPartition() {
+      assertFalse(dispatcher.hasRoom(TP2));
+      assertTrue(dispatcher.hasDrained(TP2));
     }
   }
 
@@ -249,7 +393,7 @@ class RecordDispatcherTest {
       assertTrue(started.await(1, TimeUnit.SECONDS));
       Thread.sleep(50);
       dispatcher.dispatch(TP0, record(TP0, 99));
-      dispatcher.wakeWorkers();
+      dispatcher.wakeWorkers(1);
 
       assertTrue(done.await(1, TimeUnit.SECONDS));
       assertNotNull(result.get());
@@ -369,6 +513,131 @@ class RecordDispatcherTest {
       exec.awaitTermination(2, TimeUnit.SECONDS);
       assertEquals(total, polled.get());
       assertEquals(0, large.totalQueuedRecords());
+    }
+  }
+
+  @Nested
+  class TargetedWakeups {
+
+    private Thread parkedWorker(AtomicInteger got, CountDownLatch registered) {
+      Thread t =
+          Thread.ofPlatform()
+              .start(
+                  () -> {
+                    registered.countDown();
+                    if (dispatcher.poll(10, TimeUnit.SECONDS) != null) got.incrementAndGet();
+                  });
+      return t;
+    }
+
+    private void awaitParked(Thread... threads) throws InterruptedException {
+      long deadline = System.currentTimeMillis() + 2_000;
+      for (Thread t : threads) {
+        while (t.getState() != Thread.State.TIMED_WAITING) {
+          assertTrue(System.currentTimeMillis() < deadline, "worker did not park");
+          Thread.sleep(5);
+        }
+      }
+    }
+
+    @Test
+    void wakeWorkers_wakesNoMoreWorkersThanRecords() throws Exception {
+      dispatcher.addPartition(TP0);
+      AtomicInteger got = new AtomicInteger();
+      CountDownLatch registered = new CountDownLatch(3);
+      Thread a = parkedWorker(got, registered);
+      Thread b = parkedWorker(got, registered);
+      Thread c = parkedWorker(got, registered);
+      awaitParked(a, b, c);
+
+      dispatcher.dispatch(TP0, record(TP0, 0));
+      dispatcher.wakeWorkers(1);
+
+      long deadline = System.currentTimeMillis() + 2_000;
+      while (got.get() < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+      assertEquals(1, got.get());
+      Thread.sleep(100);
+      int stillParked = 0;
+      for (Thread t : new Thread[] {a, b, c}) {
+        if (t.getState() == Thread.State.TIMED_WAITING) stillParked++;
+      }
+      assertEquals(2, stillParked, "only one worker should have been woken");
+
+      a.interrupt();
+      b.interrupt();
+      c.interrupt();
+    }
+
+    @Test
+    void remainingRecordsAreHandedOnWithoutWaitingForTimeout() throws Exception {
+      dispatcher.addPartition(TP0);
+      AtomicInteger got = new AtomicInteger();
+      CountDownLatch registered = new CountDownLatch(2);
+      Thread a = parkedWorker(got, registered);
+      Thread b = parkedWorker(got, registered);
+      awaitParked(a, b);
+
+      // Two records but only one wakeup: the woken worker sees a record still queued and wakes
+      // the other, well before the 10s park timeout.
+      dispatcher.dispatch(TP0, record(TP0, 0));
+      dispatcher.dispatch(TP0, record(TP0, 1));
+      dispatcher.wakeWorkers(1);
+
+      a.join(2_000);
+      b.join(2_000);
+      assertEquals(2, got.get());
+    }
+
+    @Test
+    void wakeWorkers_withNoRecordsWakesNobody() throws Exception {
+      dispatcher.addPartition(TP0);
+      AtomicInteger got = new AtomicInteger();
+      Thread a = parkedWorker(got, new CountDownLatch(1));
+      awaitParked(a);
+
+      dispatcher.wakeWorkers(0);
+      Thread.sleep(100);
+
+      assertEquals(Thread.State.TIMED_WAITING, a.getState());
+      a.interrupt();
+    }
+  }
+
+  @Nested
+  class QueueFullWarning {
+
+    @Test
+    void loggedOncePerIntervalNotPerFullQueue() {
+      java.util.logging.Logger jul =
+          java.util.logging.Logger.getLogger(RecordDispatcher.class.getName());
+      AtomicInteger warnings = new AtomicInteger();
+      java.util.logging.Handler handler =
+          new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord r) {
+              if (r.getLevel() == java.util.logging.Level.WARNING
+                  && String.valueOf(r.getMessage()).startsWith("Dispatch queue full")) {
+                warnings.incrementAndGet();
+              }
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+          };
+      jul.addHandler(handler);
+      try {
+        dispatcher.addPartition(TP0);
+        dispatcher.reportFull(TP0);
+        dispatcher.reportFull(TP0);
+        dispatcher.reportFull(TP0);
+
+        assertEquals(1, warnings.get(), "three full-queue reports should log one warning");
+      } finally {
+        jul.removeHandler(handler);
+      }
     }
   }
 }

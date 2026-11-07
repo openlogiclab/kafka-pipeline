@@ -408,4 +408,312 @@ class KafkaPipelineDataLossTest {
     for (long i = from; i < to; i++) set.add(i);
     return set;
   }
+
+  @Test
+  void stopWhileOutsidePoll_finalCommitStillLands() throws Exception {
+    // Real KafkaConsumer semantics: wakeup() makes the *next* blocking call throw, which can be
+    // the shutdown commitSync if stop() lands while the poll thread is not inside poll().
+    AtomicInteger wakeupThrows = new AtomicInteger();
+    mockConsumer =
+        new MockConsumer<>("earliest") {
+          private volatile boolean wakeupPending;
+
+          @Override
+          public void wakeup() {
+            wakeupPending = true; // not consumed by poll(), as if stop() landed outside it
+          }
+
+          @Override
+          public synchronized void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+            if (wakeupPending) {
+              wakeupPending = false;
+              wakeupThrows.incrementAndGet();
+              throw new org.apache.kafka.common.errors.WakeupException();
+            }
+            super.commitSync(offsets);
+          }
+        };
+    AtomicInteger processed = new AtomicInteger();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .commitInterval(Duration.ofMinutes(10)) // only the final commit can commit
+            .handler(record -> processed.incrementAndGet())
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 3);
+    await(() -> processed.get() == 3, "records should be processed");
+
+    pipeline.stop();
+    pipeline.awaitShutdown();
+
+    assertEquals(1, wakeupThrows.get(), "the pending wakeup should have fired on the commit");
+    assertTrue(committedAt(TP0, 3L), "the final commit must still land after the wakeup");
+  }
+
+  @Test
+  void recordFinishingAfterRevoke_releasesInFlightCount() throws Exception {
+    CountDownLatch started = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .drainTimeout(Duration.ofMillis(100))
+            .handler(
+                record -> {
+                  started.countDown();
+                  blockOnFirstRecord(TP0, record);
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 1);
+    assertTrue(started.await(5, TimeUnit.SECONDS));
+
+    // Revoke while offset 0 is still running; the drain times out and the window is cleared.
+    mockConsumer.rebalance(List.of());
+    assertEquals(1, pipeline.metrics().inFlightRecords());
+
+    // The record finishes after its partition is gone. Its ack fails, but the in-flight slot
+    // must still be released or backpressure would never drain.
+    release.countDown();
+    await(
+        () -> pipeline.metrics().inFlightRecords() == 0,
+        "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
+    assertEquals(0, pipeline.metrics().inFlightBytes());
+  }
+
+  @Test
+  void batchFinishingAfterRevoke_releasesInFlightCount() throws Exception {
+    CountDownLatch started = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .drainTimeout(Duration.ofMillis(100))
+            .batchHandler(
+                (tp, batch) -> {
+                  started.countDown();
+                  release.await(10, TimeUnit.SECONDS);
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    // Add all three inside one poll, so the batch can't start with only some of them.
+    mockConsumer.schedulePollTask(() -> addRecords(TP0, 0, 3));
+    assertTrue(started.await(5, TimeUnit.SECONDS));
+
+    mockConsumer.rebalance(List.of());
+    assertEquals(3, pipeline.metrics().inFlightRecords());
+
+    release.countDown();
+    await(
+        () -> pipeline.metrics().inFlightRecords() == 0,
+        "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
+  }
+
+  @Test
+  void recordFailingAfterRevoke_releasesInFlightCount() throws Exception {
+    CountDownLatch started = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .drainTimeout(Duration.ofMillis(100))
+            .handler(
+                record -> {
+                  started.countDown();
+                  release.await(10, TimeUnit.SECONDS);
+                  throw new RuntimeException("fails after its partition was revoked");
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 1);
+    assertTrue(started.await(5, TimeUnit.SECONDS));
+
+    mockConsumer.rebalance(List.of());
+    release.countDown();
+
+    await(
+        () -> pipeline.metrics().inFlightRecords() == 0,
+        "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
+  }
+
+  @Test
+  void batchFailingAfterRevoke_releasesInFlightCount() throws Exception {
+    CountDownLatch started = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .drainTimeout(Duration.ofMillis(100))
+            .batchHandler(
+                (tp, batch) -> {
+                  started.countDown();
+                  release.await(10, TimeUnit.SECONDS);
+                  throw new RuntimeException("fails after its partition was revoked");
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    addRecords(TP0, 0, 3);
+    assertTrue(started.await(5, TimeUnit.SECONDS));
+
+    mockConsumer.rebalance(List.of());
+    release.countDown();
+
+    await(
+        () -> pipeline.metrics().inFlightRecords() == 0,
+        "in-flight count leaked: " + pipeline.metrics().inFlightRecords());
+  }
+
+  @Test
+  void fullDispatchQueue_pausesPartitionInsteadOfBlockingPollThread() throws Exception {
+    Map<Long, AtomicInteger> processed = new ConcurrentHashMap<>();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .dispatchQueueCapacity(5)
+            .handler(
+                record -> {
+                  blockOnFirstRecord(TP0, record);
+                  processed
+                      .computeIfAbsent(record.offset(), o -> new AtomicInteger())
+                      .incrementAndGet();
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+
+    // The single worker is stuck on offset 0, so the queue (5) fills on the second poll and the
+    // rest of that poll is sent back with a seek. Whether the worker took offset 0 off the queue
+    // before that poll is a race, so the seek lands on 5 (queue held 0..4) or 6 (queue held 1..5).
+    serveLog(TP0, 30, 5);
+    await(
+        () -> mockConsumer.paused().contains(TP0), "TP0 should be paused while its queue is full");
+    long position = mockConsumer.position(TP0);
+    assertTrue(
+        position == 5L || position == 6L,
+        "rest of the poll should be fetched again later, position=" + position);
+
+    release.countDown();
+
+    await(() -> processed.size() == 30, "Expected 0..29, got " + processed.keySet());
+    processed.values().forEach(c -> assertEquals(1, c.get()));
+    await(() -> committedAt(TP0, 30L), "Offsets through 29 should be committed");
+  }
+
+  @Test
+  void stopWithFullQueueAndHungHandler_shutsDownWithinShutdownTimeout() throws Exception {
+    CountDownLatch neverReleased = new CountDownLatch(1);
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .dispatchQueueCapacity(2)
+            .shutdownTimeout(Duration.ofMillis(500))
+            .handler(record -> neverReleased.await(60, TimeUnit.SECONDS))
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    serveLog(TP0, 20, 5);
+    await(() -> mockConsumer.paused().contains(TP0), "queue should fill while the handler hangs");
+
+    long start = System.nanoTime();
+    pipeline.stop();
+    Thread waiter =
+        Thread.ofPlatform()
+            .start(
+                () -> {
+                  try {
+                    pipeline.awaitShutdown();
+                  } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                  }
+                });
+    waiter.join(10_000);
+
+    assertFalse(waiter.isAlive(), "shutdown hung behind a blocked poll thread");
+    assertTrue(
+        System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5),
+        "shutdown should finish shortly after shutdownTimeout");
+  }
+
+  @Test
+  void lateAckAfterReassignToSameConsumer_doesNotCompleteTheNewAttempt() throws Exception {
+    CountDownLatch firstStarted = new CountDownLatch(1);
+    CountDownLatch secondStarted = new CountDownLatch(1);
+    CountDownLatch releaseFirst = new CountDownLatch(1);
+    CountDownLatch releaseSecond = new CountDownLatch(1);
+    AtomicInteger attempts = new AtomicInteger();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 2)
+            .drainTimeout(Duration.ofMillis(100))
+            .handler(
+                record -> {
+                  if (attempts.incrementAndGet() == 1) {
+                    firstStarted.countDown();
+                    releaseFirst.await(10, TimeUnit.SECONDS);
+                  } else {
+                    secondStarted.countDown();
+                    releaseSecond.await(10, TimeUnit.SECONDS);
+                  }
+                })
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    mockConsumer.schedulePollTask(() -> addRecords(TP0, 0, 1));
+    assertTrue(firstStarted.await(5, TimeUnit.SECONDS));
+
+    // Revoke (drain times out while offset 0 is still running), then assign TP0 back to this
+    // consumer: offset 0 is fetched again and a second attempt starts.
+    mockConsumer.schedulePollTask(() -> mockConsumer.rebalance(List.of()));
+    mockConsumer.schedulePollTask(
+        () -> {
+          mockConsumer.rebalance(List.of(TP0));
+          mockConsumer.seek(TP0, 0L);
+        });
+    mockConsumer.schedulePollTask(() -> addRecords(TP0, 0, 1));
+    assertTrue(secondStarted.await(5, TimeUnit.SECONDS), "offset 0 should be retried");
+
+    // The first attempt finishes now. Its ack belongs to the old assignment and must not mark
+    // offset 0 done while the second attempt is still running.
+    releaseFirst.countDown();
+    Thread.sleep(300);
+    assertFalse(committedAt(TP0, 1L), "stale ack committed offset 0 under the new assignment");
+
+    releaseSecond.countDown();
+    await(() -> committedAt(TP0, 1L), "offset 0 should commit once the second attempt finishes");
+  }
+
+  @Test
+  void afterProcessHookThrowing_doesNotRerunTheHandler() throws Exception {
+    AtomicInteger handled = new AtomicInteger();
+    AtomicInteger afterCalls = new AtomicInteger();
+    PipelineConfig<String, String> config =
+        baseBuilder(5)
+            .concurrency(ThreadMode.PLATFORM, 1)
+            .errorStrategy(
+                io.github.openlogiclab.kafkapipeline.error.ErrorStrategy.<String, String>builder()
+                    .maxRetries(3)
+                    .retryBackoff(Duration.ofMillis(1))
+                    .build())
+            .lifecycleHook(
+                new io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook<>() {
+                  @Override
+                  public void afterProcess(
+                      ConsumerRecord<String, String> record,
+                      io.github.openlogiclab.kafkapipeline.handler.ProcessingContext ctx) {
+                    afterCalls.incrementAndGet();
+                    throw new IllegalStateException("hook bug");
+                  }
+                })
+            .handler(record -> handled.incrementAndGet())
+            .build();
+    pipeline = new KafkaPipeline<>(config, mockConsumer);
+    start(TP0);
+    mockConsumer.schedulePollTask(() -> addRecords(TP0, 0, 3));
+
+    await(() -> committedAt(TP0, 3L), "records should be acked despite the hook throwing");
+    assertEquals(3, handled.get(), "each record handled exactly once");
+    assertEquals(3, afterCalls.get());
+  }
 }

@@ -230,4 +230,78 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
    * @return the per-partition window capacity
    */
   int maxWindowSize();
+
+  /** Generation value meaning "unknown": operations given it skip the generation check. */
+  long NO_GENERATION = -1L;
+
+  /**
+   * Returns a token identifying the partition's current window. It changes every time the partition
+   * is initialized, so a record fetched before a revoke can be told apart from the same offset
+   * fetched again after the partition is re-assigned to this consumer.
+   *
+   * @param tp the topic partition
+   * @return the current generation, or {@link #NO_GENERATION} if the partition is not tracked
+   */
+  default long generation(TopicPartition tp) {
+    return NO_GENERATION;
+  }
+
+  /**
+   * Like {@link #markInProgress(TopicPartition, long)}, but only if the partition's window is still
+   * the given generation.
+   *
+   * @param tp the topic partition
+   * @param offset the offset
+   * @param generation the generation the record was registered under
+   * @throws IllegalStateException if the partition is not tracked, its window is a different
+   *     generation, or the offset is not REGISTERED
+   */
+  default void markInProgress(TopicPartition tp, long offset, long generation) {
+    markInProgress(tp, offset);
+  }
+
+  /**
+   * Like {@link #markBatchInProgress(TopicPartition, long[])}, but only if the partition's window
+   * is still the given generation.
+   *
+   * @param tp the topic partition
+   * @param offsets the offsets
+   * @param generation the generation the batch was registered under
+   * @return number of offsets transitioned
+   * @throws IllegalStateException if the partition is not tracked or its window is a different
+   *     generation
+   */
+  default int markBatchInProgress(TopicPartition tp, long[] offsets, long generation) {
+    return markBatchInProgress(tp, offsets);
+  }
+
+  /**
+   * Like {@link #ack(TopicPartition, long)}, but only if the partition's window is still the given
+   * generation. A late ack from before a revoke must not complete the same offset in the window
+   * created when the partition came back.
+   *
+   * @param tp the topic partition
+   * @param offset the offset
+   * @param generation the generation the record was registered under
+   * @throws IllegalStateException if the partition is not tracked, its window is a different
+   *     generation, or the offset is not IN_PROGRESS
+   */
+  default void ack(TopicPartition tp, long offset, long generation) {
+    ack(tp, offset);
+  }
+
+  /**
+   * Like {@link #ackBatch(TopicPartition, long[])}, but only if the partition's window is still the
+   * given generation.
+   *
+   * @param tp the topic partition
+   * @param offsets the offsets
+   * @param generation the generation the batch was registered under
+   * @return number of offsets transitioned
+   * @throws IllegalStateException if the partition is not tracked or its window is a different
+   *     generation
+   */
+  default int ackBatch(TopicPartition tp, long[] offsets, long generation) {
+    return ackBatch(tp, offsets);
+  }
 }

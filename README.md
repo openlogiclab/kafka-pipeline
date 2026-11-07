@@ -18,7 +18,7 @@ This library packages all of that into a clean pipeline that you configure once 
 
 > **At-least-once delivery.** This library guarantees that every record is delivered to your handler at least once. It will **never** silently drop data. The tradeoff: duplicate delivery is possible after a crash (see [The Duplicate Processing Problem](#the-duplicate-processing-problem)). If you need exactly-once, implement idempotent processing in your handler.
 >
-> **Blocking under pressure, not dropping.** When internal queues fill up (misconfigured backpressure, unexpected burst, slow downstream), the poll thread **blocks** until space is available rather than discarding records. This preserves data integrity at the cost of temporary latency. A `WARNING` log is emitted when blocking occurs — if you see it in production, tune your backpressure thresholds or concurrency. See [Tuning `dispatchQueueCapacity`](#tuning-dispatchqueuecapacity) for details.
+> **Pausing under pressure, not dropping or blocking.** When internal queues fill up (misconfigured backpressure, unexpected burst, slow downstream), the affected partition is **paused** and the records that did not fit are fetched again later, rather than discarded. The poll thread itself never blocks, so heartbeats, rebalances and `stop()` keep working even when handlers are stuck. A rate-limited `WARNING` log is emitted when this happens — if you see it in production, tune your backpressure thresholds or concurrency. See [Tuning `dispatchQueueCapacity`](#tuning-dispatchqueuecapacity) for details.
 
 ## Installation
 
@@ -58,7 +58,7 @@ kafkaProps.put("value.deserializer", "org.apache.kafka.common.serialization.Stri
 KafkaPipeline<String, String> pipeline = new KafkaPipeline<>(
     KafkaPipeline.<String, String>builder()
         .consumerProperties(kafkaProps)
-        .topics("orders", "payments")
+        .topic("orders")
         .handler(record -> orderService.process(record))
         .concurrency(ThreadMode.VIRTUAL, 200)
         .build());
@@ -298,6 +298,36 @@ The high/low watermark gap is the hysteresis band. Without it, the consumer woul
 
 ## Configuration
 
+### One topic per pipeline
+
+Use `.topic("orders")` and run one `KafkaPipeline` per topic, each with its own `group.id`. Everything inside a pipeline is shared: the worker thread pool, the global backpressure watermarks and the consumer. If one pipeline serves two topics, a slow topic can occupy every worker and its backpressure pauses the other topic too.
+
+```java
+ordersProps.put("group.id", "svc-orders");
+paymentsProps.put("group.id", "svc-payments");
+
+KafkaPipeline<String, String> orders = new KafkaPipeline<>(
+    KafkaPipeline.<String, String>builder()
+        .consumerProperties(ordersProps)
+        .topic("orders")
+        .handler(record -> orderService.process(record))
+        .concurrency(ThreadMode.VIRTUAL, 200)
+        .build());
+
+KafkaPipeline<String, String> payments = new KafkaPipeline<>(
+    KafkaPipeline.<String, String>builder()
+        .consumerProperties(paymentsProps)
+        .topic("payments")
+        .handler(record -> paymentService.process(record))
+        .concurrency(ThreadMode.VIRTUAL, 50)
+        .build());
+
+orders.startAsync();
+payments.startAsync();
+```
+
+`.topics("orders-us", "orders-eu")` is still available for topics that are really the same workload (same handler, similar volume and latency), such as regional shards.
+
 ### Thread Model
 
 Two options, set explicitly when you configure concurrency:
@@ -309,6 +339,29 @@ Two options, set explicitly when you configure concurrency:
 // Virtual threads (JDK 21+) — good for I/O-bound work (DB, HTTP, etc.)
 .concurrency(ThreadMode.VIRTUAL, 500)
 ```
+
+> **Virtual threads on Java 21–23: watch out for pinning.** A virtual thread that blocks inside a `synchronized` block or method (for example a JDBC driver, an HTTP client, or your own code doing I/O while holding a monitor) *pins* its carrier OS thread. There are only as many carriers as CPU cores by default, so a few pinned handlers can stall every other virtual thread, including ones that would release the lock — which looks like a deadlock. Options: run on Java 24+ (JEP 491 removes this pinning), replace `synchronized` around blocking calls with `ReentrantLock`, or use `ThreadMode.PLATFORM`. Run with `-Djdk.tracePinnedThreads=short` to find pinning sites. The library's own worker code does not hold monitors while calling your handler.
+
+### Noisy partitions
+
+All partitions in a pipeline share one worker pool. If one partition's records are slow (a slow downstream, a hot key), it can end up holding every worker while records of other partitions wait. Cap how many workers one partition may use:
+
+```java
+.concurrency(ThreadMode.VIRTUAL, 200)
+.maxConcurrencyPerPartition(20)   // ~2 × 200 workers / 20 partitions
+```
+
+A worker skips a partition that is already at its limit and takes the next partition with work, so the cap costs nothing while traffic is spread evenly.
+
+The limit never drops below a fair share of the pool: the enforced value is `max(n, ⌈concurrency ÷ assigned partitions⌉)`, recomputed on every rebalance. With `concurrency(200)` and `maxConcurrencyPerPartition(20)`:
+
+| Partitions assigned to this instance | Enforced limit |
+|---|---|
+| 1 | 200 (the whole pool) |
+| 4 | 50 |
+| 20 or more | 20 |
+
+So a pod that ends up with a single partition still uses every worker, and the cap only bites once there are enough partitions to compete. Applies to per-record mode only; batch mode submits at most one batch per partition per poll.
 
 ### Error Handling
 
@@ -350,7 +403,7 @@ For high-throughput scenarios where per-record overhead matters — bulk inserts
 KafkaPipeline<String, String> pipeline = new KafkaPipeline<>(
     KafkaPipeline.<String, String>builder()
         .consumerProperties(kafkaProps)
-        .topics("events")
+        .topic("events")
         .batchHandler((partition, records) -> {
             bulkInsert(records);
         })
@@ -551,7 +604,7 @@ app.get("/health", ctx -> {
 |---|---|---|
 | Throughput drops to zero | `backpressureStatus`, `inFlightRecords` | Backpressure triggered — workers slower than poll rate |
 | Consumer lag growing | `partitionLags`, `retryAttempts` | Retry storms or slow handler |
-| Frequent rebalances | `rebalanceCount`, `drainTimeouts` | `max.poll.interval.ms` too low for handler time |
+| Frequent rebalances | `rebalanceCount`, `drainTimeouts` | Pods restarting or scaling without static membership, or `session.timeout.ms` too low (see [Running in Production](#running-in-production)) |
 | Data loss suspected | `recordsSkipped`, `dlqSuccesses` | Fallback=SKIP dropping records |
 | Memory pressure | `inFlightRecords`, `inFlightBytes` | Backpressure thresholds too high |
 
@@ -574,7 +627,7 @@ pipeline.awaitShutdown();
 | Option | Default | Description |
 |---|---|---|
 | `consumerProperties` | *required* | Standard Kafka consumer properties (`enable.auto.commit` is forced to `false`) |
-| `topics` | *required* | Topics to subscribe to |
+| `topic` / `topics` | *required* | Topic to subscribe to; one per pipeline is recommended (see [One topic per pipeline](#one-topic-per-pipeline)) |
 | `handler` | *one required* | Your `RecordHandler<K,V>` for per-record mode |
 | `batchHandler` | *one required* | Your `BatchRecordHandler<K,V>` for batch mode |
 | `concurrency(ThreadMode, int)` | *required* | Thread model and worker count |
@@ -586,9 +639,10 @@ pipeline.awaitShutdown();
 | `lifecycleHook` | no-op | Before/after/error callbacks (per-record mode only) |
 | `commitInterval` | 5s | How often to commit offsets async |
 | `drainTimeout` | 30s | Max wait for in-flight records during rebalance |
-| `shutdownTimeout` | 30s | Max wait for workers during shutdown |
+| `shutdownTimeout` | 30s | Max wait for records already being processed to finish on shutdown; queued records that haven't started are redelivered on the next start |
 | `pollTimeout` | 100ms | Kafka consumer poll timeout |
 | `dispatchQueueCapacity` | 500 | Bounded queue capacity for pending work (see below) |
+| `maxConcurrencyPerPartition` | 0 (unlimited) | Max records of one partition processed at once, so a slow partition can't take every worker (per-record mode; see [Noisy partitions](#noisy-partitions)) |
 
 ### Tuning `dispatchQueueCapacity`
 
@@ -605,19 +659,21 @@ kafkaProps.put("max.poll.records", "1000");
 
 KafkaPipeline.<String, String>builder()
     .consumerProperties(kafkaProps)
-    .topics("events")
+    .topic("events")
     .handler(record -> process(record))
     .concurrency(ThreadMode.VIRTUAL, 200)
     .dispatchQueueCapacity(1000)
     .build();
 ```
 
-When the queue fills up, the dispatch call **blocks** the poll thread until space is available. This acts as a runtime safety net — you'll see a `WARNING` log if it happens:
+When the queue fills up, the poll thread does **not** block. Records that don't fit stay unacknowledged, the consumer seeks back to the first of them and pauses that partition; other partitions keep flowing. The partition resumes once its queue has drained to half capacity, and the skipped records are fetched again — nothing is dropped. You'll see a rate-limited `WARNING` log if this happens:
 
 ```
-WARNING: Dispatch queue full for topic-0, blocking until space is available
-         — review backpressure thresholds vs dispatchQueueCapacity
+WARNING: Dispatch queue full for topic-0, pausing the partition until workers catch up
+         (N times since last warning) — consider more concurrency or a larger dispatchQueueCapacity
 ```
+
+Because the poll thread keeps running, heartbeats, rebalances and `stop()` are unaffected even if every handler is stuck.
 
 > **Warning:** If you see this message in production, it typically means backpressure thresholds are set too high relative to processing speed, or `dispatchQueueCapacity` is too low. Fix the root cause — don't just increase the queue capacity, as oversized queues waste memory and reduce backpressure sensitivity (records sit idle in the queue longer before backpressure kicks in).
 
@@ -630,7 +686,7 @@ A full example tying `dispatchQueueCapacity`, `max.poll.records`, and backpressu
 
 KafkaPipeline.<String, String>builder()
     .consumerProperties(kafkaProps)
-    .topics("orders")
+    .topic("orders")
     .handler(record -> orderService.process(record))
     .concurrency(ThreadMode.VIRTUAL, 100)
     .backpressure(BackpressureConfig.builder()
@@ -642,7 +698,42 @@ KafkaPipeline.<String, String>builder()
     .build();
 ```
 
-In this setup, backpressure pauses the poll loop well before the dispatch queue fills up. The queue only blocks as a last resort if something unexpected happens at runtime.
+In this setup, backpressure pauses the poll loop well before the dispatch queue fills up. The queue-full pause only kicks in as a last resort if something unexpected happens at runtime.
+
+## Running in Production
+
+### Kafka consumer settings
+
+Pass these through `consumerProperties`:
+
+```java
+// Only partitions that actually move are revoked during a rebalance; the rest keep processing.
+kafkaProps.put("partition.assignment.strategy",
+    "org.apache.kafka.clients.consumer.CooperativeStickyAssignor");
+
+// Static membership: a restarting pod rejoins with the same identity and keeps its partitions,
+// so a rolling deploy does not trigger a rebalance per pod. Must be unique and stable per
+// instance, e.g. the StatefulSet pod name exposed through the Kubernetes downward API.
+kafkaProps.put("group.instance.id", System.getenv("POD_NAME"));
+kafkaProps.put("session.timeout.ms", "45000"); // longer than a pod restart takes
+```
+
+`max.poll.interval.ms` does not need to cover handler time. The poll thread keeps calling `poll()` while records are processed, and pauses partitions instead of blocking when queues or windows fill up. It only has to cover `drainTimeout` (default 30s), which runs inside `poll()` during a rebalance.
+
+### Scaling
+
+- **Partitions cap parallelism across pods.** Each partition belongs to one pod in the group, so pods beyond the partition count sit idle. Create topics with headroom (for example 2–4× the most pods you expect); adding partitions later changes which partition each key maps to.
+- **Scale on consumer lag, not CPU.** I/O-bound handlers keep CPU low while lag grows. KEDA's Kafka scaler can scale a Deployment on lag directly.
+- **Get more out of each pod first.** `ThreadMode.VIRTUAL` and batch mode with bulk writes downstream usually raise throughput per pod more cheaply than adding pods.
+- **One pipeline per workload.** See [One topic per pipeline](#one-topic-per-pipeline) and [Noisy partitions](#noisy-partitions).
+
+### Kubernetes CPU limits
+
+The JVM sizes itself from the container's CPU limit: the number of carrier threads that run virtual threads, GC threads and `availableProcessors()` all follow it. With a limit of `1` or less (e.g. `500m`), every virtual thread shares a single carrier, and CFS throttling adds latency spikes.
+
+- Give pods at least 2 CPUs, or set the processor count explicitly with `-XX:ActiveProcessorCount=N`.
+- Pinning threads to cores (CPU affinity) is not supported. Containers with CPU limits run on time slices across cores, and virtual threads move between carriers, so pinning would not hold.
+- Size the heap from the container limit, e.g. `-XX:MaxRAMPercentage=75`, and keep backpressure watermarks well under it.
 
 ## Offset Management
 
@@ -686,7 +777,7 @@ KafkaPipeline.<String, String>builder()
 
 A larger window gives slow records more slack before the partition pauses, but uses more memory (roughly 50 bytes per entry) and means more records are reprocessed after a crash.
 
-On rebalance, the pipeline drains in-flight records (up to `drainTimeout`), does a final sync commit, then hands the partition off cleanly.
+On rebalance, the pipeline drains in-flight records (up to `drainTimeout`), does a final sync commit, then hands the partition off cleanly. A record that is still running when `drainTimeout` expires is not acked when it finishes, even if the partition has come back to this same consumer in the meantime: each assignment gets its own generation, and results from an older one are discarded. That record is redelivered from the committed offset instead.
 
 ### The Duplicate Processing Problem
 
@@ -722,8 +813,12 @@ The library doesn't try to solve idempotency for you — that's deeply tied to y
 ## Running Tests
 
 ```bash
-./gradlew test
+./gradlew test               # unit tests
+./gradlew integrationTest    # against a real Kafka broker in Docker (Testcontainers)
+./gradlew check              # both, plus formatting checks
 ```
+
+Integration tests are skipped automatically when Docker is not available.
 
 ## Contributing
 

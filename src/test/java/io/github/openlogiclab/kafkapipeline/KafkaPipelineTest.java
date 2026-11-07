@@ -165,47 +165,6 @@ class KafkaPipelineTest {
   class PollLoopBranches {
 
     @Test
-    void dispatchQueueFull_blocksUntilSpaceAvailable() throws Exception {
-      CopyOnWriteArrayList<String> processed = new CopyOnWriteArrayList<>();
-      CountDownLatch blockLatch = new CountDownLatch(1);
-
-      PipelineConfig<String, String> config =
-          baseBuilder()
-              .concurrency(ThreadMode.PLATFORM, 1)
-              .dispatchQueueCapacity(2)
-              .handler(
-                  record -> {
-                    if (record.offset() == 0L) {
-                      try {
-                        blockLatch.await(10, TimeUnit.SECONDS);
-                      } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                      }
-                    }
-                    processed.add(record.value());
-                  })
-              .build();
-
-      pipeline = new KafkaPipeline<>(config, mockConsumer);
-      startAndAssign(TP0);
-
-      for (int i = 0; i < 5; i++) {
-        mockConsumer.addRecord(new ConsumerRecord<>(TOPIC, 0, i, "key-" + i, "value-" + i));
-      }
-
-      Thread.sleep(500);
-      blockLatch.countDown();
-
-      assertTrue(
-          awaitCondition(() -> processed.size() == 5, Duration.ofSeconds(5)),
-          "All records should eventually be processed, got " + processed.size());
-
-      pipeline.stop();
-      pipeline.awaitShutdown();
-      assertEquals(5, processed.size(), "No records should be dropped with blocking dispatch");
-    }
-
-    @Test
     void emptyPollReturnsNoRecords() throws Exception {
       AtomicInteger handlerCalls = new AtomicInteger();
       PipelineConfig<String, String> config =

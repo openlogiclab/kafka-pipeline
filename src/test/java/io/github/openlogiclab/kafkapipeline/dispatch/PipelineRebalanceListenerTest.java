@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.openlogiclab.kafkapipeline.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.time.Duration;
 import java.util.Collections;
@@ -62,6 +63,37 @@ class PipelineRebalanceListenerTest {
             mockConsumer,
             Duration.ofSeconds(5),
             NoOpMetricsCollector.INSTANCE);
+  }
+
+  @Test
+  void revokeAfterShutdown_clearsStateWithoutDrainingOrCommitting() {
+    mockConsumer.assign(List.of(TP0));
+    mockConsumer.updateBeginningOffsets(Map.of(TP0, 0L));
+    listener.onPartitionsAssigned(List.of(TP0));
+    tracker.register(TP0, 0L);
+    tracker.markInProgress(TP0, 0L); // a record whose worker was already stopped
+
+    listener.shutdown();
+    long start = System.nanoTime();
+    assertDoesNotThrow(() -> listener.onPartitionsRevoked(List.of(TP0)));
+
+    assertTrue(
+        System.nanoTime() - start < java.util.concurrent.TimeUnit.SECONDS.toNanos(1),
+        "must not wait drainTimeout for workers that are already stopped");
+    assertEquals(0, commitSyncCalls.get(), "final commit already ran before close");
+    assertEquals(OffsetTracker.NO_GENERATION, tracker.generation(TP0), "partition cleared");
+  }
+
+  @Test
+  void assignedQueue_carriesTheTrackersGeneration() {
+    mockConsumer.assign(List.of(TP0));
+    mockConsumer.updateBeginningOffsets(Map.of(TP0, 0L));
+    listener.onPartitionsAssigned(List.of(TP0));
+    dispatcher.dispatch(TP0, new ConsumerRecord<>("test", 0, 0L, "k", "v"));
+
+    RecordDispatcher.PollResult<String, String> polled =
+        dispatcher.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS);
+    assertEquals(tracker.generation(TP0), polled.generation());
   }
 
   @Nested

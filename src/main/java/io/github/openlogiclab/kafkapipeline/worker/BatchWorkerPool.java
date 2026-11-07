@@ -25,6 +25,7 @@ import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
@@ -45,6 +46,10 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   private final OffsetTracker offsetTracker;
   private final InFlightCounter counter;
   private final PipelineMetricsCollector metricsCollector;
+
+  // Virtual-thread executors start a thread per task with no upper bound, so concurrency is
+  // enforced here instead. Null for platform threads, where the fixed-size pool already bounds it.
+  private final Semaphore handlerPermits;
 
   /**
    * Creates a new batch worker pool.
@@ -75,6 +80,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     this.offsetTracker = offsetTracker;
     this.counter = counter;
     this.metricsCollector = metricsCollector;
+    this.handlerPermits = threadMode == ThreadMode.VIRTUAL ? new Semaphore(concurrency) : null;
   }
 
   @Override
@@ -104,6 +110,13 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         batchBytes += RecordSize.estimateBytes(record);
       }
 
+      if (!hasTaskQueueRoom()) {
+        // Never block the poll thread on a full task queue: fetch the batch again once it drains.
+        reportTaskQueueFull(tp);
+        if (rejected.isEmpty()) rejected = new HashMap<>();
+        rejected.put(tp, offsets[0]);
+        continue;
+      }
       try {
         offsetTracker.registerBatch(tp, offsets);
       } catch (WindowFullException e) {
@@ -114,18 +127,54 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       counter.registered(batch.size(), batchBytes);
 
       long totalBytes = batchBytes;
-      executor.submit(() -> processBatch(tp, batch, offsets, totalBytes));
+      // Captured on the poll thread, where rebalance callbacks also run, so it is exactly the
+      // generation the batch was registered under.
+      long generation = offsetTracker.generation(tp);
+      executor.submit(() -> processBatch(tp, batch, offsets, totalBytes, generation));
     }
     return rejected;
   }
 
+  @Override
+  public boolean canResume(TopicPartition tp) {
+    return taskQueueDrained();
+  }
+
   private void processBatch(
-      TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets, long totalBytes) {
+      TopicPartition tp,
+      List<ConsumerRecord<K, V>> batch,
+      long[] offsets,
+      long totalBytes,
+      long generation) {
+    try {
+      if (handlerPermits == null) {
+        process(tp, batch, offsets, generation);
+      } else {
+        handlerPermits.acquire();
+        try {
+          process(tp, batch, offsets, generation);
+        } finally {
+          handlerPermits.release();
+        }
+      }
+    } catch (InterruptedException e) {
+      // Shutdown while waiting for a permit: the batch was never started, so leave its offsets
+      // unacked and let it be redelivered.
+      Thread.currentThread().interrupt();
+    } finally {
+      // Always release the in-flight slots, even if the partition was revoked mid-processing and
+      // the ack below failed; otherwise backpressure would never drain.
+      counter.completed(batch.size(), totalBytes);
+    }
+  }
+
+  private void process(
+      TopicPartition tp, List<ConsumerRecord<K, V>> batch, long[] offsets, long generation) {
     long firstOffset = offsets[0];
     long lastOffset = offsets[offsets.length - 1];
 
     try {
-      offsetTracker.markBatchInProgress(tp, offsets);
+      offsetTracker.markBatchInProgress(tp, offsets, generation);
     } catch (IllegalStateException e) {
       logger.log(
           System.Logger.Level.WARNING,
@@ -134,7 +183,6 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
           lastOffset,
           tp,
           e.getMessage());
-      counter.completed(batch.size(), totalBytes);
       return;
     }
 
@@ -144,8 +192,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         retryExecutor.executeWithRetries(attempt -> handler.handleBatch(tp, batch), tp, desc);
 
     if (lastError == null) {
-      offsetTracker.ackBatch(tp, offsets);
-      counter.completed(batch.size(), totalBytes);
+      ackBatch(tp, offsets, generation, desc);
       metricsCollector.recordProcessed(batch.size());
       return;
     }
@@ -155,7 +202,6 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       // not committed and the batch is redelivered.
       logger.log(
           System.Logger.Level.DEBUG, "Interrupted while processing {0} {1}, not acking", tp, desc);
-      counter.completed(batch.size(), totalBytes);
       return;
     }
 
@@ -163,10 +209,31 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     RetryExecutor.FailureResolution resolution =
         retryExecutor.handleFailure(batch, tp, lastError, desc);
     if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
-      offsetTracker.markFailed(tp);
       metricsCollector.recordFailed(batch.size());
+      if (ackBatch(tp, offsets, generation, desc)) offsetTracker.markFailed(tp);
+    } else {
+      ackBatch(tp, offsets, generation, desc);
     }
-    offsetTracker.ackBatch(tp, offsets);
-    counter.completed(batch.size(), totalBytes);
+  }
+
+  /**
+   * Acks a batch. Returns false if the partition is no longer tracked, which happens when a batch
+   * finishes after its partition was revoked and the drain timeout expired. The new owner
+   * re-consumes it from the last committed offset, so there is nothing more to do here.
+   */
+  private boolean ackBatch(TopicPartition tp, long[] offsets, long generation, String desc) {
+    try {
+      offsetTracker.ackBatch(tp, offsets, generation);
+      return true;
+    } catch (IllegalStateException e) {
+      logger.log(
+          System.Logger.Level.INFO,
+          "Finished {0} {1} but could not ack it ({2}); the partition was likely revoked and the"
+              + " batch will be redelivered to its new owner",
+          tp,
+          desc,
+          e.getMessage());
+      return false;
+    }
   }
 }

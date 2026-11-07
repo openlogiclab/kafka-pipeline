@@ -78,8 +78,10 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  *   <li><b>Lifecycle hooks</b> — {@link
  *       io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook} for deduplication,
  *       metrics, tracing, or audit logging
- *   <li><b>Graceful shutdown</b> — drains in-flight records and commits offsets on {@link #stop()},
- *       SIGTERM, or rebalance
+ *   <li><b>Graceful shutdown</b> — on {@link #stop()} or SIGTERM, records already being processed
+ *       get up to {@code shutdownTimeout} to finish and completed offsets are committed; records
+ *       still queued are not started and are redelivered on the next start. On rebalance, in-flight
+ *       records of revoked partitions get up to {@code drainTimeout}.
  * </ul>
  *
  * <h2>Quick Start</h2>
@@ -88,7 +90,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  * KafkaPipeline<String, String> pipeline = new KafkaPipeline<>(
  *     KafkaPipeline.<String, String>builder()
  *         .consumerProperties(kafkaProps)
- *         .topics("orders", "payments")
+ *         .topic("orders")
  *         .handler(record -> myService.process(record))
  *         .concurrency(ThreadMode.VIRTUAL, 200)
  *         .errorStrategy(ErrorStrategy.<String, String>builder()
@@ -161,7 +163,11 @@ public final class KafkaPipeline<K, V> {
     this.backpressure = buildBackpressureController(config, counter);
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
     this.retryExecutor = new RetryExecutor<>(config.errorStrategy(), metricsCollector);
-    this.dispatcher = new RecordDispatcher<>(config.dispatchQueueCapacity());
+    this.dispatcher =
+        new RecordDispatcher<>(
+            config.dispatchQueueCapacity(),
+            config.maxConcurrencyPerPartition(),
+            config.concurrency());
     this.workerPool =
         buildWorkerPool(
             config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
@@ -190,7 +196,11 @@ public final class KafkaPipeline<K, V> {
     this.backpressure = buildBackpressureController(config, counter);
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
     this.retryExecutor = new RetryExecutor<>(config.errorStrategy(), metricsCollector);
-    this.dispatcher = new RecordDispatcher<>(config.dispatchQueueCapacity());
+    this.dispatcher =
+        new RecordDispatcher<>(
+            config.dispatchQueueCapacity(),
+            config.maxConcurrencyPerPartition(),
+            config.concurrency());
     this.workerPool =
         buildWorkerPool(
             config, retryExecutor, offsetTracker, dispatcher, counter, metricsCollector);
@@ -250,8 +260,9 @@ public final class KafkaPipeline<K, V> {
   }
 
   /**
-   * Signals the pipeline to stop gracefully. The poll loop will exit, workers will drain, and
-   * offsets will be committed.
+   * Signals the pipeline to stop gracefully. The poll loop exits, records already being processed
+   * get up to {@code shutdownTimeout} to finish, and completed offsets are committed. Queued
+   * records that have not started are not processed; they are redelivered on the next start.
    */
   public void stop() {
     if (running.compareAndSet(true, false)) {
@@ -345,7 +356,7 @@ public final class KafkaPipeline<K, V> {
       consumer = new KafkaConsumer<>(props);
     }
 
-    pauseController = new PartitionPauseController(consumer, offsetTracker);
+    pauseController = new PartitionPauseController(consumer, offsetTracker, workerPool::canResume);
 
     committer =
         new PeriodicCommitter(offsetTracker, consumer, config.commitInterval(), metricsCollector);

@@ -53,6 +53,8 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
  * @param pollTimeout Kafka consumer poll timeout
  * @param dispatchQueueCapacity capacity of per-partition dispatch queues
  * @param maxWindowSize max tracked offsets per partition before that partition is paused
+ * @param maxConcurrencyPerPartition max records of one partition processed at once (per-record
+ *     mode); 0 means unlimited
  */
 public record PipelineConfig<K, V>(
     Properties consumerProperties,
@@ -72,7 +74,8 @@ public record PipelineConfig<K, V>(
     Duration shutdownTimeout,
     Duration pollTimeout,
     int dispatchQueueCapacity,
-    int maxWindowSize) {
+    int maxWindowSize,
+    int maxConcurrencyPerPartition) {
   /** Validates configuration constraints. */
   public PipelineConfig {
     Objects.requireNonNull(consumerProperties, "consumerProperties");
@@ -99,6 +102,10 @@ public record PipelineConfig<K, V>(
     }
     if (dispatchQueueCapacity <= 0) {
       throw new IllegalArgumentException("dispatchQueueCapacity must be positive");
+    }
+    if (maxConcurrencyPerPartition < 0) {
+      throw new IllegalArgumentException(
+          "maxConcurrencyPerPartition must be >= 0, got " + maxConcurrencyPerPartition);
     }
     if (maxWindowSize <= 0) {
       throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
@@ -165,6 +172,7 @@ public record PipelineConfig<K, V>(
     private Duration shutdownTimeout = Duration.ofSeconds(30);
     private Duration pollTimeout = Duration.ofMillis(100);
     private int dispatchQueueCapacity = 500;
+    private int maxConcurrencyPerPartition = 0;
     private int maxWindowSize = 10_000;
 
     private Builder() {}
@@ -182,7 +190,27 @@ public record PipelineConfig<K, V>(
     }
 
     /**
-     * Topics to subscribe to. At least one is required.
+     * The topic to subscribe to. This is the recommended way to configure a pipeline: one topic per
+     * pipeline, so each topic gets its own thread pool, backpressure and consumer group.
+     *
+     * @param topic the topic
+     * @return this builder
+     * @see #topics(String...)
+     */
+    public Builder<K, V> topic(String topic) {
+      this.topics = List.of(Objects.requireNonNull(topic, "topic"));
+      return this;
+    }
+
+    /**
+     * Subscribes one pipeline to several topics. Prefer {@link #topic(String)} with one pipeline
+     * per topic.
+     *
+     * <p>Topics in the same pipeline share the worker thread pool, the global backpressure
+     * watermarks and the consumer: a slow topic can occupy every worker, and backpressure caused by
+     * one topic pauses all of them. Only use this for topics that are the same workload (for
+     * example regional shards such as {@code orders-us} and {@code orders-eu}). Run a separate
+     * pipeline, with its own {@code group.id}, for topics that need isolation.
      *
      * @param topics the topics
      * @return this builder
@@ -193,7 +221,8 @@ public record PipelineConfig<K, V>(
     }
 
     /**
-     * Topics to subscribe to. At least one is required.
+     * Subscribes one pipeline to several topics. Prefer {@link #topic(String)}; see {@link
+     * #topics(List)} for what topics in one pipeline share.
      *
      * @param topics the topics
      * @return this builder
@@ -397,13 +426,14 @@ public record PipelineConfig<K, V>(
      * </ul>
      *
      * <p>A good starting point is Kafka's {@code max.poll.records} (default 500). If the queue
-     * fills up, the dispatch/submit call blocks the poll thread (with a WARNING log) until space is
-     * available — this acts as a safety net but should not happen under normal operation when
-     * backpressure thresholds are configured correctly.
+     * fills up, the poll thread never blocks: that partition is paused, the records that did not
+     * fit are fetched again later (seek back to the first one), and a rate-limited WARNING is
+     * logged. The partition resumes once its queue has drained to half capacity. This is a safety
+     * net and should be rare when backpressure thresholds are configured correctly.
      *
      * <p><b>Warning:</b> setting this too high wastes memory and reduces backpressure sensitivity
      * (records sit in the queue longer before backpressure reacts). Setting it too low causes
-     * frequent blocking of the poll thread, which degrades throughput.
+     * frequent pause/refetch cycles, which waste fetch bandwidth and degrade throughput.
      *
      * <p>Default: {@code 500} (matches Kafka's default {@code max.poll.records}).
      *
@@ -438,6 +468,33 @@ public record PipelineConfig<K, V>(
     }
 
     /**
+     * Maximum number of records from the same partition that may be processed at the same time
+     * (per-record mode only).
+     *
+     * <p>All partitions share one worker pool. Without a limit, a partition whose records are slow
+     * (a slow downstream, a hot key range) can occupy every worker while records of other
+     * partitions wait in their queues. With a limit of {@code n}, at most {@code n} workers work on
+     * one partition; the rest stay available to the others.
+     *
+     * <p>The limit never drops below a fair share of the pool: the enforced value is {@code
+     * max(max, ceil(concurrency / assignedPartitions))}, recomputed on every rebalance. So with a
+     * single assigned partition all workers can still be used, and the configured value only bites
+     * once there are enough partitions to share the pool. A good starting point is about {@code 2 ×
+     * concurrency / expectedPartitionsPerInstance}.
+     *
+     * <p>Ignored in batch mode, where each poll submits at most one batch per partition.
+     *
+     * <p>Default: {@code 0} (unlimited).
+     *
+     * @param max the per-partition limit, or 0 for no limit
+     * @return this builder
+     */
+    public Builder<K, V> maxConcurrencyPerPartition(int max) {
+      this.maxConcurrencyPerPartition = max;
+      return this;
+    }
+
+    /**
      * Builds an immutable {@link PipelineConfig}.
      *
      * @return the built configuration
@@ -468,7 +525,8 @@ public record PipelineConfig<K, V>(
           shutdownTimeout,
           pollTimeout,
           dispatchQueueCapacity,
-          maxWindowSize);
+          maxWindowSize,
+          maxConcurrencyPerPartition);
     }
   }
 }
