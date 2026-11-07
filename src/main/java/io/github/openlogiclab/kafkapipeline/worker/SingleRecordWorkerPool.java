@@ -148,7 +148,11 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         if (Thread.currentThread().isInterrupted()) break;
         RecordDispatcher.PollResult<K, V> result = dispatcher.poll(100, MILLISECONDS);
         if (result == null) continue;
-        processRecord(result.partition(), result.record());
+        try {
+          processRecord(result.partition(), result.record());
+        } finally {
+          dispatcher.release(result);
+        }
       } catch (Exception e) {
         logger.log(System.Logger.Level.ERROR, "Unexpected error in worker loop", e);
       }

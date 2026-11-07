@@ -17,6 +17,7 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -46,6 +47,139 @@ class RecordDispatcherTest {
 
   private ConsumerRecord<String, String> record(TopicPartition tp, long offset) {
     return new ConsumerRecord<>(tp.topic(), tp.partition(), offset, "key", "value-" + offset);
+  }
+
+  @Nested
+  class PerPartitionLimit {
+
+    private RecordDispatcher<String, String> capped;
+
+    @BeforeEach
+    void setUp() {
+      capped = new RecordDispatcher<>(100, 2);
+      capped.addPartition(TP0);
+      capped.addPartition(TP1);
+    }
+
+    @Test
+    void fairShareFloor_tracksAssignedPartitions() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 2, 10);
+      assertEquals(2, d.effectivePartitionLimit(), "no partitions yet");
+      d.addPartition(TP0);
+      assertEquals(10, d.effectivePartitionLimit(), "one partition gets the whole pool");
+      d.addPartition(TP1);
+      assertEquals(5, d.effectivePartitionLimit());
+      d.addPartition(TP2);
+      assertEquals(4, d.effectivePartitionLimit(), "ceil(10 / 3)");
+      d.removePartition(TP2);
+      assertEquals(5, d.effectivePartitionLimit());
+    }
+
+    @Test
+    void fairShareFloor_neverBelowConfiguredLimit() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 3, 4);
+      d.addPartition(TP0);
+      d.addPartition(TP1);
+      d.addPartition(TP2);
+      assertEquals(3, d.effectivePartitionLimit(), "ceil(4 / 3) = 2 < 3");
+    }
+
+    @Test
+    void singlePartition_withFloor_handsOutUpToConcurrencyRecords() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 1, 3);
+      d.addPartition(TP0);
+      for (long i = 0; i < 5; i++) d.dispatch(TP0, record(TP0, i));
+      for (int i = 0; i < 3; i++) assertNotNull(d.poll(10, TimeUnit.MILLISECONDS));
+      assertNull(d.poll(10, TimeUnit.MILLISECONDS), "limit is 3 with one partition");
+    }
+
+    @Test
+    void withoutALimit_fairShareIsNotApplied() {
+      RecordDispatcher<String, String> d = new RecordDispatcher<>(100, 0, 10);
+      d.addPartition(TP0);
+      assertEquals(0, d.effectivePartitionLimit());
+    }
+
+    @Test
+    void rejectsNegativeConcurrency() {
+      assertThrows(IllegalArgumentException.class, () -> new RecordDispatcher<>(10, 1, -1));
+    }
+
+    @Test
+    void rejectsNegativeLimit() {
+      assertThrows(IllegalArgumentException.class, () -> new RecordDispatcher<>(10, -1));
+    }
+
+    @Test
+    void partitionAtItsLimit_isSkippedUntilARecordIsReleased() {
+      for (long i = 0; i < 5; i++) capped.dispatch(TP0, record(TP0, i));
+      capped.dispatch(TP1, record(TP1, 0));
+
+      List<RecordDispatcher.PollResult<String, String>> polled = new ArrayList<>();
+      for (int i = 0; i < 3; i++) polled.add(capped.poll(10, TimeUnit.MILLISECONDS));
+      assertEquals(
+          2, polled.stream().filter(r -> r.partition().equals(TP0)).count(), "TP0 limited to 2");
+      assertEquals(1, polled.stream().filter(r -> r.partition().equals(TP1)).count());
+      assertEquals(2, capped.activeRecords(TP0));
+
+      assertNull(capped.poll(10, TimeUnit.MILLISECONDS), "TP0 is at its limit, TP1 is empty");
+
+      RecordDispatcher.PollResult<String, String> tp0 =
+          polled.stream().filter(r -> r.partition().equals(TP0)).findFirst().orElseThrow();
+      capped.release(tp0);
+      assertEquals(1, capped.activeRecords(TP0));
+      RecordDispatcher.PollResult<String, String> next = capped.poll(10, TimeUnit.MILLISECONDS);
+      assertNotNull(next);
+      assertEquals(TP0, next.partition());
+      assertEquals(2, capped.activeRecords(TP0));
+    }
+
+    @Test
+    void release_wakesAWorkerWaitingOnALimitedPartition() throws Exception {
+      for (long i = 0; i < 3; i++) capped.dispatch(TP0, record(TP0, i));
+      RecordDispatcher.PollResult<String, String> first = capped.poll(10, TimeUnit.MILLISECONDS);
+      capped.poll(10, TimeUnit.MILLISECONDS);
+
+      AtomicReference<RecordDispatcher.PollResult<String, String>> got = new AtomicReference<>();
+      Thread waiter = Thread.ofPlatform().start(() -> got.set(capped.poll(10, TimeUnit.SECONDS)));
+      Thread.sleep(100);
+      assertNull(got.get(), "third record must wait while TP0 is at its limit");
+
+      long start = System.nanoTime();
+      capped.release(first);
+      waiter.join(5_000);
+      assertNotNull(got.get());
+      assertEquals(2L, got.get().record().offset());
+      assertTrue(
+          System.nanoTime() - start < TimeUnit.SECONDS.toNanos(2),
+          "release should wake the waiting worker, not leave it to the timeout");
+    }
+
+    @Test
+    void releaseAfterRevokeAndReassign_doesNotTouchTheNewQueuesCount() {
+      capped.dispatch(TP0, record(TP0, 0));
+      RecordDispatcher.PollResult<String, String> old = capped.poll(10, TimeUnit.MILLISECONDS);
+      capped.removePartition(TP0);
+      capped.addPartition(TP0);
+      capped.dispatch(TP0, record(TP0, 1));
+      capped.poll(10, TimeUnit.MILLISECONDS);
+      assertEquals(1, capped.activeRecords(TP0));
+
+      capped.release(old);
+      assertEquals(1, capped.activeRecords(TP0), "stale release must not free a new slot");
+    }
+
+    @Test
+    void withoutALimit_releaseIsANoOpAndActiveIsNotTracked() {
+      dispatcher.addPartition(TP0);
+      dispatcher.dispatch(TP0, record(TP0, 0));
+      RecordDispatcher.PollResult<String, String> r = dispatcher.poll(10, TimeUnit.MILLISECONDS);
+      assertNull(r.lane());
+      assertEquals(0, dispatcher.activeRecords(TP0));
+      dispatcher.release(r);
+      assertEquals(0, dispatcher.activeRecords(TP0));
+      assertEquals(0, dispatcher.activeRecords(TP2), "unknown partition");
+    }
   }
 
   @Nested

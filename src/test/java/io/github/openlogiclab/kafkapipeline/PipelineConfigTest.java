@@ -53,6 +53,16 @@ class PipelineConfigTest {
   }
 
   @Test
+  void maxConcurrencyPerPartition_defaultsToUnlimitedAndRejectsNegative() {
+    assertEquals(0, minimalBuilder().build().maxConcurrencyPerPartition());
+    assertEquals(
+        5, minimalBuilder().maxConcurrencyPerPartition(5).build().maxConcurrencyPerPartition());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> minimalBuilder().maxConcurrencyPerPartition(-1).build());
+  }
+
+  @Test
   void topics_stillSupportsSeveralTopics() {
     assertEquals(
         List.of("orders-us", "orders-eu"),
