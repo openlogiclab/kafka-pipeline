@@ -213,4 +213,21 @@ public sealed interface OffsetTracker permits UnorderedOffsetTracker {
    * @return failure count
    */
   int failureCount(TopicPartition tp);
+
+  /**
+   * Number of entries currently held in the partition's window, including completed offsets that
+   * are waiting behind an unfinished one.
+   *
+   * @param tp the topic partition
+   * @return window size, or 0 if the partition is not tracked
+   */
+  int windowSize(TopicPartition tp);
+
+  /**
+   * Maximum number of entries a partition window can hold before registration fails with {@link
+   * WindowFullException}.
+   *
+   * @return the per-partition window capacity
+   */
+  int maxWindowSize();
 }

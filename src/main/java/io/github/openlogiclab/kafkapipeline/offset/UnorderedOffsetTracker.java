@@ -36,8 +36,24 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   private final ConcurrentHashMap<TopicPartition, PartitionWindow> partitions =
       new ConcurrentHashMap<>();
 
+  private final int maxWindowSize;
+
   /** Creates a new unordered offset tracker. */
-  public UnorderedOffsetTracker() {}
+  public UnorderedOffsetTracker() {
+    this(PartitionWindow.DEFAULT_MAX_WINDOW_SIZE);
+  }
+
+  /**
+   * Creates a tracker whose partition windows hold at most {@code maxWindowSize} entries.
+   *
+   * @param maxWindowSize per-partition window capacity
+   */
+  public UnorderedOffsetTracker(int maxWindowSize) {
+    if (maxWindowSize <= 0) {
+      throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
+    }
+    this.maxWindowSize = maxWindowSize;
+  }
 
   @Override
   public void register(TopicPartition tp, long offset) {
@@ -118,7 +134,8 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
 
   @Override
   public void initPartition(TopicPartition tp, long startOffset) {
-    PartitionWindow existing = partitions.putIfAbsent(tp, new PartitionWindow(startOffset));
+    PartitionWindow existing =
+        partitions.putIfAbsent(tp, new PartitionWindow(startOffset, maxWindowSize));
     if (existing != null) {
       throw new IllegalStateException(
           "Partition " + tp + " already initialized. Call clearPartition first.");
@@ -188,6 +205,17 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   public int failureCount(TopicPartition tp) {
     PartitionWindow window = partitions.get(tp);
     return window != null ? window.failureCount() : 0;
+  }
+
+  @Override
+  public int windowSize(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.windowSize() : 0;
+  }
+
+  @Override
+  public int maxWindowSize() {
+    return maxWindowSize;
   }
 
   private PartitionWindow getOrThrow(TopicPartition tp) {

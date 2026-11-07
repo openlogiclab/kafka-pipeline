@@ -112,6 +112,16 @@ class KafkaPipelineTest {
     }
 
     @Test
+    void publicConstructor_buildsWithoutConnecting() {
+      PipelineConfig<String, String> config =
+          baseBuilder().maxWindowSize(1_000).handler(record -> {}).build();
+      KafkaPipeline<String, String> notStarted = new KafkaPipeline<>(config);
+
+      assertFalse(notStarted.isRunning());
+      assertNotNull(notStarted.metrics());
+    }
+
+    @Test
     void stopBeforeStartIsNoOp() {
       PipelineConfig<String, String> config = baseBuilder().handler(record -> {}).build();
       pipeline = new KafkaPipeline<>(config, mockConsumer);
