@@ -1,7 +1,7 @@
 plugins {
     `java-library`
     id("jacoco")
-    id("com.diffplug.spotless") version "8.10.4"
+    id("com.diffplug.spotless") version "8.11.0"
     id("com.vanniktech.maven.publish") version "0.37.0"
 }
 
