@@ -67,6 +67,7 @@ public class PipelineMetricsCollector {
   private final LongAdder rebalanceCount = new LongAdder();
   private final LongAdder drainTimeouts = new LongAdder();
   private final LongAdder recordsAbandoned = new LongAdder();
+  private final LongAdder processingTimeouts = new LongAdder();
 
   // ── Partition tracking ────────────────────────────────────────
   private final Set<TopicPartition> assignedPartitions = ConcurrentHashMap.newKeySet();
@@ -96,6 +97,11 @@ public class PipelineMetricsCollector {
    */
   public void recordProcessed(long count) {
     recordsProcessed.add(count);
+  }
+
+  /** Records a handler attempt interrupted by the processing timeout. */
+  public void recordProcessingTimeout() {
+    processingTimeouts.increment();
   }
 
   /**
@@ -216,11 +222,16 @@ public class PipelineMetricsCollector {
   public PipelineMetrics snapshot() {
     Map<TopicPartition, Long> lags = new HashMap<>();
     Map<TopicPartition, Integer> failures = new HashMap<>();
+    Map<TopicPartition, Long> stalls = new HashMap<>();
     for (TopicPartition tp : Set.copyOf(assignedPartitions)) {
       lags.put(tp, offsetTracker.lag(tp));
       int failureCount = offsetTracker.failureCount(tp);
       if (failureCount > 0) {
         failures.put(tp, failureCount);
+      }
+      long stall = offsetTracker.commitStallMillis(tp);
+      if (stall > 0) {
+        stalls.put(tp, stall);
       }
     }
 
@@ -232,7 +243,7 @@ public class PipelineMetricsCollector {
         emptyPollCount.sum(),
         inFlightCounter.records(),
         inFlightCounter.bytes(),
-        backpressureController.evaluate(),
+        backpressureController.lastStatus(),
         throttleCount.sum(),
         Map.copyOf(lags),
         Map.copyOf(failures),
@@ -245,6 +256,8 @@ public class PipelineMetricsCollector {
         rebalanceCount.sum(),
         drainTimeouts.sum(),
         recordsAbandoned.sum(),
-        Set.copyOf(assignedPartitions));
+        Set.copyOf(assignedPartitions),
+        Map.copyOf(stalls),
+        processingTimeouts.sum());
   }
 }

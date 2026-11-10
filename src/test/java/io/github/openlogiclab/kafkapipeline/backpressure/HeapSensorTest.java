@@ -203,6 +203,7 @@ class HeapSensorTest {
     }
 
     @Override
+    @SuppressWarnings("deprecation") // required by MemoryMXBean; finalization is deprecated
     public int getObjectPendingFinalizationCount() {
       return 0;
     }

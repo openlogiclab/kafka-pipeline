@@ -54,6 +54,27 @@ public final class PartitionPauseController {
   // Partitions whose records were sent back with a seek because they did not fit (full window or
   // full queue). They resume once the window has drained and the worker pool has room again.
   private final Set<TopicPartition> rejectedPaused = new HashSet<>();
+  // Other per-partition reasons to stay paused (partition not initialized yet, ordered batch still
+  // running). Each is a limit of that one partition, never a substitute for global backpressure.
+  private final List<Predicate<TopicPartition>> holds = new ArrayList<>();
+
+  /**
+   * Adds a per-partition reason to keep a partition paused, checked before every poll. The
+   * partition resumes only when no hold, no window or rejection pause, and no global throttle
+   * applies.
+   *
+   * @param hold returns true while the partition must not be fetched
+   */
+  public void addHold(Predicate<TopicPartition> hold) {
+    holds.add(hold);
+  }
+
+  private boolean held(TopicPartition tp) {
+    for (Predicate<TopicPartition> hold : holds) {
+      if (hold.test(tp)) return true;
+    }
+    return false;
+  }
 
   /**
    * Creates a pause controller.
@@ -123,7 +144,8 @@ public final class PartitionPauseController {
     List<TopicPartition> toPause = new ArrayList<>();
     List<TopicPartition> toResume = new ArrayList<>();
     for (TopicPartition tp : assignment) {
-      boolean shouldPause = throttled || windowPaused.contains(tp) || rejectedPaused.contains(tp);
+      boolean shouldPause =
+          throttled || windowPaused.contains(tp) || rejectedPaused.contains(tp) || held(tp);
       boolean isPaused = paused.contains(tp);
       if (shouldPause && !isPaused) {
         toPause.add(tp);
@@ -166,7 +188,7 @@ public final class PartitionPauseController {
    * @return true if window-paused or paused after its records were sent back
    */
   public boolean isPaused(TopicPartition tp) {
-    return windowPaused.contains(tp) || rejectedPaused.contains(tp);
+    return windowPaused.contains(tp) || rejectedPaused.contains(tp) || held(tp);
   }
 
   /**

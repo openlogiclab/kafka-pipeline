@@ -52,7 +52,9 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
           0,
           0,
           0,
-          Set.of());
+          Set.of(),
+          Map.of(),
+          0);
 
   private NoOpMetricsCollector() {
     super(null, null, null);
@@ -63,6 +65,9 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
 
   @Override
   public void recordFailed(int count) {}
+
+  @Override
+  public void recordProcessingTimeout() {}
 
   @Override
   public void recordSkipped(int count) {}

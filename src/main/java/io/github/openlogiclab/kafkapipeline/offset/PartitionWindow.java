@@ -22,6 +22,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
@@ -43,6 +44,12 @@ final class PartitionWindow {
   private final ReentrantLock registerLock = new ReentrantLock();
   private final ReentrantLock shrinkLock = new ReentrantLock();
   private final Condition drained = shrinkLock.newCondition();
+  private final AtomicBoolean shrinkRequested = new AtomicBoolean();
+  // Bumped whenever the commit point may have changed (an offset finished, tracking stopped), so
+  // the commit tick can skip rebuilding and re-encoding an unchanged commit point.
+  private final AtomicLong version = new AtomicLong();
+  private long cachedVersion = -1; // guarded by shrinkLock
+  private CommitPoint cachedPoint; // guarded by shrinkLock
 
   static final int DEFAULT_MAX_WINDOW_SIZE = 10_000;
 
@@ -62,6 +69,8 @@ final class PartitionWindow {
   private final AtomicInteger completedCount = new AtomicInteger(0);
   private final AtomicInteger failureCount = new AtomicInteger(0);
   private volatile boolean failed = false;
+  // When the committable offset last advanced, or the window last went from empty to non-empty.
+  private volatile long lastAdvanceNanos = System.nanoTime();
 
   // Crash replay: offsets the previous owner finished beyond its committed offset (relative to
   // baseOffset, read-only after construction), and whether to encode our own finished offsets.
@@ -114,6 +123,7 @@ final class PartitionWindow {
   /** Stops recording finished offsets in commit points; later points carry no metadata. */
   void stopTrackingCompleted() {
     trackCompleted = false;
+    version.incrementAndGet();
   }
 
   /** True if a previous owner already finished this offset, so it must not be processed again. */
@@ -143,6 +153,7 @@ final class PartitionWindow {
       windowSize.incrementAndGet();
       updateHighestRegistered(offset);
       completedCount.incrementAndGet();
+      version.incrementAndGet();
     } finally {
       registerLock.unlock();
     }
@@ -173,6 +184,7 @@ final class PartitionWindow {
           throw new IllegalStateException("Offset " + offset + " already tracked in window");
         }
       }
+      if (windowSize.get() == 0) lastAdvanceNanos = System.nanoTime();
       int t = 0;
       for (long offset : offsets) {
         boolean done = isPreDone(offset);
@@ -181,6 +193,7 @@ final class PartitionWindow {
         updateHighestRegistered(offset);
         if (done) {
           completedCount.incrementAndGet();
+          version.incrementAndGet();
         } else {
           pendingCount.incrementAndGet();
           todo[t++] = offset;
@@ -201,7 +214,7 @@ final class PartitionWindow {
         throw new IllegalStateException("Offset " + offset + " already tracked in window");
       }
       entries.put(offset, OffsetStatus.REGISTERED);
-      windowSize.incrementAndGet();
+      if (windowSize.getAndIncrement() == 0) lastAdvanceNanos = System.nanoTime();
       updateHighestRegistered(offset);
       pendingCount.incrementAndGet();
     } finally {
@@ -213,6 +226,7 @@ final class PartitionWindow {
     registerLock.lock();
     try {
       validateWindowCapacity(offsets.length);
+      if (windowSize.get() == 0) lastAdvanceNanos = System.nanoTime();
       for (int i = 0; i < offsets.length; i++) {
         long offset = offsets[i];
         if (entries.containsKey(offset)) {
@@ -297,6 +311,7 @@ final class PartitionWindow {
     }
     int remaining = inProgressCount.decrementAndGet();
     completedCount.incrementAndGet();
+    version.incrementAndGet();
 
     tryShrink();
     if (remaining == 0) {
@@ -329,6 +344,7 @@ final class PartitionWindow {
     if (transitioned > 0) {
       int remaining = inProgressCount.addAndGet(-transitioned);
       completedCount.addAndGet(transitioned);
+      version.incrementAndGet();
       tryShrink();
       if (remaining == 0) {
         signalDrained();
@@ -352,7 +368,7 @@ final class PartitionWindow {
       }
       return OptionalLong.empty();
     } finally {
-      shrinkLock.unlock();
+      unlockShrink();
     }
   }
 
@@ -367,7 +383,7 @@ final class PartitionWindow {
       long current = committableOffset.get();
       return current > baseOffset ? OptionalLong.of(current) : OptionalLong.empty();
     } finally {
-      shrinkLock.unlock();
+      unlockShrink();
     }
   }
 
@@ -419,37 +435,52 @@ final class PartitionWindow {
   private CommitPoint commitPoint() {
     shrinkLock.lock();
     try {
+      // Always shrink, even when the cached point is reused: the commit tick is also the backstop
+      // that keeps windowSize (and so the window pause) accurate.
       shrinkWindow();
       long c = committableOffset.get();
       if (!trackCompleted) {
         return new CommitPoint(c, "");
       }
-      // Records the previous owner finished right at the committable offset need not be fetched
-      // again before the commit can move past them.
-      while (isPreDone(c)) {
-        c++;
+      // Read the version before building, so a change made meanwhile forces a rebuild next time.
+      long v = version.get();
+      if (v == cachedVersion && cachedPoint != null && cachedPoint.offset() >= c) {
+        return cachedPoint;
       }
-      BitSet done = new BitSet();
-      for (Map.Entry<Long, OffsetStatus> e : entries.tailMap(c, false).entrySet()) {
-        if (e.getValue() == OffsetStatus.DONE) {
-          long rel = e.getKey() - c;
-          if (rel >= CompletedOffsetsCodec.MAX_SPAN) break; // sorted: the rest are further
-          done.set((int) rel);
-        }
-      }
-      // Offsets the previous owner finished that we have not fetched again yet are still done.
-      long from = Math.max(1, c - baseOffset + 1);
-      if (from < preDone.length()) {
-        for (int i = preDone.nextSetBit((int) from); i >= 0; i = preDone.nextSetBit(i + 1)) {
-          // c >= baseOffset, so rel <= i < MAX_SPAN: the decoder never yields more bits.
-          done.set((int) (baseOffset + i - c));
-        }
-      }
-      // Built on every commit tick: at most one window of entries plus a small deflate.
-      return new CommitPoint(c, CompletedOffsetsCodec.encode(c, done));
+      CommitPoint point = buildCommitPoint(c);
+      cachedVersion = v;
+      cachedPoint = point;
+      return point;
     } finally {
-      shrinkLock.unlock();
+      unlockShrink();
     }
+  }
+
+  /** Builds the commit point from offset {@code c}; caller holds the shrink lock. */
+  private CommitPoint buildCommitPoint(long c) {
+    // Records the previous owner finished right at the committable offset need not be fetched
+    // again before the commit can move past them.
+    while (isPreDone(c)) {
+      c++;
+    }
+    BitSet done = new BitSet();
+    for (Map.Entry<Long, OffsetStatus> e : entries.tailMap(c, false).entrySet()) {
+      if (e.getValue() == OffsetStatus.DONE) {
+        long rel = e.getKey() - c;
+        if (rel >= CompletedOffsetsCodec.MAX_SPAN) break; // sorted: the rest are further
+        done.set((int) rel);
+      }
+    }
+    // Offsets the previous owner finished that we have not fetched again yet are still done.
+    long from = Math.max(1, c - baseOffset + 1);
+    if (from < preDone.length()) {
+      for (int i = preDone.nextSetBit((int) from); i >= 0; i = preDone.nextSetBit(i + 1)) {
+        // c >= baseOffset, so rel <= i < MAX_SPAN: the decoder never yields more bits.
+        done.set((int) (baseOffset + i - c));
+      }
+    }
+    // Only rebuilt when the window changed: at most one window of entries plus a small deflate.
+    return new CommitPoint(c, CompletedOffsetsCodec.encode(c, done));
   }
 
   /**
@@ -486,7 +517,7 @@ final class PartitionWindow {
           current > baseOffset ? OptionalLong.of(current) : OptionalLong.empty();
       return new PartitionDrainResult(false, completedCount.get(), abandoned, committable);
     } finally {
-      shrinkLock.unlock();
+      unlockShrink();
     }
   }
 
@@ -522,21 +553,39 @@ final class PartitionWindow {
     return failureCount.get();
   }
 
+  /** Milliseconds the committable offset has not moved while records wait; 0 if none wait. */
+  long commitStallMillis() {
+    if (pendingCount.get() + inProgressCount.get() <= 0) return 0;
+    return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastAdvanceNanos);
+  }
+
   long lag() {
     long highest = highestRegistered.get();
     if (highest < 0) return 0;
     return highest + 1 - committableOffset.get();
   }
 
-  /** Best-effort shrink. Non-blocking: skips if lock is held by another thread. */
+  /**
+   * Shrinks without blocking. If another thread holds the lock, leaves a request that the holder
+   * serves when it unlocks ({@link #unlockShrink()}), so an ack that lands while another thread is
+   * shrinking is never left unshrunk at the head of the window until the next commit tick.
+   */
   private void tryShrink() {
-    if (shrinkLock.tryLock()) {
+    shrinkRequested.set(true);
+    while (shrinkRequested.get() && shrinkLock.tryLock()) {
       try {
+        shrinkRequested.set(false);
         shrinkWindow();
       } finally {
         shrinkLock.unlock();
       }
     }
+  }
+
+  /** Unlocks the shrink lock, then serves a shrink requested while it was held. */
+  private void unlockShrink() {
+    shrinkLock.unlock();
+    if (shrinkRequested.get()) tryShrink();
   }
 
   /** Signals waiting drain threads. Called when inProgressCount reaches 0. */
@@ -545,7 +594,7 @@ final class PartitionWindow {
     try {
       drained.signalAll();
     } finally {
-      shrinkLock.unlock();
+      unlockShrink();
     }
   }
 
@@ -555,6 +604,7 @@ final class PartitionWindow {
       if (entries.remove(first.getKey(), OffsetStatus.DONE)) {
         windowSize.decrementAndGet();
         committableOffset.set(first.getKey() + 1);
+        lastAdvanceNanos = System.nanoTime();
       } else {
         break;
       }

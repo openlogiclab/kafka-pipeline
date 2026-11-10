@@ -23,6 +23,7 @@ import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
+import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
 import io.github.openlogiclab.kafkapipeline.offset.ProcessingProgress;
@@ -129,6 +130,13 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
         } catch (WindowFullException e) {
           rejected = reject(rejected, tp, record.offset());
           break;
+        } catch (RuntimeException e) {
+          // E.g. the partition is assigned but not initialized. Send this partition's records back
+          // and carry on with the others: the consumer position has already moved past every
+          // polled record, so a partition skipped here would lose records once later ones commit.
+          reportDispatchFailure(tp, record.offset(), e);
+          rejected = reject(rejected, tp, record.offset());
+          break;
         }
         counter.registered(1, RecordSize.estimateBytes(record));
         dispatcher.dispatch(tp, record);
@@ -147,17 +155,30 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private void workerLoop() {
     while (running.get()) {
       try {
-        if (Thread.currentThread().isInterrupted()) break;
         RecordDispatcher.PollResult<K, V> result = dispatcher.poll(100, MILLISECONDS);
-        if (result == null) continue;
-        try {
-          processRecord(result.partition(), result.record(), result.generation());
-        } finally {
-          dispatcher.release(result);
+        if (result != null) {
+          try {
+            processRecord(result.partition(), result.record(), result.generation());
+          } finally {
+            dispatcher.release(result);
+          }
         }
-      } catch (Exception e) {
-        logger.log(System.Logger.Level.ERROR, "Unexpected error in worker loop", e);
+      } catch (Throwable t) {
+        // Never let a throwable end the loop: the pool would silently lose a worker.
+        reportWorkerError(t);
       }
+      clearStrayInterrupt();
+    }
+  }
+
+  /**
+   * Clears an interrupt left on this long-lived worker thread while the pool is running. Only a
+   * shutdown (which stops the pool before interrupting) may end the loop; a handler that restores
+   * the interrupt flag after catching InterruptedException must not.
+   */
+  private void clearStrayInterrupt() {
+    if (running.get() && Thread.interrupted()) {
+      logger.log(System.Logger.Level.DEBUG, "Cleared an interrupt left by the handler");
     }
   }
 
@@ -200,7 +221,8 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
               handleOnce(record, new ProcessingContext(tp, offset, attempt));
             },
             tp,
-            desc);
+            desc,
+            this::stopping);
 
     if (lastError == null) {
       // Outside the retry loop: a hook that throws must not re-run a handler that succeeded.
@@ -217,7 +239,8 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private boolean skippedByHook(ConsumerRecord<K, V> record, ProcessingContext ctx) {
     try {
       return !hook.beforeProcess(record, ctx);
-    } catch (Exception e) {
+    } catch (Throwable e) {
+      FatalErrors.rethrowIfJvmFatal(e);
       logger.log(
           System.Logger.Level.WARNING,
           "beforeProcess hook threw for {0}:{1}, proceeding with handler",
@@ -231,15 +254,37 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     try {
       handler.handle(record);
     } catch (Exception e) {
-      hook.onError(record, ctx, e);
+      notifyError(record, ctx, e);
       throw e;
+    } catch (Error e) {
+      if (!FatalErrors.isJvmFatal(e)) notifyError(record, ctx, RetryExecutor.asException(e));
+      throw e;
+    }
+  }
+
+  /** Calls onError; a hook that throws must not hide the handler's exception. */
+  private void notifyError(ConsumerRecord<K, V> record, ProcessingContext ctx, Exception error) {
+    try {
+      hook.onError(record, ctx, error);
+    } catch (Throwable hookError) {
+      FatalErrors.rethrowIfJvmFatal(hookError);
+      error.addSuppressed(hookError);
+      logger.log(
+          System.Logger.Level.WARNING,
+          "onError hook threw for "
+              + ctx.partition()
+              + ":"
+              + ctx.offset()
+              + "; keeping the handler's exception",
+          hookError);
     }
   }
 
   private void notifyAfterProcess(ConsumerRecord<K, V> record, ProcessingContext ctx) {
     try {
       hook.afterProcess(record, ctx);
-    } catch (Exception e) {
+    } catch (Throwable e) {
+      FatalErrors.rethrowIfJvmFatal(e);
       logger.log(
           System.Logger.Level.WARNING,
           "afterProcess hook threw for "

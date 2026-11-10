@@ -30,6 +30,9 @@ public final class BackpressureController {
 
   private final List<BackpressureSensor> sensors;
   private final boolean enabled;
+  // Result of the last evaluate(), for readers on other threads (metrics). Sensors keep
+  // hysteresis state, so only the poll thread may evaluate them.
+  private volatile BackpressureStatus lastStatus = BackpressureStatus.OK;
 
   /**
    * Creates a controller with multiple sensors.
@@ -68,11 +71,23 @@ public final class BackpressureController {
       if (status.ordinal() > worst.ordinal()) {
         worst = status;
         if (worst == BackpressureStatus.CRITICAL) {
-          return worst;
+          break;
         }
       }
     }
+    lastStatus = worst;
     return worst;
+  }
+
+  /**
+   * Returns the status from the last {@link #evaluate()} by the poll thread, without evaluating the
+   * sensors again. Safe to call from any thread and free of side effects, unlike {@link
+   * #evaluate()}, which advances each sensor's hysteresis state.
+   *
+   * @return the last evaluated status
+   */
+  public BackpressureStatus lastStatus() {
+    return enabled ? lastStatus : BackpressureStatus.OK;
   }
 
   /**

@@ -21,11 +21,11 @@ import java.util.concurrent.LinkedBlockingQueue;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
 /** Records handed out in offset order; any number may be in flight (limited by the dispatcher). */
-final class FifoLaneQueue<K, V> implements LaneQueue<K, V> {
+final class FIFOLaneQueue<K, V> implements LaneQueue<K, V> {
 
   private final LinkedBlockingQueue<ConsumerRecord<K, V>> queue;
 
-  FifoLaneQueue(int capacity) {
+  FIFOLaneQueue(int capacity) {
     this.queue = new LinkedBlockingQueue<>(capacity);
   }
 
