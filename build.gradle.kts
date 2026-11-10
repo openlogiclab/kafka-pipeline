@@ -105,7 +105,7 @@ configurations[integrationTestSourceSet.runtimeOnlyConfigurationName]
 dependencies {
     "integrationTestImplementation"("org.testcontainers:testcontainers-kafka:2.0.4")
     "integrationTestImplementation"("org.testcontainers:testcontainers-junit-jupiter:2.0.4")
-    "integrationTestRuntimeOnly"("org.slf4j:slf4j-simple:2.0.17")
+    "integrationTestRuntimeOnly"("org.slf4j:slf4j-simple:2.0.20")
 }
 
 val integrationTest = tasks.register<Test>("integrationTest") {
