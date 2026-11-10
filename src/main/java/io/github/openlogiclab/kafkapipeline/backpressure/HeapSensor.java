@@ -15,9 +15,15 @@
  */
 package io.github.openlogiclab.kafkapipeline.backpressure;
 
+import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryPoolMXBean;
+import java.lang.management.MemoryType;
 import java.lang.management.MemoryUsage;
+import java.util.List;
+import java.util.Map;
+import java.util.function.DoubleSupplier;
 
 /**
  * Backpressure sensor based on JVM heap usage.
@@ -26,6 +32,12 @@ import java.lang.management.MemoryUsage;
  * Hysteresis prevents flapping: once THROTTLE is triggered at {@code throttleThreshold}, it stays
  * until usage drops below {@code resumeThreshold}.
  *
+ * <p>{@code used} includes garbage the collector has not reclaimed yet, and with G1 or Parallel GC
+ * it routinely climbs to 80–95% before a collection. Once the JVM has run a GC, the sensor
+ * therefore uses the lower of {@code used} and the heap occupied right after the last collection
+ * (the live set), so uncollected garbage alone does not throttle. Taking the lower value also means
+ * resuming never depends on a GC happening while the consumer is paused.
+ *
  * <p>This sensor protects against OOM regardless of pressure source — in-flight records, producer
  * buffers, caches, or any other heap-resident data.
  */
@@ -33,6 +45,8 @@ public final class HeapSensor implements BackpressureSensor {
 
   private final MemoryMXBean memoryMxBean;
   private final HeapBackpressureConfig config;
+  // Heap used right after the last GC as a ratio of max, or NaN before the first GC.
+  private final DoubleSupplier afterGcUsage;
 
   private volatile boolean throttled = false;
 
@@ -42,7 +56,7 @@ public final class HeapSensor implements BackpressureSensor {
    * @param config the heap backpressure configuration
    */
   public HeapSensor(HeapBackpressureConfig config) {
-    this(config, ManagementFactory.getMemoryMXBean());
+    this(config, ManagementFactory.getMemoryMXBean(), new JvmAfterGcUsage());
   }
 
   /**
@@ -52,8 +66,77 @@ public final class HeapSensor implements BackpressureSensor {
    * @param memoryMxBean the memory bean to read heap usage from
    */
   HeapSensor(HeapBackpressureConfig config, MemoryMXBean memoryMxBean) {
+    this(config, memoryMxBean, () -> Double.NaN);
+  }
+
+  /**
+   * Creates a heap backpressure sensor with custom heap readings (for testing).
+   *
+   * @param config the heap backpressure configuration
+   * @param memoryMxBean the memory bean to read current heap usage from
+   * @param afterGcUsage heap usage ratio right after the last GC, or NaN if unknown
+   */
+  HeapSensor(
+      HeapBackpressureConfig config, MemoryMXBean memoryMxBean, DoubleSupplier afterGcUsage) {
     this.config = config;
     this.memoryMxBean = memoryMxBean;
+    this.afterGcUsage = afterGcUsage;
+  }
+
+  /**
+   * Reads the heap occupied right after the most recent GC (young or full), as a ratio of max heap,
+   * from {@code com.sun.management.GcInfo}. That snapshot covers every heap pool at the end of the
+   * same collection, unlike per-pool collection usage, which for the old generation under Serial or
+   * Parallel GC only changes after a full GC. Recomputed only when a new GC has run. Returns NaN
+   * before the first GC or when the JVM does not provide GC info, so the sensor uses current usage.
+   */
+  private static final class JvmAfterGcUsage implements DoubleSupplier {
+    private long lastCollections = -1;
+    private double cached = Double.NaN;
+    private boolean unsupported;
+
+    @Override
+    public synchronized double getAsDouble() {
+      if (unsupported) return Double.NaN;
+      try {
+        List<GarbageCollectorMXBean> collectors = ManagementFactory.getGarbageCollectorMXBeans();
+        long collections = 0;
+        for (GarbageCollectorMXBean gc : collectors) {
+          collections += Math.max(0, gc.getCollectionCount());
+        }
+        if (collections == 0) return Double.NaN;
+        if (collections == lastCollections) return cached;
+        lastCollections = collections;
+
+        Map<String, MemoryUsage> after = null;
+        long latestEnd = Long.MIN_VALUE;
+        boolean anyExtended = false;
+        for (GarbageCollectorMXBean gc : collectors) {
+          if (gc instanceof com.sun.management.GarbageCollectorMXBean ext) {
+            anyExtended = true;
+            com.sun.management.GcInfo info = ext.getLastGcInfo();
+            if (info != null && info.getEndTime() >= latestEnd) {
+              latestEnd = info.getEndTime();
+              after = info.getMemoryUsageAfterGc();
+            }
+          }
+        }
+        if (!anyExtended) unsupported = true;
+        if (after == null) return cached = Double.NaN;
+
+        long used = 0;
+        for (MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
+          if (pool.getType() != MemoryType.HEAP) continue;
+          MemoryUsage usage = after.get(pool.getName());
+          if (usage != null) used += usage.getUsed();
+        }
+        long max = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getMax();
+        return cached = max > 0 ? (double) used / max : Double.NaN;
+      } catch (LinkageError | RuntimeException e) {
+        unsupported = true; // jdk.management not available: use current usage only
+        return Double.NaN;
+      }
+    }
   }
 
   @Override
@@ -105,6 +188,8 @@ public final class HeapSensor implements BackpressureSensor {
     if (max <= 0) {
       return 0.0;
     }
-    return (double) heap.getUsed() / max;
+    double current = (double) heap.getUsed() / max;
+    double afterGc = afterGcUsage.getAsDouble();
+    return Double.isNaN(afterGc) ? current : Math.min(current, afterGc);
   }
 }

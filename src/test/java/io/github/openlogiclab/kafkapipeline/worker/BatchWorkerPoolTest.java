@@ -52,7 +52,6 @@ class BatchWorkerPoolTest {
     counter = new InFlightCounter();
   }
 
-  @SuppressWarnings("deprecation")
   private ConsumerRecords<String, String> buildRecords(TopicPartition tp, int from, int to) {
     Map<TopicPartition, List<ConsumerRecord<String, String>>> map = new HashMap<>();
     List<ConsumerRecord<String, String>> records = new java.util.ArrayList<>();
@@ -60,7 +59,7 @@ class BatchWorkerPoolTest {
       records.add(new ConsumerRecord<>(tp.topic(), tp.partition(), i, "k", "v-" + i));
     }
     map.put(tp, records);
-    return new ConsumerRecords<>(map);
+    return new ConsumerRecords<>(map, Map.of());
   }
 
   @Nested

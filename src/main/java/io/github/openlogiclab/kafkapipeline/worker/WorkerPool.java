@@ -16,6 +16,7 @@
 package io.github.openlogiclab.kafkapipeline.worker;
 
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
+import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -27,6 +28,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
 
@@ -58,6 +60,10 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
 
   /** Thread mode (platform or virtual). */
   protected final ThreadMode threadMode;
+
+  // Called when a worker hits an error the pipeline cannot recover from (OutOfMemoryError and
+  // similar).
+  private volatile Consumer<Throwable> fatalErrorHandler = t -> {};
 
   /**
    * Creates a new worker pool.
@@ -97,6 +103,40 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
   public abstract void start();
 
   /**
+   * Sets the callback invoked when a worker hits an error the pipeline cannot safely continue
+   * after, such as {@link OutOfMemoryError}. The record involved is left unacked so it is
+   * redelivered.
+   *
+   * @param handler the callback
+   */
+  public void onFatalError(Consumer<Throwable> handler) {
+    this.fatalErrorHandler = handler;
+  }
+
+  /**
+   * Logs an unexpected throwable from a worker and escalates it if the JVM may be unusable.
+   *
+   * @param t the throwable
+   */
+  protected void reportWorkerError(Throwable t) {
+    if (FatalErrors.isJvmFatal(t)) {
+      logger.log(System.Logger.Level.ERROR, "Fatal error in worker, stopping the pipeline", t);
+      fatalErrorHandler.accept(t);
+    } else {
+      logger.log(System.Logger.Level.ERROR, "Unexpected error in worker", t);
+    }
+  }
+
+  /**
+   * Whether the pool is stopping; interrupts mean shutdown only while this is true.
+   *
+   * @return true once {@link #stop} has been called
+   */
+  protected boolean stopping() {
+    return !running.get();
+  }
+
+  /**
    * Dispatches records to workers for processing.
    *
    * <p>If a partition's offset window has no room, that partition's remaining records are not
@@ -117,6 +157,18 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
    * @return true once there is room again
    */
   public abstract boolean canResume(TopicPartition tp);
+
+  /**
+   * Whether the pool needs the partition to stay paused for a reason of its own (for example an
+   * ordered batch still running). A per-partition limit, combined with global backpressure by the
+   * pause controller.
+   *
+   * @param tp the partition
+   * @return true while the partition must not be fetched
+   */
+  public boolean holdsPartition(TopicPartition tp) {
+    return false;
+  }
 
   /**
    * Returns whether the bounded task queue (PLATFORM threads with a task queue capacity) has room
@@ -155,6 +207,30 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
               + " warning) — consider more concurrency or a larger dispatchQueueCapacity",
           tp,
           count);
+    }
+  }
+
+  private final AtomicLong lastDispatchFailureLogNanos =
+      new AtomicLong(System.nanoTime() - QUEUE_FULL_LOG_INTERVAL_NANOS);
+
+  /**
+   * Logs (rate-limited) that a partition's records were sent back because registering failed.
+   *
+   * @param tp the partition
+   * @param offset first offset sent back
+   * @param e the failure
+   */
+  protected void reportDispatchFailure(TopicPartition tp, long offset, RuntimeException e) {
+    long now = System.nanoTime();
+    long last = lastDispatchFailureLogNanos.get();
+    if (now - last >= QUEUE_FULL_LOG_INTERVAL_NANOS
+        && lastDispatchFailureLogNanos.compareAndSet(last, now)) {
+      logger.log(
+          System.Logger.Level.WARNING,
+          "Could not register {0} from offset {1}, fetching it again later: {2}",
+          tp,
+          offset,
+          e.toString());
     }
   }
 

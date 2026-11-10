@@ -9,6 +9,9 @@
 module io.github.openlogiclab.kafkapipeline {
   requires kafka.clients;
   requires java.management;
+  // Optional: heap usage right after the last GC (HeapSensor). Without it the sensor falls back to
+  // current heap usage.
+  requires static jdk.management;
 
   exports io.github.openlogiclab.kafkapipeline;
   exports io.github.openlogiclab.kafkapipeline.handler;

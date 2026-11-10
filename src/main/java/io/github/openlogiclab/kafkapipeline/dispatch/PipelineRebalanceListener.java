@@ -16,6 +16,7 @@
 package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
 import io.github.openlogiclab.kafkapipeline.offset.PartitionDrainResult;
@@ -25,9 +26,11 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -54,6 +57,17 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
   private final PipelineMetricsCollector metricsCollector;
   private final ExecutorService drainExecutor;
   private final boolean readCommittedMetadata;
+
+  private static final long INIT_RETRY_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
+  private static final long INIT_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(30);
+  // Total time one initialization pass may block the poll thread, kept well below the default
+  // max.poll.interval.ms (5 minutes) however many partitions are assigned.
+  private static final Duration INIT_BUDGET = Duration.ofSeconds(10);
+  private static final Duration INIT_RETRY_BUDGET = Duration.ofSeconds(5);
+  // Assigned partitions whose initialization failed; poll thread only.
+  private final Set<TopicPartition> pendingInit = new HashSet<>();
+  private long lastInitRetryNanos = System.nanoTime();
+  private long lastInitWarnNanos = System.nanoTime();
 
   /**
    * Creates a rebalance listener.
@@ -126,6 +140,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
 
     logger.log(System.Logger.Level.INFO, "Partitions revoked: {0}", partitions);
     metricsCollector.recordRebalance();
+    pendingInit.removeAll(partitions);
     dropQueued(partitions);
 
     if (drainExecutor.isShutdown()) {
@@ -185,6 +200,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
             + " redelivered.",
         partitions);
     metricsCollector.recordRebalance();
+    pendingInit.removeAll(partitions);
     dropQueued(partitions);
     clearTracking(partitions);
   }
@@ -205,29 +221,98 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     if (partitions.isEmpty()) return;
 
     logger.log(System.Logger.Level.INFO, "Partitions assigned: {0}", partitions);
+    initialize(partitions, INIT_BUDGET);
+  }
 
-    Map<TopicPartition, OffsetAndMetadata> committed = committedOffsets(partitions);
+  /**
+   * Initializes each partition on its own, so one that fails (for example a {@code position()}
+   * timeout) does not leave the others uninitialized. Failed partitions stay paused through {@link
+   * #isPendingInit} and are retried by {@link #retryPendingInit()}. The whole pass shares one time
+   * budget, and after a timeout the remaining partitions are deferred without blocking further, so
+   * the poll thread never stalls long enough to be removed from the group. Fatal errors are
+   * rethrown.
+   */
+  private void initialize(Collection<TopicPartition> partitions, Duration budget) {
+    long deadline = System.nanoTime() + budget.toNanos();
+    Map<TopicPartition, OffsetAndMetadata> committed = committedOffsets(partitions, budget);
+    boolean timedOut = false;
     for (TopicPartition tp : partitions) {
-      long position = consumer.position(tp);
-      OffsetAndMetadata last = committed.get(tp);
-      // The metadata only describes records after the committed offset, so it applies only when
-      // this consumer resumes exactly there (not after an offset reset or a seek).
-      String metadata = last != null && last.offset() == position ? last.metadata() : null;
-      offsetTracker.initPartition(tp, position, metadata);
-      dispatcher.addPartition(tp, offsetTracker.generation(tp));
-      metricsCollector.partitionAssigned(tp);
-
-      logger.log(System.Logger.Level.DEBUG, "Initialized {0} at offset {1}", tp, position);
+      long remainingNanos = deadline - System.nanoTime();
+      if (timedOut || remainingNanos <= 0) {
+        defer(tp, "initialization time budget used up");
+        continue;
+      }
+      try {
+        long position = consumer.position(tp, Duration.ofNanos(remainingNanos));
+        OffsetAndMetadata last = committed.get(tp);
+        // The metadata only describes records after the committed offset, so it applies only when
+        // this consumer resumes exactly there (not after an offset reset or a seek).
+        String metadata = last != null && last.offset() == position ? last.metadata() : null;
+        offsetTracker.initPartition(tp, position, metadata);
+        dispatcher.addPartition(tp, offsetTracker.generation(tp));
+        metricsCollector.partitionAssigned(tp);
+        pendingInit.remove(tp);
+        logger.log(System.Logger.Level.DEBUG, "Initialized {0} at offset {1}", tp, position);
+      } catch (RuntimeException e) {
+        if (FatalErrors.isFatal(e)) throw e;
+        if (e instanceof org.apache.kafka.common.errors.TimeoutException) timedOut = true;
+        // Undo a half-done init so the retry starts clean.
+        dispatcher.removePartition(tp);
+        offsetTracker.clearPartition(tp);
+        defer(tp, e.toString());
+      }
     }
   }
 
+  private void defer(TopicPartition tp, String reason) {
+    if (pendingInit.add(tp) || shouldLogRetry()) {
+      logger.log(
+          System.Logger.Level.WARNING,
+          "Could not initialize {0}, keeping it paused and retrying: {1}",
+          tp,
+          reason);
+    }
+  }
+
+  /**
+   * Retries partitions whose initialization failed. Call from the poll thread before each poll; at
+   * most one attempt per second.
+   */
+  public void retryPendingInit() {
+    if (pendingInit.isEmpty()) return;
+    long now = System.nanoTime();
+    if (now - lastInitRetryNanos < INIT_RETRY_INTERVAL_NANOS) return;
+    lastInitRetryNanos = now;
+    Set<TopicPartition> retry = new HashSet<>(pendingInit);
+    retry.retainAll(consumer.assignment());
+    pendingInit.retainAll(retry);
+    if (!retry.isEmpty()) initialize(retry, INIT_RETRY_BUDGET);
+  }
+
+  /**
+   * Whether the partition is assigned but not yet initialized, so it must stay paused.
+   *
+   * @param tp the partition
+   * @return true while initialization is pending
+   */
+  public boolean isPendingInit(TopicPartition tp) {
+    return pendingInit.contains(tp);
+  }
+
+  private boolean shouldLogRetry() {
+    long now = System.nanoTime();
+    if (now - lastInitWarnNanos < INIT_WARN_INTERVAL_NANOS) return false;
+    lastInitWarnNanos = now;
+    return true;
+  }
+
   private Map<TopicPartition, OffsetAndMetadata> committedOffsets(
-      Collection<TopicPartition> partitions) {
+      Collection<TopicPartition> partitions, Duration timeout) {
     if (!readCommittedMetadata) {
       return Map.of();
     }
     try {
-      return consumer.committed(new HashSet<>(partitions));
+      return consumer.committed(new HashSet<>(partitions), timeout);
     } catch (Exception e) {
       // Only an optimisation: without it, records finished after the committed offset are
       // processed again, exactly as they would be without completed-offset tracking.

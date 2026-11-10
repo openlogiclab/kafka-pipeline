@@ -22,9 +22,6 @@ import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
@@ -37,9 +34,9 @@ import org.apache.kafka.common.errors.WakeupException;
  * OffsetTracker} and commits them via the Kafka consumer.
  *
  * <p>Thread-safety: Kafka's consumer is not thread-safe (only {@code wakeup()} may be called from
- * another thread). This committer uses a flag-based signaling approach: the scheduler thread sets a
- * {@code commitDue} flag, and the poll loop calls {@link #maybeCommitAsync()} to perform the actual
- * commit on the poll thread.
+ * another thread). The poll loop calls {@link #maybeCommitAsync()} on every iteration; it commits
+ * when the commit interval has elapsed, so commits always run on the poll thread and no timer
+ * thread is needed.
  *
  * <p>Uses {@code commitAsync()} for periodic commits (non-blocking on the poll loop) and {@code
  * commitSync()} for the final commit during shutdown/rebalance.
@@ -51,9 +48,8 @@ public final class PeriodicCommitter {
   private final CommitSource offsetTracker;
   private final Consumer<?, ?> consumer;
   private final Duration commitInterval;
-  private final ScheduledExecutorService scheduler;
   private final AtomicBoolean running = new AtomicBoolean(false);
-  private final AtomicBoolean commitDue = new AtomicBoolean(false);
+  private long nextCommitNanos; // poll thread only
   private final PipelineMetricsCollector metricsCollector;
 
   /**
@@ -73,48 +69,24 @@ public final class PeriodicCommitter {
     this.consumer = consumer;
     this.commitInterval = commitInterval;
     this.metricsCollector = metricsCollector;
-    this.scheduler =
-        Executors.newSingleThreadScheduledExecutor(
-            r -> {
-              Thread t = new Thread(r);
-              t.setName("kafka-pipeline-committer");
-              t.setDaemon(true);
-              return t;
-            });
   }
 
-  /** Starts the periodic commit scheduler. */
+  /** Starts periodic commits; the first one is due one interval from now. */
   public void start() {
     if (!running.compareAndSet(false, true)) {
       throw new IllegalStateException("PeriodicCommitter already started");
     }
     long intervalMs = commitInterval.toMillis();
-    scheduler.scheduleAtFixedRate(
-        this::signalCommitDue, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+    // A deadline checked by the poll thread replaces a timer thread that only flipped a flag.
+    nextCommitNanos = System.nanoTime() + commitInterval.toNanos();
     logger.log(
         System.Logger.Level.INFO, "PeriodicCommitter started with interval {0}ms", intervalMs);
   }
 
-  /** Stops the periodic commit scheduler and waits for termination. */
+  /** Stops periodic commits. */
   public void stop() {
     running.set(false);
-    scheduler.shutdown();
-    try {
-      if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-        scheduler.shutdownNow();
-      }
-    } catch (InterruptedException e) {
-      scheduler.shutdownNow();
-      Thread.currentThread().interrupt();
-    }
     logger.log(System.Logger.Level.INFO, "PeriodicCommitter stopped");
-  }
-
-  /** Called by the scheduler thread to signal that a commit is due. Does not touch the consumer. */
-  private void signalCommitDue() {
-    if (running.get()) {
-      commitDue.set(true);
-    }
   }
 
   /**
@@ -122,9 +94,14 @@ public final class PeriodicCommitter {
    * poll thread (the same thread that calls {@code consumer.poll()}).
    */
   public void maybeCommitAsync() {
-    if (commitDue.compareAndSet(true, false)) {
-      commitAsync();
-    }
+    if (!running.get()) return;
+    long now = System.nanoTime();
+    if (now - nextCommitNanos < 0) return;
+    // Fixed rate, but never try to catch up on ticks missed while the poll thread was busy.
+    long interval = commitInterval.toNanos();
+    nextCommitNanos += interval;
+    if (now - nextCommitNanos >= 0) nextCommitNanos = now + interval;
+    commitAsync();
   }
 
   /** Performs an async commit. Must be called from the poll thread. */

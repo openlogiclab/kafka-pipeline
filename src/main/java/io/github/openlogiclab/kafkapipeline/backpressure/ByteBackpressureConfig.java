@@ -24,6 +24,9 @@ package io.github.openlogiclab.kafkapipeline.backpressure;
  *
  * <p>Size estimation uses {@code ConsumerRecord.serializedKeySize() +
  * ConsumerRecord.serializedValueSize()} — the wire payload size, not Java heap overhead.
+ * Deserialized keys and values are often 2–10× larger on the heap (JSON trees, Avro records, UTF-16
+ * strings), so set the watermarks with that factor in mind, or combine this with {@link
+ * HeapBackpressureConfig}.
  *
  * @param highWatermarkBytes total in-flight bytes at which the consumer pauses polling
  * @param lowWatermarkBytes total in-flight bytes at which the consumer resumes polling

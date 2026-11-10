@@ -103,7 +103,8 @@ final class KeyedLaneQueue<K, V> implements LaneQueue<K, V> {
       } else {
         ArrayDeque<ConsumerRecord<K, V>> queue = waiting.get(key);
         if (queue == null) {
-          queue = new ArrayDeque<>();
+          // Most keys have one or two waiting records; the default capacity (16) wastes space.
+          queue = new ArrayDeque<>(2);
           waiting.put(key, queue);
           if (!busy.contains(key)) readyKeys.addLast(key);
         }
