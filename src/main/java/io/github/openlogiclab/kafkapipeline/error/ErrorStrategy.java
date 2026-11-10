@@ -183,6 +183,12 @@ public record ErrorStrategy<K, V>(
      * Base delay between retry attempts. When {@link #exponentialBackoff} is enabled, this is
      * multiplied by powers of 2 on each subsequent attempt.
      *
+     * <p>The backoff sleeps on the worker thread, so a retrying record holds a worker for its whole
+     * retry sequence. With {@link io.github.openlogiclab.kafkapipeline.ThreadMode#PLATFORM}
+     * threads, a burst of failures can occupy every worker and stall unrelated partitions; prefer
+     * {@link io.github.openlogiclab.kafkapipeline.ThreadMode#VIRTUAL} threads when retries with
+     * long backoffs are enabled.
+     *
      * <p>Default: {@code 1 second}.
      *
      * @param retryBackoff the retry backoff duration

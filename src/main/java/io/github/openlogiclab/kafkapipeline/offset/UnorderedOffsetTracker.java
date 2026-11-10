@@ -287,6 +287,12 @@ public final class UnorderedOffsetTracker implements OffsetTracker {
   }
 
   @Override
+  public long commitStallMillis(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.commitStallMillis() : 0;
+  }
+
+  @Override
   public int maxWindowSize() {
     return maxWindowSize;
   }

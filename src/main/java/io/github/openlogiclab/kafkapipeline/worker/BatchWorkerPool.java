@@ -26,9 +26,9 @@ import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.function.IntSupplier;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
@@ -54,9 +54,15 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   // Virtual-thread executors start a thread per task with no upper bound, so concurrency is
   // enforced here instead. Null for platform threads, where the fixed-size pool already bounds it.
   private final Semaphore handlerPermits;
-  // Ordered modes: partitions with a batch submitted and not yet finished.
+  // Ordered modes allow one batch per partition in flight. Unordered mode allows up to the
+  // per-partition limit (0 = unlimited), so one slow partition cannot fill the shared in-flight
+  // budget and throttle every partition.
   private final boolean ordered;
-  private final Set<TopicPartition> batchInFlight = ConcurrentHashMap.newKeySet();
+  private volatile IntSupplier partitionLimit = () -> 0;
+  // Batches in flight per partition. Updated only with atomic per-key compute operations, so an
+  // increment can never land on an entry that a concurrent decrement just removed.
+  private final ConcurrentHashMap<TopicPartition, Integer> batchesInFlight =
+      new ConcurrentHashMap<>();
 
   /**
    * Creates a new batch worker pool.
@@ -130,6 +136,36 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     this.handlerPermits = threadMode == ThreadMode.VIRTUAL ? new Semaphore(concurrency) : null;
   }
 
+  /**
+   * Sets the per-partition limit on batches in flight in unordered mode, such as {@code
+   * RecordDispatcher::effectivePartitionLimit} (the configured {@code maxConcurrencyPerPartition}
+   * with its fair-share floor). Zero means unlimited. Ordered modes always allow one.
+   *
+   * @param limit supplies the current limit
+   */
+  public void partitionLimit(IntSupplier limit) {
+    this.partitionLimit = limit;
+  }
+
+  private int inFlight(TopicPartition tp) {
+    return batchesInFlight.getOrDefault(tp, 0);
+  }
+
+  /** Whether the partition already has as many batches in flight as it may. */
+  private boolean atLimit(TopicPartition tp) {
+    int limit = ordered ? 1 : partitionLimit.getAsInt();
+    return limit > 0 && inFlight(tp) >= limit;
+  }
+
+  /**
+   * Keeps a partition paused while it is at its batch limit, so its records are not fetched only to
+   * be sent back and fetched again.
+   */
+  @Override
+  public boolean holdsPartition(TopicPartition tp) {
+    return atLimit(tp);
+  }
+
   @Override
   public void start() {
     if (!running.compareAndSet(false, true)) {
@@ -150,8 +186,9 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       // Offsets are not assumed consecutive (compaction, transaction markers).
       long[] offsets = polled.stream().mapToLong(ConsumerRecord::offset).toArray();
 
-      if (ordered && batchInFlight.contains(tp)) {
-        // Keep partition order: this batch waits until the previous one of the partition is done.
+      if (atLimit(tp)) {
+        // Ordered: keep partition order, this batch waits until the previous one is done.
+        // Unordered: the partition already has its share of batches in flight.
         rejected = reject(rejected, tp, offsets[0]);
         continue;
       }
@@ -165,6 +202,12 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       try {
         todo = offsetTracker.registerBatchUnlessDone(tp, offsets);
       } catch (WindowFullException e) {
+        rejected = reject(rejected, tp, offsets[0]);
+        continue;
+      } catch (RuntimeException e) {
+        // Registration is all-or-nothing, so the whole batch can be fetched again. Do not let one
+        // partition's failure drop the other partitions' records from this poll.
+        reportDispatchFailure(tp, offsets[0], e);
         rejected = reject(rejected, tp, offsets[0]);
         continue;
       }
@@ -183,13 +226,13 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     // Captured on the poll thread, where rebalance callbacks also run, so it is exactly the
     // generation the batch was registered under.
     long generation = offsetTracker.generation(tp);
-    if (ordered) batchInFlight.add(tp);
+    batchesInFlight.merge(tp, 1, Integer::sum);
     executor.submit(() -> processBatch(tp, batch, offsets, bytes, generation));
   }
 
   @Override
   public boolean canResume(TopicPartition tp) {
-    return taskQueueDrained() && !(ordered && batchInFlight.contains(tp));
+    return taskQueueDrained() && !atLimit(tp);
   }
 
   private void processBatch(
@@ -218,11 +261,14 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       // Shutdown while waiting for a permit: the batch was never started, so leave its offsets
       // unacked and let it be redelivered.
       Thread.currentThread().interrupt();
+    } catch (Throwable t) {
+      // submit() would hide this in an unread Future; log it (and stop on a fatal error).
+      reportWorkerError(t);
     } finally {
       // Always release the in-flight slots, even if the partition was revoked mid-processing and
       // the ack below failed; otherwise backpressure would never drain.
       counter.completed(batch.size(), totalBytes);
-      if (ordered) batchInFlight.remove(tp);
+      batchesInFlight.computeIfPresent(tp, (x, n) -> n <= 1 ? null : n - 1);
     }
   }
 
@@ -247,7 +293,8 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     String desc = "batch [" + firstOffset + ".." + lastOffset + "]";
 
     Exception lastError =
-        retryExecutor.executeWithRetries(attempt -> handler.handleBatch(tp, batch), tp, desc);
+        retryExecutor.executeWithRetries(
+            attempt -> handler.handleBatch(tp, batch), tp, desc, this::stopping);
 
     if (lastError == null) {
       ackBatch(tp, offsets, generation, desc);

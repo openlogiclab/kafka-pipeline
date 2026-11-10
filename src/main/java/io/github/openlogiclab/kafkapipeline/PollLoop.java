@@ -18,6 +18,7 @@ package io.github.openlogiclab.kafkapipeline;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.dispatch.PartitionPauseController;
 import io.github.openlogiclab.kafkapipeline.dispatch.PeriodicCommitter;
+import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.worker.WorkerPool;
 import java.time.Duration;
@@ -45,6 +46,7 @@ final class PollLoop<K, V> {
   private final PartitionPauseController pauseController;
   private final WorkerPool<K, V> workerPool;
   private final PipelineMetricsCollector metricsCollector;
+  private final Runnable beforePoll;
   private boolean throttled;
 
   PollLoop(
@@ -55,6 +57,31 @@ final class PollLoop<K, V> {
       PartitionPauseController pauseController,
       WorkerPool<K, V> workerPool,
       PipelineMetricsCollector metricsCollector) {
+    this(
+        consumer,
+        pollTimeout,
+        committer,
+        backpressure,
+        pauseController,
+        workerPool,
+        metricsCollector,
+        () -> {});
+  }
+
+  /**
+   * Creates the loop with a hook that runs on the poll thread before each poll, such as retrying
+   * partitions whose initialization failed.
+   */
+  PollLoop(
+      Consumer<K, V> consumer,
+      Duration pollTimeout,
+      PeriodicCommitter committer,
+      BackpressureController backpressure,
+      PartitionPauseController pauseController,
+      WorkerPool<K, V> workerPool,
+      PipelineMetricsCollector metricsCollector,
+      Runnable beforePoll) {
+    this.beforePoll = beforePoll;
     this.consumer = consumer;
     this.pollTimeout = pollTimeout;
     this.committer = committer;
@@ -73,6 +100,8 @@ final class PollLoop<K, V> {
           logger.log(System.Logger.Level.WARNING, "Unexpected wakeup in poll loop");
         }
       } catch (Exception e) {
+        // Errors that retrying cannot fix end the loop; the pipeline stops and reports them.
+        if (FatalErrors.isFatal(e)) throw e;
         logger.log(System.Logger.Level.ERROR, "Error in poll loop", e);
         if (running.getAsBoolean() && !backOff()) break;
       }
@@ -82,6 +111,7 @@ final class PollLoop<K, V> {
   private void pollOnce() {
     // Periodic commits run here: the consumer is not thread-safe.
     committer.maybeCommitAsync();
+    beforePoll.run();
 
     updateThrottle();
     // Reapplied before every poll so partitions assigned by a rebalance are paused too.

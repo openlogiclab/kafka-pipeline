@@ -54,6 +54,9 @@ final class CompletedOffsetsCodec {
   /** Upper bound on the decoded bitmap, so a corrupt or hostile string cannot exhaust memory. */
   private static final int MAX_DECODED_BYTES = MAX_SPAN / 8;
 
+  private static final ThreadLocal<Deflater> DEFLATER =
+      ThreadLocal.withInitial(() -> new Deflater(Deflater.BEST_SPEED));
+
   private CompletedOffsetsCodec() {}
 
   /**
@@ -66,28 +69,27 @@ final class CompletedOffsetsCodec {
       return "";
     }
     byte[] raw = done.toByteArray();
-    Deflater deflater = new Deflater(Deflater.BEST_SPEED);
-    try {
-      deflater.setInput(raw);
-      deflater.finish();
-      ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, raw.length / 4));
-      byte[] buf = new byte[1024];
-      while (!deflater.finished()) {
-        int n = deflater.deflate(buf);
-        out.write(buf, 0, n);
-        if (out.size() > MAX_LENGTH) {
-          return "";
-        }
+    // Reuse one native zlib stream per thread (in practice only the poll thread encodes): creating
+    // a Deflater allocates about 256 KB off-heap each time.
+    Deflater deflater = DEFLATER.get();
+    deflater.reset();
+    deflater.setInput(raw);
+    deflater.finish();
+    ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, raw.length / 4));
+    byte[] buf = new byte[1024];
+    while (!deflater.finished()) {
+      int n = deflater.deflate(buf);
+      out.write(buf, 0, n);
+      if (out.size() > MAX_LENGTH) {
+        return "";
       }
-      String encoded =
-          PREFIX
-              + base
-              + ':'
-              + Base64.getUrlEncoder().withoutPadding().encodeToString(out.toByteArray());
-      return encoded.length() <= MAX_LENGTH ? encoded : "";
-    } finally {
-      deflater.end();
     }
+    String encoded =
+        PREFIX
+            + base
+            + ':'
+            + Base64.getUrlEncoder().withoutPadding().encodeToString(out.toByteArray());
+    return encoded.length() <= MAX_LENGTH ? encoded : "";
   }
 
   /**
