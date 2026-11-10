@@ -84,6 +84,16 @@ public sealed interface OffsetStats permits OffsetTracker {
   int windowSize(TopicPartition tp);
 
   /**
+   * How long the partition's committable offset has not moved while it has records pending or in
+   * progress.
+   *
+   * @param tp the topic partition
+   * @return milliseconds since the committable offset last advanced, or 0 if nothing is waiting or
+   *     the partition is not tracked
+   */
+  long commitStallMillis(TopicPartition tp);
+
+  /**
    * Maximum number of entries a partition window can hold before registration fails with {@link
    * WindowFullException}.
    *

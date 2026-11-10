@@ -34,12 +34,15 @@ import io.github.openlogiclab.kafkapipeline.worker.SingleRecordWorkerPool;
 import io.github.openlogiclab.kafkapipeline.worker.WorkerPool;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.errors.WakeupException;
 
 /**
  * Main entry point for the Kafka Pipeline library. Wraps a {@link KafkaConsumer} with concurrent
@@ -129,7 +132,9 @@ public final class KafkaPipeline<K, V> {
 
   private final PipelineConfig<K, V> config;
 
+  private final AtomicBoolean started = new AtomicBoolean(false);
   private final AtomicBoolean running = new AtomicBoolean(false);
+  private volatile Throwable failure;
   private final CountDownLatch shutdownLatch = new CountDownLatch(1);
 
   private final boolean ownsConsumer;
@@ -142,7 +147,7 @@ public final class KafkaPipeline<K, V> {
   private final WorkerPool<K, V> workerPool;
   private final PipelineMetricsCollector metricsCollector;
 
-  private Consumer<K, V> consumer;
+  private volatile Consumer<K, V> consumer;
   private PeriodicCommitter committer;
   private PartitionPauseController pauseController;
   private PipelineRebalanceListener rebalanceListener;
@@ -181,7 +186,8 @@ public final class KafkaPipeline<K, V> {
     this.counter = new InFlightCounter();
     this.backpressure = buildBackpressureController(config, counter);
     this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
-    this.retryExecutor = new RetryExecutor<>(config.errorStrategy(), metricsCollector);
+    this.retryExecutor =
+        new RetryExecutor<>(config.errorStrategy(), metricsCollector, config.processingTimeout());
     this.dispatcher =
         new RecordDispatcher<>(
             config.dispatchQueueCapacity(),
@@ -204,14 +210,31 @@ public final class KafkaPipeline<K, V> {
     return PipelineConfig.builder();
   }
 
-  /** Starts the pipeline. Blocks the calling thread until {@link #stop()} is called. */
+  /**
+   * Starts the pipeline. Blocks the calling thread until {@link #stop()} is called or the pipeline
+   * fails.
+   *
+   * <p>Before starting any worker, the pipeline checks that the consumer can reach the brokers (a
+   * metadata request bounded by the consumer's {@code default.api.timeout.ms}). If it cannot, or if
+   * the pipeline later hits an error it cannot recover from (bad credentials or ACLs, a fenced or
+   * invalid group member, an unsupported broker, a partition with no offset and {@code
+   * auto.offset.reset=none}, or a JVM error such as {@link OutOfMemoryError}), it shuts down,
+   * {@link #isRunning()} turns false, and this method rethrows the cause. The cause is also
+   * available from {@link #failure()}.
+   *
+   * @throws IllegalStateException if the pipeline was already started
+   * @throws RuntimeException the error that stopped the pipeline
+   */
   public void start() {
-    if (!running.compareAndSet(false, true)) {
+    if (!started.compareAndSet(false, true)) {
       throw new IllegalStateException("Pipeline already started");
     }
+    running.set(true);
 
     try {
       initConsumer();
+      verifyBrokerConnection();
+      workerPool.onFatalError(this::fail);
       workerPool.start();
       committer.start();
       registerShutdownHook();
@@ -231,27 +254,80 @@ public final class KafkaPipeline<K, V> {
               backpressure,
               pauseController,
               workerPool,
-              metricsCollector)
+              metricsCollector,
+              rebalanceListener::retryPendingInit)
           .run(running::get);
-    } catch (Exception e) {
-      logger.log(System.Logger.Level.ERROR, "Pipeline error", e);
+    } catch (WakeupException e) {
+      // stop() woke a blocking startup call (such as the broker check): a normal stop.
+      if (running.get()) fail(e);
+    } catch (Throwable t) {
+      fail(t);
     } finally {
+      running.set(false);
       shutdown();
       shutdownLatch.countDown();
     }
+
+    Throwable cause = failure;
+    if (cause instanceof RuntimeException re) throw re;
+    if (cause instanceof Error err) throw err;
+    if (cause != null) throw new IllegalStateException("Pipeline failed", cause);
   }
 
   /**
-   * Starts the pipeline on a daemon thread. Returns immediately.
+   * Starts the pipeline on a daemon thread. Returns immediately. If the pipeline fails, the thread
+   * ends and the cause is available from {@link #failure()}.
    *
    * @return the daemon thread running the pipeline
    */
   public Thread startAsync() {
-    Thread thread = new Thread(this::start);
+    Thread thread =
+        new Thread(
+            () -> {
+              try {
+                start();
+              } catch (Throwable t) {
+                // Already logged and kept in failure().
+              }
+            });
     thread.setName("kafka-pipeline-main");
     thread.setDaemon(true);
     thread.start();
     return thread;
+  }
+
+  /**
+   * Returns the error that stopped the pipeline, if it failed.
+   *
+   * @return the cause, or empty if the pipeline has not failed
+   */
+  public Optional<Throwable> failure() {
+    return Optional.ofNullable(failure);
+  }
+
+  /** Records the first fatal error and stops the pipeline. Safe to call from any thread. */
+  private void fail(Throwable t) {
+    synchronized (this) {
+      if (failure == null) failure = t;
+    }
+    logger.log(System.Logger.Level.ERROR, "Pipeline failed, shutting down", t);
+    stop();
+  }
+
+  /**
+   * Fails fast when the brokers are unreachable or reject the client: there is no point starting
+   * workers that would wait forever for records.
+   */
+  private void verifyBrokerConnection() {
+    Map<String, ?> topics = consumer.listTopics();
+    for (String topic : config.topics()) {
+      if (topics != null && !topics.containsKey(topic)) {
+        logger.log(
+            System.Logger.Level.WARNING,
+            "Topic {0} does not exist yet; the pipeline waits until it is created",
+            topic);
+      }
+    }
   }
 
   /**
@@ -321,16 +397,20 @@ public final class KafkaPipeline<K, V> {
       InFlightCounter counter,
       PipelineMetricsCollector metricsCollector) {
     if (config.isBatchMode()) {
-      return new BatchWorkerPool<>(
-          config.concurrency(),
-          config.threadMode(),
-          config.batchHandler(),
-          retryExecutor,
-          offsetTracker,
-          counter,
-          config.dispatchQueueCapacity(),
-          metricsCollector,
-          config.ordering());
+      BatchWorkerPool<K, V> pool =
+          new BatchWorkerPool<>(
+              config.concurrency(),
+              config.threadMode(),
+              config.batchHandler(),
+              retryExecutor,
+              offsetTracker,
+              counter,
+              config.dispatchQueueCapacity(),
+              metricsCollector,
+              config.ordering());
+      // Same per-partition limit (with its fair-share floor) as per-record mode.
+      pool.partitionLimit(dispatcher::effectivePartitionLimit);
+      return pool;
     }
     return new SingleRecordWorkerPool<>(
         config.concurrency(),
@@ -368,6 +448,8 @@ public final class KafkaPipeline<K, V> {
             metricsCollector,
             config.skipCompletedOnRestart());
 
+    pauseController.addHold(rebalanceListener::isPendingInit);
+    pauseController.addHold(workerPool::holdsPartition);
     consumer.subscribe(config.topics(), rebalanceListener);
   }
 
@@ -379,12 +461,15 @@ public final class KafkaPipeline<K, V> {
     } catch (Exception e) {
       logger.log(System.Logger.Level.WARNING, "Error stopping workers", e);
     }
+    retryExecutor.close();
 
-    try {
-      committer.commitSync();
-      committer.stop();
-    } catch (Exception e) {
-      logger.log(System.Logger.Level.WARNING, "Error during final commit", e);
+    if (committer != null) {
+      try {
+        committer.commitSync();
+        committer.stop();
+      } catch (Exception e) {
+        logger.log(System.Logger.Level.WARNING, "Error during final commit", e);
+      }
     }
 
     if (rebalanceListener != null) {
@@ -395,7 +480,7 @@ public final class KafkaPipeline<K, V> {
       }
     }
 
-    if (ownsConsumer) {
+    if (ownsConsumer && consumer != null) {
       try {
         consumer.close(
             org.apache.kafka.clients.consumer.CloseOptions.timeout(config.shutdownTimeout()));

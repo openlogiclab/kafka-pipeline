@@ -23,9 +23,10 @@ package io.github.openlogiclab.kafkapipeline.backpressure;
  * when the application's overall memory usage grows — regardless of whether the pressure comes from
  * in-flight records, producer buffers, or other allocations.
  *
- * <p>Heap usage is measured via {@code MemoryMXBean.getHeapMemoryUsage()} which reports {@code
- * used/max} — the ratio of occupied heap to the JVM maximum ({@code -Xmx} or {@code
- * -XX:MaxRAMPercentage}).
+ * <p>Heap usage is the ratio of occupied heap to the JVM maximum ({@code -Xmx} or {@code
+ * -XX:MaxRAMPercentage}): the lower of the current {@code MemoryMXBean.getHeapMemoryUsage()} and
+ * the heap occupied right after the last GC, so garbage that has not been collected yet does not
+ * trigger throttling. See {@link HeapSensor}.
  *
  * @param throttleThreshold heap usage ratio at which the consumer pauses polling
  * @param resumeThreshold heap usage ratio at which the consumer resumes polling

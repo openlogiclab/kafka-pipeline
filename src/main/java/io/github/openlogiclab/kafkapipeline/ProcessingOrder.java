@@ -35,6 +35,16 @@ public enum ProcessingOrder {
    * keys. Records with a {@code null} key are not ordered. Retries of a record hold back later
    * records of its key.
    *
+   * <p>Keys are compared with {@code equals}/{@code hashCode} ({@code byte[]} keys by content). A
+   * key type without value-based equality (a plain object that does not override them) compares by
+   * identity, so equal keys from different records count as different keys and are not ordered.
+   *
+   * <p>Records waiting behind a busy key count toward the partition's {@code
+   * dispatchQueueCapacity}. A hot key can therefore fill the queue with records that can only run
+   * one at a time, and the partition pauses until they drain, delaying other keys of the same
+   * partition. For heavily skewed keys, use a larger {@code dispatchQueueCapacity} or spread the
+   * hot key over more partitions.
+   *
    * <p>In batch mode this behaves like {@link #PARTITION}, because a batch mixes keys.
    */
   KEY,

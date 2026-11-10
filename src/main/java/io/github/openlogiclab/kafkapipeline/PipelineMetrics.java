@@ -120,6 +120,9 @@ import org.apache.kafka.common.TopicPartition;
  * @param drainTimeouts drains that did not complete in time (counter)
  * @param recordsAbandoned records abandoned during rebalance (counter)
  * @param assignedPartitions currently assigned partitions (gauge)
+ * @param partitionCommitStallMillis per-partition time the committable offset has not moved while
+ *     records are pending or in progress (gauge)
+ * @param processingTimeouts handler attempts interrupted by the processing timeout (counter)
  * @see KafkaPipeline#metrics()
  */
 public record PipelineMetrics(
@@ -275,4 +278,23 @@ public record PipelineMetrics(
      *
      * <p>The returned set is an unmodifiable snapshot.
      */
-    Set<TopicPartition> assignedPartitions) {}
+    Set<TopicPartition> assignedPartitions,
+
+    // ── Stalls ─────────────────────────────────────────────────
+
+    /**
+     * Per-partition time, in milliseconds, since the partition's committable offset last moved,
+     * while it has records pending or in progress. (Gauge)
+     *
+     * <p>Partitions that are idle or committing normally are omitted. A value that keeps growing
+     * means a record at the head of the partition is stuck (a slow or hung handler): its commits
+     * are held back and the partition pauses once its window fills. Alert on it, and consider
+     * {@code processingTimeout}. The returned map is an unmodifiable snapshot.
+     */
+    Map<TopicPartition, Long> partitionCommitStallMillis,
+
+    /**
+     * Total handler attempts that ran past {@code processingTimeout} and were interrupted since
+     * pipeline start. (Counter)
+     */
+    long processingTimeouts) {}

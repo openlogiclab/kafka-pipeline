@@ -64,6 +64,8 @@ public final class RecordDispatcher<K, V> {
   // Whether in-flight records per partition are counted (a limit or strict partition order).
   private final boolean limited;
   private final Set<Thread> waitingWorkers = ConcurrentHashMap.newKeySet();
+  // Orders queue add/remove with the cleanup of state retained for revoked partitions.
+  private final Object retainedStateLock = new Object();
 
   // Approximate number of queued records, used to decide whether to wake another worker. It can
   // briefly lag the queues; the park timeout in poll() bounds the cost of a missed wakeup.
@@ -222,14 +224,20 @@ public final class RecordDispatcher<K, V> {
    * @param generation the offset-tracker generation of this assignment
    */
   public void addPartition(TopicPartition tp, long generation) {
+    synchronized (retainedStateLock) {
+      addLane(tp, generation);
+    }
+    rebuildSnapshot();
+    logger.log(System.Logger.Level.DEBUG, "Added dispatch queue for {0}", tp);
+  }
+
+  private void addLane(TopicPartition tp, long generation) {
     queues.computeIfAbsent(
         tp,
         t -> {
           AtomicInteger active = activeByPartition.computeIfAbsent(t, x -> new AtomicInteger());
           return new Lane<>(t, newQueue(t), active, generation);
         });
-    rebuildSnapshot();
-    logger.log(System.Logger.Level.DEBUG, "Added dispatch queue for {0}", tp);
   }
 
   private LaneQueue<K, V> newQueue(TopicPartition tp) {
@@ -238,7 +246,7 @@ public final class RecordDispatcher<K, V> {
       return new KeyedLaneQueue<>(
           queueCapacity, keyGuards.computeIfAbsent(tp, x -> new KeyedLaneQueue.KeyGuard()));
     }
-    return new FifoLaneQueue<>(queueCapacity);
+    return new FIFOLaneQueue<>(queueCapacity);
   }
 
   /**
@@ -256,15 +264,27 @@ public final class RecordDispatcher<K, V> {
     // Keep the partition's in-flight state only while something from it is still running, so a
     // consumer that sees many partitions over its life does not keep state for each of them. The
     // queue is drained, so nothing new can be taken from it after this check.
-    if (lane.active.get() == 0) activeByPartition.remove(tp, lane.active);
-    KeyedLaneQueue.KeyGuard guard = keyGuards.get(tp);
-    if (guard != null && guard.idle()) keyGuards.remove(tp, guard);
+    synchronized (retainedStateLock) {
+      dropRetainedStateIfIdle(tp, lane);
+    }
     logger.log(
         System.Logger.Level.DEBUG,
         "Removed dispatch queue for {0}, discarded {1} records",
         tp,
         drained.size());
     return drained;
+  }
+
+  /**
+   * Drops the partition's in-flight state once nothing of it runs and it has no queue. Called when
+   * the partition is removed, and again when its last in-flight record finishes, so a partition
+   * revoked while busy and never assigned back does not keep its state forever.
+   */
+  private void dropRetainedStateIfIdle(TopicPartition tp, Lane<K, V> lane) {
+    if (queues.get(tp) != null) return; // assigned again: the new queue uses this state
+    if (lane.active.get() == 0) activeByPartition.remove(tp, lane.active);
+    KeyedLaneQueue.KeyGuard guard = keyGuards.get(tp);
+    if (guard != null && guard.idle()) keyGuards.remove(tp, guard);
   }
 
   @SuppressWarnings("unchecked")
@@ -460,6 +480,12 @@ public final class RecordDispatcher<K, V> {
     Lane<K, V> current = queues.get(lane.tp);
     if (freed && current != null && current.queue.hasReady()) {
       wakeOneWorker();
+    }
+    if (current == null) {
+      // The record outlived its queue (partition revoked). Rare, so taking the lock is fine.
+      synchronized (retainedStateLock) {
+        dropRetainedStateIfIdle(lane.tp, lane);
+      }
     }
   }
 

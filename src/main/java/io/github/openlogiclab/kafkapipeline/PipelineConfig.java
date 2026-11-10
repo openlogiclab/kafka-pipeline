@@ -53,9 +53,11 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
  * @param pollTimeout Kafka consumer poll timeout
  * @param dispatchQueueCapacity capacity of per-partition dispatch queues
  * @param maxWindowSize max tracked offsets per partition before that partition is paused
- * @param maxConcurrencyPerPartition max records of one partition processed at once (per-record
- *     mode); 0 means unlimited
+ * @param maxConcurrencyPerPartition max records (per-record mode) or batches (batch mode) of one
+ *     partition processed at once; 0 means unlimited
  * @param ordering ordering guarantee for records of the same partition
+ * @param processingTimeout max duration of one handler attempt before it is interrupted and counted
+ *     as failed; zero disables it
  * @param skipCompletedOnRestart record finished-but-uncommitted offsets in commit metadata and skip
  *     them when the partition is consumed again
  */
@@ -80,7 +82,8 @@ public record PipelineConfig<K, V>(
     int maxWindowSize,
     int maxConcurrencyPerPartition,
     ProcessingOrder ordering,
-    boolean skipCompletedOnRestart) {
+    boolean skipCompletedOnRestart,
+    Duration processingTimeout) {
   /** Validates configuration constraints. */
   public PipelineConfig {
     Objects.requireNonNull(consumerProperties, "consumerProperties");
@@ -93,6 +96,11 @@ public record PipelineConfig<K, V>(
     Objects.requireNonNull(errorStrategy, "errorStrategy");
     Objects.requireNonNull(lifecycleHook, "lifecycleHook");
     Objects.requireNonNull(ordering, "ordering");
+    requirePositive(commitInterval, "commitInterval");
+    requireNonNegative(drainTimeout, "drainTimeout");
+    requireNonNegative(shutdownTimeout, "shutdownTimeout");
+    requireNonNegative(pollTimeout, "pollTimeout");
+    requireNonNegative(processingTimeout, "processingTimeout");
 
     if (handler == null && batchHandler == null) {
       throw new IllegalArgumentException("Either handler or batchHandler must be set");
@@ -124,6 +132,43 @@ public record PipelineConfig<K, V>(
               + ") must be >= max.poll.records ("
               + maxPollRecords
               + "), otherwise a single poll may never fit in a partition window");
+    }
+    long maxPollIntervalMs = maxPollIntervalMs(consumerProperties);
+    if (drainTimeout.toMillis() >= maxPollIntervalMs) {
+      // The revoke callback blocks the poll thread for up to drainTimeout; reaching
+      // max.poll.interval.ms there makes the consumer leave the group mid-rebalance.
+      throw new IllegalArgumentException(
+          "drainTimeout ("
+              + drainTimeout
+              + ") must be less than max.poll.interval.ms ("
+              + maxPollIntervalMs
+              + "ms)");
+    }
+  }
+
+  private static void requirePositive(Duration d, String name) {
+    Objects.requireNonNull(d, name);
+    if (d.isZero() || d.isNegative()) {
+      throw new IllegalArgumentException(name + " must be positive, got " + d);
+    }
+  }
+
+  private static void requireNonNegative(Duration d, String name) {
+    Objects.requireNonNull(d, name);
+    if (d.isNegative()) {
+      throw new IllegalArgumentException(name + " must not be negative, got " + d);
+    }
+  }
+
+  private static long maxPollIntervalMs(Properties props) {
+    Object value = props.get(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG);
+    if (value == null) {
+      return 300_000L; // Kafka's default max.poll.interval.ms
+    }
+    try {
+      return Long.parseLong(value.toString().trim());
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException("Invalid max.poll.interval.ms: " + value, e);
     }
   }
 
@@ -181,6 +226,7 @@ public record PipelineConfig<K, V>(
     private int maxConcurrencyPerPartition = 0;
     private ProcessingOrder ordering = ProcessingOrder.UNORDERED;
     private boolean skipCompletedOnRestart = true;
+    private Duration processingTimeout = Duration.ZERO;
     private int maxWindowSize = 10_000;
 
     private Builder() {}
@@ -384,8 +430,9 @@ public record PipelineConfig<K, V>(
 
     /**
      * Maximum time to wait for in-flight records to complete during a rebalance before abandoning
-     * them. Records still in-flight after this timeout are abandoned (not committed), and will be
-     * redelivered to the new partition owner.
+     * them. Must be less than the consumer's {@code max.poll.interval.ms}, because the poll thread
+     * waits for the drain. Records still in-flight after this timeout are abandoned (not
+     * committed), and will be redelivered to the new partition owner.
      *
      * <p>Default: {@code 30 seconds}.
      *
@@ -400,6 +447,11 @@ public record PipelineConfig<K, V>(
     /**
      * Maximum time to wait for worker threads to finish during {@code stop()}.
      *
+     * <p>The same timeout bounds the consumer close afterwards, so a full shutdown can take up to
+     * about twice this value. Keep that below the time your platform allows before a hard kill (for
+     * example Kubernetes' {@code terminationGracePeriodSeconds}, 30 seconds by default), or the
+     * final commit is lost and finished records are processed again after restart.
+     *
      * <p>Default: {@code 30 seconds}.
      *
      * @param timeout the shutdown timeout
@@ -407,6 +459,26 @@ public record PipelineConfig<K, V>(
      */
     public Builder<K, V> shutdownTimeout(Duration timeout) {
       this.shutdownTimeout = timeout;
+      return this;
+    }
+
+    /**
+     * Maximum duration of one handler attempt. An attempt still running after this is interrupted
+     * and counted as a failed attempt, so it goes through the error strategy (retry, then DLQ or
+     * skip) and its partition can commit past it. Without a timeout, a handler call that never
+     * returns holds back its partition's commits until a rebalance.
+     *
+     * <p>The timeout works by interrupting the worker thread: a handler that ignores interrupts
+     * (for example blocking socket I/O without its own timeout) cannot be stopped this way and
+     * keeps its worker until it returns. Give I/O clients their own timeouts as well.
+     *
+     * <p>Default: {@code 0} (disabled).
+     *
+     * @param timeout the per-attempt timeout; zero disables it
+     * @return this builder
+     */
+    public Builder<K, V> processingTimeout(Duration timeout) {
+      this.processingTimeout = timeout;
       return this;
     }
 
@@ -476,8 +548,8 @@ public record PipelineConfig<K, V>(
     }
 
     /**
-     * Maximum number of records from the same partition that may be processed at the same time
-     * (per-record mode only).
+     * Maximum number of records (per-record mode) or batches (batch mode) from the same partition
+     * that may be processed at the same time.
      *
      * <p>All partitions share one worker pool. Without a limit, a partition whose records are slow
      * (a slow downstream, a hot key range) can occupy every worker while records of other
@@ -490,7 +562,11 @@ public record PipelineConfig<K, V>(
      * once there are enough partitions to share the pool. A good starting point is about {@code 2 ×
      * concurrency / expectedPartitionsPerInstance}.
      *
-     * <p>Ignored in batch mode, where each poll submits at most one batch per partition.
+     * <p>In unordered batch mode the limit counts batches of one partition in flight. Without it, a
+     * slow partition keeps submitting batches until its window is nearly full, and those records
+     * alone can push the shared in-flight count over the backpressure high watermark and throttle
+     * every partition. A partition at its limit is paused on its own until a batch finishes.
+     * Ordered batch modes always allow one batch per partition.
      *
      * <p>Default: {@code 0} (unlimited).
      *
@@ -581,7 +657,8 @@ public record PipelineConfig<K, V>(
           maxWindowSize,
           maxConcurrencyPerPartition,
           ordering,
-          skipCompletedOnRestart);
+          skipCompletedOnRestart,
+          processingTimeout);
     }
   }
 }

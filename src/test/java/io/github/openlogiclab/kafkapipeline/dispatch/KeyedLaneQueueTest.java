@@ -109,7 +109,7 @@ class KeyedLaneQueueTest {
 
   @Test
   void fifoLane_releaseIsANoOp() {
-    FifoLaneQueue<String, String> q = new FifoLaneQueue<>(2);
+    FIFOLaneQueue<String, String> q = new FIFOLaneQueue<>(2);
     ConsumerRecord<String, String> r = new ConsumerRecord<>("t", 0, 0, "k", "v");
     q.offer(r);
     q.release(r);
