@@ -19,8 +19,8 @@ import io.github.openlogiclab.kafkapipeline.ProcessingOrder;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
 import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
-import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
+import io.github.openlogiclab.kafkapipeline.internal.WorkerMetrics;
 import io.github.openlogiclab.kafkapipeline.offset.ProcessingProgress;
 import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
 import java.util.ArrayList;
@@ -48,7 +48,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   private final RetryExecutor<K, V> retryExecutor;
   private final ProcessingProgress offsetTracker;
   private final InFlightCounter counter;
-  private final PipelineMetricsCollector metricsCollector;
+  private final WorkerMetrics metrics;
   private final FailureResolver<K, V> failures;
 
   // Virtual-thread executors start a thread per task with no upper bound, so concurrency is
@@ -76,7 +76,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
    * @param taskQueueCapacity max queued batch tasks for PLATFORM mode; acts as a safety net when
    *     backpressure alone is insufficient. For VIRTUAL threads this is ignored (each task gets its
    *     own lightweight thread).
-   * @param metricsCollector pipeline metrics collector
+   * @param metrics pipeline metrics collector
    */
   public BatchWorkerPool(
       int concurrency,
@@ -86,7 +86,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       ProcessingProgress offsetTracker,
       InFlightCounter counter,
       int taskQueueCapacity,
-      PipelineMetricsCollector metricsCollector) {
+      WorkerMetrics metrics) {
     this(
         concurrency,
         threadMode,
@@ -95,7 +95,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
         offsetTracker,
         counter,
         taskQueueCapacity,
-        metricsCollector,
+        metrics,
         ProcessingOrder.UNORDERED);
   }
 
@@ -112,7 +112,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
    * @param offsetTracker offset tracker
    * @param counter in-flight counter
    * @param taskQueueCapacity executor task queue capacity (platform threads)
-   * @param metricsCollector metrics collector
+   * @param metrics the metrics this component records
    * @param order ordering guarantee
    */
   public BatchWorkerPool(
@@ -123,7 +123,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       ProcessingProgress offsetTracker,
       InFlightCounter counter,
       int taskQueueCapacity,
-      PipelineMetricsCollector metricsCollector,
+      WorkerMetrics metrics,
       ProcessingOrder order) {
     super(concurrency, threadMode, "kafka-pipeline-batch-", taskQueueCapacity);
     this.ordered = order != ProcessingOrder.UNORDERED;
@@ -131,8 +131,8 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     this.retryExecutor = retryExecutor;
     this.offsetTracker = offsetTracker;
     this.counter = counter;
-    this.metricsCollector = metricsCollector;
-    this.failures = new FailureResolver<>(retryExecutor, offsetTracker, metricsCollector);
+    this.metrics = metrics;
+    this.failures = new FailureResolver<>(retryExecutor, offsetTracker);
     this.handlerPermits = threadMode == ThreadMode.VIRTUAL ? new Semaphore(concurrency) : null;
   }
 
@@ -298,7 +298,7 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
 
     if (lastError == null) {
       ackBatch(tp, offsets, generation, desc);
-      metricsCollector.recordProcessed(batch.size());
+      metrics.recordProcessed(batch.size());
       return;
     }
 

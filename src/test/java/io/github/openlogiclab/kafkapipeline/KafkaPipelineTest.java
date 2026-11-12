@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.backpressure.HeapBackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;

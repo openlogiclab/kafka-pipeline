@@ -14,6 +14,7 @@ module io.github.openlogiclab.kafkapipeline {
   requires static jdk.management;
 
   exports io.github.openlogiclab.kafkapipeline;
+  exports io.github.openlogiclab.kafkapipeline.metrics;
   exports io.github.openlogiclab.kafkapipeline.handler;
   exports io.github.openlogiclab.kafkapipeline.error;
   exports io.github.openlogiclab.kafkapipeline.backpressure;

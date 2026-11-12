@@ -26,6 +26,7 @@ import io.github.openlogiclab.kafkapipeline.error.Fallback;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
+import io.github.openlogiclab.kafkapipeline.internal.HandlerAttemptObserver;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.time.Duration;
@@ -93,7 +94,11 @@ class WorkerRobustnessTest {
         ThreadMode.PLATFORM,
         handler,
         hook,
-        new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE, processingTimeout),
+        new RetryExecutor<>(
+            strategy,
+            NoOpMetricsCollector.INSTANCE,
+            HandlerAttemptObserver.NONE,
+            processingTimeout),
         tracker,
         dispatcher,
         counter,
@@ -304,7 +309,10 @@ class WorkerRobustnessTest {
     void timeoutDuringShutdown_leavesRecordForRedelivery() {
       RetryExecutor<String, String> executor =
           new RetryExecutor<>(
-              ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE, Duration.ofMillis(20));
+              ErrorStrategy.skipOnError(),
+              NoOpMetricsCollector.INSTANCE,
+              HandlerAttemptObserver.NONE,
+              Duration.ofMillis(20));
       try {
         Exception result =
             executor.executeWithRetries(
@@ -327,7 +335,10 @@ class WorkerRobustnessTest {
     void attemptAfterClose_runsWithoutTimer() {
       RetryExecutor<String, String> executor =
           new RetryExecutor<>(
-              ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE, Duration.ofMillis(20));
+              ErrorStrategy.skipOnError(),
+              NoOpMetricsCollector.INSTANCE,
+              HandlerAttemptObserver.NONE,
+              Duration.ofMillis(20));
       executor.close();
       assertNull(executor.executeWithRetries(attempt -> {}, TP0, "late", () -> true));
     }
@@ -336,7 +347,10 @@ class WorkerRobustnessTest {
     void fastAttempts_neverSeeAStrayTimeoutInterrupt() throws Exception {
       RetryExecutor<String, String> executor =
           new RetryExecutor<>(
-              ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE, Duration.ofMillis(1));
+              ErrorStrategy.skipOnError(),
+              NoOpMetricsCollector.INSTANCE,
+              HandlerAttemptObserver.NONE,
+              Duration.ofMillis(1));
       try {
         for (int i = 0; i < 200; i++) {
           Exception result =
