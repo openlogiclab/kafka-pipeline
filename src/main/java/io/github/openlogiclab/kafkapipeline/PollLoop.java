@@ -19,7 +19,7 @@ import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.dispatch.PartitionPauseController;
 import io.github.openlogiclab.kafkapipeline.dispatch.PeriodicCommitter;
 import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
-import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.internal.PollMetrics;
 import io.github.openlogiclab.kafkapipeline.worker.WorkerPool;
 import java.time.Duration;
 import java.util.function.BooleanSupplier;
@@ -45,7 +45,7 @@ final class PollLoop<K, V> {
   private final BackpressureController backpressure;
   private final PartitionPauseController pauseController;
   private final WorkerPool<K, V> workerPool;
-  private final PipelineMetricsCollector metricsCollector;
+  private final PollMetrics metrics;
   private final Runnable beforePoll;
   private boolean throttled;
 
@@ -56,7 +56,7 @@ final class PollLoop<K, V> {
       BackpressureController backpressure,
       PartitionPauseController pauseController,
       WorkerPool<K, V> workerPool,
-      PipelineMetricsCollector metricsCollector) {
+      PollMetrics metrics) {
     this(
         consumer,
         pollTimeout,
@@ -64,7 +64,7 @@ final class PollLoop<K, V> {
         backpressure,
         pauseController,
         workerPool,
-        metricsCollector,
+        metrics,
         () -> {});
   }
 
@@ -79,7 +79,7 @@ final class PollLoop<K, V> {
       BackpressureController backpressure,
       PartitionPauseController pauseController,
       WorkerPool<K, V> workerPool,
-      PipelineMetricsCollector metricsCollector,
+      PollMetrics metrics,
       Runnable beforePoll) {
     this.beforePoll = beforePoll;
     this.consumer = consumer;
@@ -88,7 +88,7 @@ final class PollLoop<K, V> {
     this.backpressure = backpressure;
     this.pauseController = pauseController;
     this.workerPool = workerPool;
-    this.metricsCollector = metricsCollector;
+    this.metrics = metrics;
   }
 
   void run(BooleanSupplier running) {
@@ -118,9 +118,9 @@ final class PollLoop<K, V> {
     pauseController.apply(throttled);
 
     ConsumerRecords<K, V> records = consumer.poll(pollTimeout);
-    metricsCollector.recordPoll();
+    metrics.recordPoll();
     if (records.isEmpty()) {
-      metricsCollector.recordEmptyPoll();
+      metrics.recordEmptyPoll();
       return;
     }
     // Never drop polled records: the consumer position has already moved past them. Records that
@@ -132,7 +132,7 @@ final class PollLoop<K, V> {
     boolean shouldThrottle = backpressure.shouldThrottle();
     if (shouldThrottle == throttled) return;
     throttled = shouldThrottle;
-    if (throttled) metricsCollector.recordThrottle();
+    if (throttled) metrics.recordThrottle();
     logger.log(
         System.Logger.Level.DEBUG,
         "Backpressure: {0}. {1}",

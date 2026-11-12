@@ -15,62 +15,20 @@
  */
 package io.github.openlogiclab.kafkapipeline.internal;
 
-import io.github.openlogiclab.kafkapipeline.PipelineMetrics;
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureStatus;
-import java.util.Map;
-import java.util.Set;
 import org.apache.kafka.common.TopicPartition;
 
 /**
- * Null-object implementation of {@link PipelineMetricsCollector} that silently discards all events.
- * Used by backward-compatible constructors that don't receive a real collector.
+ * Discards every metric. For components built without a pipeline, mainly in tests.
+ *
+ * <p><strong>This is an internal API, not intended for direct use by library consumers.</strong>
  */
-public final class NoOpMetricsCollector extends PipelineMetricsCollector {
+public final class NoOpMetricsCollector
+    implements PollMetrics, CommitMetrics, RebalanceMetrics, WorkerMetrics, RetryMetrics {
 
   /** Singleton instance. */
   public static final NoOpMetricsCollector INSTANCE = new NoOpMetricsCollector();
 
-  private static final PipelineMetrics EMPTY =
-      new PipelineMetrics(
-          0,
-          0,
-          0,
-          0,
-          0,
-          0,
-          0,
-          BackpressureStatus.OK,
-          0,
-          Map.of(),
-          Map.of(),
-          0,
-          0,
-          0,
-          0,
-          0,
-          0,
-          0,
-          0,
-          0,
-          Set.of(),
-          Map.of(),
-          0);
-
-  private NoOpMetricsCollector() {
-    super(null, null, null);
-  }
-
-  @Override
-  public void recordProcessed(long count) {}
-
-  @Override
-  public void recordFailed(int count) {}
-
-  @Override
-  public void recordProcessingTimeout() {}
-
-  @Override
-  public void recordSkipped(int count) {}
+  private NoOpMetricsCollector() {}
 
   @Override
   public void recordPoll() {}
@@ -82,22 +40,16 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
   public void recordThrottle() {}
 
   @Override
-  public void recordRetry() {}
-
-  @Override
-  public void recordDlqSuccess(int count) {}
-
-  @Override
-  public void recordDlqFailure(int count) {}
-
-  @Override
-  public void recordFinalFailure() {}
-
-  @Override
   public void recordCommitSuccess() {}
 
   @Override
   public void recordCommitFailure() {}
+
+  @Override
+  public void partitionAssigned(TopicPartition tp) {}
+
+  @Override
+  public void partitionRevoked(TopicPartition tp) {}
 
   @Override
   public void recordRebalance() {}
@@ -109,13 +61,26 @@ public final class NoOpMetricsCollector extends PipelineMetricsCollector {
   public void recordAbandoned(long count) {}
 
   @Override
-  public void partitionAssigned(TopicPartition tp) {}
+  public void recordProcessed(long count) {}
 
   @Override
-  public void partitionRevoked(TopicPartition tp) {}
+  public void recordSkipped(int count) {}
 
   @Override
-  public PipelineMetrics snapshot() {
-    return EMPTY;
-  }
+  public void recordRetry() {}
+
+  @Override
+  public void recordProcessingTimeout() {}
+
+  @Override
+  public void recordDlqSuccess(int count) {}
+
+  @Override
+  public void recordDlqFailure(int count) {}
+
+  @Override
+  public void recordFailed(int count) {}
+
+  @Override
+  public void recordFinalFailure() {}
 }

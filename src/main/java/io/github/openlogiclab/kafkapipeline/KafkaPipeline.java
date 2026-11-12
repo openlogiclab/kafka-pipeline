@@ -25,7 +25,11 @@ import io.github.openlogiclab.kafkapipeline.dispatch.PartitionPauseController;
 import io.github.openlogiclab.kafkapipeline.dispatch.PeriodicCommitter;
 import io.github.openlogiclab.kafkapipeline.dispatch.PipelineRebalanceListener;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
+import io.github.openlogiclab.kafkapipeline.internal.AttemptPublisher;
+import io.github.openlogiclab.kafkapipeline.internal.ExporterBinding;
+import io.github.openlogiclab.kafkapipeline.internal.MetricsExporters;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import io.github.openlogiclab.kafkapipeline.worker.BatchWorkerPool;
@@ -146,6 +150,8 @@ public final class KafkaPipeline<K, V> {
   private final BackpressureController backpressure;
   private final WorkerPool<K, V> workerPool;
   private final PipelineMetricsCollector metricsCollector;
+  private final AttemptPublisher attemptPublisher = new AttemptPublisher();
+  private final MetricsExporters exporters;
 
   private volatile Consumer<K, V> consumer;
   private PeriodicCommitter committer;
@@ -185,9 +191,15 @@ public final class KafkaPipeline<K, V> {
         new UnorderedOffsetTracker(config.maxWindowSize(), config.skipCompletedOnRestart());
     this.counter = new InFlightCounter();
     this.backpressure = buildBackpressureController(config, counter);
-    this.metricsCollector = new PipelineMetricsCollector(counter, backpressure, offsetTracker);
+    this.metricsCollector =
+        new PipelineMetricsCollector(config.name(), counter, backpressure, offsetTracker);
+    this.exporters = new MetricsExporters(config.metricsExporters());
     this.retryExecutor =
-        new RetryExecutor<>(config.errorStrategy(), metricsCollector, config.processingTimeout());
+        new RetryExecutor<>(
+            config.errorStrategy(),
+            metricsCollector,
+            metricsCollector.andThen(attemptPublisher),
+            config.processingTimeout());
     this.dispatcher =
         new RecordDispatcher<>(
             config.dispatchQueueCapacity(),
@@ -232,6 +244,8 @@ public final class KafkaPipeline<K, V> {
     running.set(true);
 
     try {
+      exporters.bindAll(
+          new ExporterBinding(config.name(), metricsCollector::snapshot, attemptPublisher));
       initConsumer();
       verifyBrokerConnection();
       workerPool.onFatalError(this::fail);
@@ -490,6 +504,7 @@ public final class KafkaPipeline<K, V> {
     }
 
     removeShutdownHook();
+    exporters.closeAll(); // last, so exporters see the final commit's counters
 
     logger.log(System.Logger.Level.INFO, "Pipeline shut down complete");
   }

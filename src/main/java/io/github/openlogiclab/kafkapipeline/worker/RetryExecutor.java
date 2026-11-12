@@ -19,9 +19,12 @@ import io.github.openlogiclab.kafkapipeline.error.DLQHandler;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.error.Fallback;
 import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
-import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.internal.HandlerAttemptObserver;
+import io.github.openlogiclab.kafkapipeline.internal.RetryMetrics;
+import io.github.openlogiclab.kafkapipeline.metrics.AttemptOutcome;
 import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -44,17 +47,18 @@ public final class RetryExecutor<K, V> {
   private static final System.Logger logger = System.getLogger(RetryExecutor.class.getName());
 
   private final ErrorStrategy<K, V> strategy;
-  private final PipelineMetricsCollector metricsCollector;
+  private final RetryMetrics metrics;
+  private final HandlerAttemptObserver attempts;
   private final AttemptTimer timer;
 
   /**
-   * Creates a retry executor.
+   * Creates a retry executor with no processing timeout that reports attempts to no one.
    *
    * @param strategy the error strategy
-   * @param metricsCollector the metrics collector
+   * @param metrics the metrics this component records
    */
-  public RetryExecutor(ErrorStrategy<K, V> strategy, PipelineMetricsCollector metricsCollector) {
-    this(strategy, metricsCollector, Duration.ZERO);
+  public RetryExecutor(ErrorStrategy<K, V> strategy, RetryMetrics metrics) {
+    this(strategy, metrics, HandlerAttemptObserver.NONE, Duration.ZERO);
   }
 
   /**
@@ -62,15 +66,18 @@ public final class RetryExecutor<K, V> {
    * processingTimeout} and counts it as failed.
    *
    * @param strategy the error strategy
-   * @param metricsCollector the metrics collector
+   * @param metrics the metrics this component records
+   * @param attempts observes every handler attempt
    * @param processingTimeout max duration of one handler attempt; zero or null disables it
    */
   public RetryExecutor(
       ErrorStrategy<K, V> strategy,
-      PipelineMetricsCollector metricsCollector,
+      RetryMetrics metrics,
+      HandlerAttemptObserver attempts,
       Duration processingTimeout) {
     this.strategy = strategy;
-    this.metricsCollector = metricsCollector;
+    this.metrics = metrics;
+    this.attempts = Objects.requireNonNull(attempts, "attempts");
     this.timer =
         processingTimeout == null || processingTimeout.isZero() || processingTimeout.isNegative()
             ? AttemptTimer.DISABLED
@@ -98,7 +105,10 @@ public final class RetryExecutor<K, V> {
   public enum FailureResolution {
     /** All records sent to DLQ successfully. */
     DLQ_SUCCESS,
-    /** Records were skipped. */
+    /**
+     * At least one record was dropped (DLQ not configured or the DLQ send failed). Records sent to
+     * the DLQ before a failure still count as DLQ'd in the metrics.
+     */
     SKIPPED
   }
 
@@ -152,13 +162,16 @@ public final class RetryExecutor<K, V> {
       }
 
       AttemptTimer.Attempt timed = timer.start();
+      long startNanos = System.nanoTime();
       Throwable failure = null;
       try {
         task.execute(attempt);
       } catch (Throwable t) {
         failure = t;
       }
+      long elapsedNanos = System.nanoTime() - startNanos;
       boolean timedOut = timed.finish();
+      attempts.onAttempt(tp, elapsedNanos, outcomeOf(failure, timedOut));
 
       if (failure == null) {
         if (timedOut) {
@@ -185,7 +198,7 @@ public final class RetryExecutor<K, V> {
                 description + " of " + tp + " exceeded the processing timeout " + timer.timeout());
         timeout.initCause(failure);
         lastError = timeout;
-        metricsCollector.recordProcessingTimeout();
+        metrics.recordProcessingTimeout();
       } else if (Thread.currentThread().isInterrupted() || causedByInterrupt(failure)) {
         if (stopping.getAsBoolean()) {
           Thread.currentThread().interrupt();
@@ -200,7 +213,7 @@ public final class RetryExecutor<K, V> {
       }
 
       if (attempt < maxAttempts - 1) {
-        metricsCollector.recordRetry();
+        metrics.recordRetry();
         logger.log(
             System.Logger.Level.DEBUG,
             "Retry {0}/{1} for {2}: {3}",
@@ -211,6 +224,11 @@ public final class RetryExecutor<K, V> {
       }
     }
     return lastError;
+  }
+
+  private static AttemptOutcome outcomeOf(Throwable failure, boolean timedOut) {
+    if (failure == null) return AttemptOutcome.SUCCESS; // includes finishing after the timeout
+    return timedOut ? AttemptOutcome.TIMEOUT : AttemptOutcome.FAILURE;
   }
 
   /**
@@ -263,7 +281,7 @@ public final class RetryExecutor<K, V> {
           dlq.send(record, error);
           sentToDlq++;
         }
-        metricsCollector.recordDlqSuccess(recordCount);
+        metrics.recordDlqSuccess(recordCount);
         logger.log(System.Logger.Level.INFO, "Sent to DLQ: {0} ({1})", tp, description);
         return FailureResolution.DLQ_SUCCESS;
       } catch (Throwable dlqThrowable) {
@@ -271,7 +289,7 @@ public final class RetryExecutor<K, V> {
         Exception dlqError = asException(dlqThrowable);
         int failedToSend = recordCount - sentToDlq;
         if (sentToDlq > 0) {
-          metricsCollector.recordDlqSuccess(sentToDlq);
+          metrics.recordDlqSuccess(sentToDlq);
           logger.log(
               System.Logger.Level.WARNING,
               "Partial DLQ send for {0} ({1}): {2}/{3} records sent before failure",
@@ -280,7 +298,7 @@ public final class RetryExecutor<K, V> {
               sentToDlq,
               recordCount);
         }
-        metricsCollector.recordDlqFailure(failedToSend);
+        metrics.recordDlqFailure(failedToSend);
         logger.log(
             System.Logger.Level.ERROR,
             "DLQ send failed for {0} ({1}): {2}",
@@ -292,20 +310,22 @@ public final class RetryExecutor<K, V> {
         for (int i = sentToDlq; i < recordCount; i++) {
           invokeFinalFailureHandler(records.get(i), dlqError);
         }
+        // Only the records that did not reach the DLQ are dropped; the others count as DLQ'd.
+        metrics.recordFailed(failedToSend);
       }
     } else {
       // No DLQ configured, call final failure handler for all records
       for (ConsumerRecord<K, V> record : records) {
         invokeFinalFailureHandler(record, error);
       }
+      metrics.recordFailed(recordCount);
     }
 
-    metricsCollector.recordSkipped(recordCount);
     return FailureResolution.SKIPPED;
   }
 
   private void invokeFinalFailureHandler(ConsumerRecord<K, V> record, Exception error) {
-    metricsCollector.recordFinalFailure();
+    metrics.recordFinalFailure();
     try {
       strategy.finalFailureHandler().handle(record, error);
     } catch (Throwable handlerError) {

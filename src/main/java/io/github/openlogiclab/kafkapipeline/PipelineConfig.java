@@ -23,6 +23,7 @@ import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
+import io.github.openlogiclab.kafkapipeline.metrics.MetricsExporter;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -31,68 +32,74 @@ import java.util.Properties;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 
 /**
- * Top-level configuration for a {@link KafkaPipeline}.
+ * Top-level configuration for a {@link KafkaPipeline}. Created only through {@link #builder()}, so
+ * new options can be added without breaking callers.
+ *
+ * <p>Instances are immutable.
  *
  * @param <K> record key type
  * @param <V> record value type
- * @param consumerProperties Kafka consumer configuration
- * @param topics topics to subscribe to
- * @param handler per-record handler (mutually exclusive with batchHandler)
- * @param batchHandler batch handler (mutually exclusive with handler)
- * @param concurrency number of worker threads
- * @param threadMode platform or virtual threads
- * @param backpressure record-count backpressure configuration
- * @param byteBackpressure byte-level backpressure configuration
- * @param heapBackpressure heap-based backpressure configuration
- * @param customSensors custom backpressure sensors
- * @param errorStrategy retry and error handling configuration
- * @param lifecycleHook processing lifecycle callbacks
- * @param commitInterval interval between async offset commits
- * @param drainTimeout max wait for in-flight records during rebalance
- * @param shutdownTimeout max wait for workers during shutdown
- * @param pollTimeout Kafka consumer poll timeout
- * @param dispatchQueueCapacity capacity of per-partition dispatch queues
- * @param maxWindowSize max tracked offsets per partition before that partition is paused
- * @param maxConcurrencyPerPartition max records (per-record mode) or batches (batch mode) of one
- *     partition processed at once; 0 means unlimited
- * @param ordering ordering guarantee for records of the same partition
- * @param processingTimeout max duration of one handler attempt before it is interrupted and counted
- *     as failed; zero disables it
- * @param skipCompletedOnRestart record finished-but-uncommitted offsets in commit metadata and skip
- *     them when the partition is consumed again
  */
-public record PipelineConfig<K, V>(
-    Properties consumerProperties,
-    List<String> topics,
-    RecordHandler<K, V> handler,
-    BatchRecordHandler<K, V> batchHandler,
-    int concurrency,
-    ThreadMode threadMode,
-    BackpressureConfig backpressure,
-    ByteBackpressureConfig byteBackpressure,
-    HeapBackpressureConfig heapBackpressure,
-    List<BackpressureSensor> customSensors,
-    ErrorStrategy<K, V> errorStrategy,
-    ProcessingLifecycleHook<K, V> lifecycleHook,
-    Duration commitInterval,
-    Duration drainTimeout,
-    Duration shutdownTimeout,
-    Duration pollTimeout,
-    int dispatchQueueCapacity,
-    int maxWindowSize,
-    int maxConcurrencyPerPartition,
-    ProcessingOrder ordering,
-    boolean skipCompletedOnRestart,
-    Duration processingTimeout) {
-  /** Validates configuration constraints. */
-  public PipelineConfig {
+public final class PipelineConfig<K, V> {
+  /** Default name used when neither {@code name} nor {@code group.id} is set. */
+  public static final String DEFAULT_NAME = "kafka-pipeline";
+
+  private final Properties consumerProperties;
+  private final List<String> topics;
+  private final RecordHandler<K, V> handler;
+  private final BatchRecordHandler<K, V> batchHandler;
+  private final int concurrency;
+  private final ThreadMode threadMode;
+  private final BackpressureConfig backpressure;
+  private final ByteBackpressureConfig byteBackpressure;
+  private final HeapBackpressureConfig heapBackpressure;
+  private final List<BackpressureSensor> customSensors;
+  private final ErrorStrategy<K, V> errorStrategy;
+  private final ProcessingLifecycleHook<K, V> lifecycleHook;
+  private final Duration commitInterval;
+  private final Duration drainTimeout;
+  private final Duration shutdownTimeout;
+  private final Duration pollTimeout;
+  private final int dispatchQueueCapacity;
+  private final int maxWindowSize;
+  private final int maxConcurrencyPerPartition;
+  private final ProcessingOrder ordering;
+  private final boolean skipCompletedOnRestart;
+  private final Duration processingTimeout;
+  private final String name;
+  private final List<MetricsExporter> metricsExporters;
+
+  /** Validates the builder's values and resolves the default name. */
+  private PipelineConfig(Builder<K, V> b) {
+    this.consumerProperties = copyOf(b.consumerProperties);
+    this.topics = b.topics == null ? null : List.copyOf(b.topics);
+    this.handler = b.handler;
+    this.batchHandler = b.batchHandler;
+    this.concurrency = b.concurrency;
+    this.threadMode = b.threadMode;
+    this.backpressure = b.backpressure;
+    this.byteBackpressure = b.byteBackpressure;
+    this.heapBackpressure = b.heapBackpressure;
+    this.customSensors = List.copyOf(b.customSensors);
+    this.errorStrategy = b.errorStrategy;
+    this.lifecycleHook = b.lifecycleHook;
+    this.commitInterval = b.commitInterval;
+    this.drainTimeout = b.drainTimeout;
+    this.shutdownTimeout = b.shutdownTimeout;
+    this.pollTimeout = b.pollTimeout;
+    this.dispatchQueueCapacity = b.dispatchQueueCapacity;
+    this.maxWindowSize = b.maxWindowSize;
+    this.maxConcurrencyPerPartition = b.maxConcurrencyPerPartition;
+    this.ordering = b.ordering;
+    this.skipCompletedOnRestart = b.skipCompletedOnRestart;
+    this.processingTimeout = b.processingTimeout;
+    this.metricsExporters = List.copyOf(b.metricsExporters);
     Objects.requireNonNull(consumerProperties, "consumerProperties");
     Objects.requireNonNull(topics, "topics");
     Objects.requireNonNull(threadMode, "threadMode");
     Objects.requireNonNull(backpressure, "backpressure");
     Objects.requireNonNull(byteBackpressure, "byteBackpressure");
     Objects.requireNonNull(heapBackpressure, "heapBackpressure");
-    Objects.requireNonNull(customSensors, "customSensors");
     Objects.requireNonNull(errorStrategy, "errorStrategy");
     Objects.requireNonNull(lifecycleHook, "lifecycleHook");
     Objects.requireNonNull(ordering, "ordering");
@@ -144,6 +151,274 @@ public record PipelineConfig<K, V>(
               + maxPollIntervalMs
               + "ms)");
     }
+    this.name = resolveName(b.name, consumerProperties);
+  }
+
+  /**
+   * Kafka consumer configuration. Returns a copy; changing it does not change this config.
+   *
+   * @return a copy of the consumer properties
+   */
+  public Properties consumerProperties() {
+    return copyOf(consumerProperties);
+  }
+
+  /**
+   * Returns the topics to subscribe to.
+   *
+   * @return the topics
+   */
+  public List<String> topics() {
+    return topics;
+  }
+
+  /**
+   * Returns the per-record handler (mutually exclusive with batchHandler).
+   *
+   * @return the handler
+   */
+  public RecordHandler<K, V> handler() {
+    return handler;
+  }
+
+  /**
+   * Returns the batch handler (mutually exclusive with handler).
+   *
+   * @return the batchHandler
+   */
+  public BatchRecordHandler<K, V> batchHandler() {
+    return batchHandler;
+  }
+
+  /**
+   * Returns the number of worker threads.
+   *
+   * @return the concurrency
+   */
+  public int concurrency() {
+    return concurrency;
+  }
+
+  /**
+   * Returns whether workers run on platform or virtual threads.
+   *
+   * @return the threadMode
+   */
+  public ThreadMode threadMode() {
+    return threadMode;
+  }
+
+  /**
+   * Returns the record-count backpressure configuration.
+   *
+   * @return the backpressure
+   */
+  public BackpressureConfig backpressure() {
+    return backpressure;
+  }
+
+  /**
+   * Returns the byte-level backpressure configuration.
+   *
+   * @return the byteBackpressure
+   */
+  public ByteBackpressureConfig byteBackpressure() {
+    return byteBackpressure;
+  }
+
+  /**
+   * Returns the heap-based backpressure configuration.
+   *
+   * @return the heapBackpressure
+   */
+  public HeapBackpressureConfig heapBackpressure() {
+    return heapBackpressure;
+  }
+
+  /**
+   * Returns the custom backpressure sensors.
+   *
+   * @return the customSensors
+   */
+  public List<BackpressureSensor> customSensors() {
+    return customSensors;
+  }
+
+  /**
+   * Returns the retry and error handling configuration.
+   *
+   * @return the errorStrategy
+   */
+  public ErrorStrategy<K, V> errorStrategy() {
+    return errorStrategy;
+  }
+
+  /**
+   * Returns the processing lifecycle callbacks.
+   *
+   * @return the lifecycleHook
+   */
+  public ProcessingLifecycleHook<K, V> lifecycleHook() {
+    return lifecycleHook;
+  }
+
+  /**
+   * Returns the interval between async offset commits.
+   *
+   * @return the commitInterval
+   */
+  public Duration commitInterval() {
+    return commitInterval;
+  }
+
+  /**
+   * Returns the max wait for in-flight records during rebalance.
+   *
+   * @return the drainTimeout
+   */
+  public Duration drainTimeout() {
+    return drainTimeout;
+  }
+
+  /**
+   * Returns the max wait for workers during shutdown.
+   *
+   * @return the shutdownTimeout
+   */
+  public Duration shutdownTimeout() {
+    return shutdownTimeout;
+  }
+
+  /**
+   * Returns the Kafka consumer poll timeout.
+   *
+   * @return the pollTimeout
+   */
+  public Duration pollTimeout() {
+    return pollTimeout;
+  }
+
+  /**
+   * Returns the capacity of per-partition dispatch queues.
+   *
+   * @return the dispatchQueueCapacity
+   */
+  public int dispatchQueueCapacity() {
+    return dispatchQueueCapacity;
+  }
+
+  /**
+   * Returns the max tracked offsets per partition before that partition is paused.
+   *
+   * @return the maxWindowSize
+   */
+  public int maxWindowSize() {
+    return maxWindowSize;
+  }
+
+  /**
+   * Returns the max records (per-record mode) or batches (batch mode) of one partition processed at
+   * once; 0 means unlimited.
+   *
+   * @return the maxConcurrencyPerPartition
+   */
+  public int maxConcurrencyPerPartition() {
+    return maxConcurrencyPerPartition;
+  }
+
+  /**
+   * Returns the ordering guarantee for records of the same partition.
+   *
+   * @return the ordering
+   */
+  public ProcessingOrder ordering() {
+    return ordering;
+  }
+
+  /**
+   * Returns whether finished-but-uncommitted offsets are recorded in commit metadata and skipped
+   * when the partition is consumed again.
+   *
+   * @return the skipCompletedOnRestart
+   */
+  public boolean skipCompletedOnRestart() {
+    return skipCompletedOnRestart;
+  }
+
+  /**
+   * Returns the max duration of one handler attempt before it is interrupted and counted as failed;
+   * zero disables it.
+   *
+   * @return the processingTimeout
+   */
+  public Duration processingTimeout() {
+    return processingTimeout;
+  }
+
+  /**
+   * Returns the name that identifies this pipeline in metrics. Defaults to the consumer's {@code
+   * group.id}, or {@value #DEFAULT_NAME}.
+   *
+   * @return the name
+   */
+  public String name() {
+    return name;
+  }
+
+  /**
+   * Returns the exporters that publish this pipeline's metrics, in registration order.
+   *
+   * @return the metrics exporters; empty if none
+   */
+  public List<MetricsExporter> metricsExporters() {
+    return metricsExporters;
+  }
+
+  /**
+   * Describes this configuration. Consumer properties are left out because they may hold
+   * credentials such as {@code sasl.jaas.config}.
+   */
+  @Override
+  public String toString() {
+    return "PipelineConfig[name="
+        + name
+        + ", topics="
+        + topics
+        + ", mode="
+        + (isBatchMode() ? "batch" : "record")
+        + ", concurrency="
+        + concurrency
+        + ", threadMode="
+        + threadMode
+        + ", ordering="
+        + ordering
+        + ", maxWindowSize="
+        + maxWindowSize
+        + ", maxConcurrencyPerPartition="
+        + maxConcurrencyPerPartition
+        + ", commitInterval="
+        + commitInterval
+        + ", processingTimeout="
+        + processingTimeout
+        + "]";
+  }
+
+  private static Properties copyOf(Properties props) {
+    if (props == null) return null;
+    Properties copy = new Properties();
+    copy.putAll(props);
+    return copy;
+  }
+
+  private static String resolveName(String name, Properties props) {
+    if (name != null) {
+      if (name.isBlank()) {
+        throw new IllegalArgumentException("name must not be blank");
+      }
+      return name;
+    }
+    Object groupId = props.get(ConsumerConfig.GROUP_ID_CONFIG);
+    return groupId != null && !groupId.toString().isBlank() ? groupId.toString() : DEFAULT_NAME;
   }
 
   private static void requirePositive(Duration d, String name) {
@@ -228,8 +503,37 @@ public record PipelineConfig<K, V>(
     private boolean skipCompletedOnRestart = true;
     private Duration processingTimeout = Duration.ZERO;
     private int maxWindowSize = 10_000;
+    private String name;
+    private final List<MetricsExporter> metricsExporters = new ArrayList<>();
 
     private Builder() {}
+
+    /**
+     * Adds an exporter that publishes this pipeline's metrics, for example to Micrometer or
+     * OpenTelemetry. Call it once per exporter; they are bound in the order added.
+     *
+     * @param exporter the exporter
+     * @return this builder
+     * @see MetricsExporter
+     */
+    public Builder<K, V> metricsExporter(MetricsExporter exporter) {
+      metricsExporters.add(Objects.requireNonNull(exporter, "exporter"));
+      return this;
+    }
+
+    /**
+     * Name of this pipeline, used to tell pipelines apart in metrics (for example as a tag).
+     *
+     * <p>Default: the consumer's {@code group.id}, or {@value PipelineConfig#DEFAULT_NAME} if that
+     * is not set either.
+     *
+     * @param name the pipeline name; must not be blank
+     * @return this builder
+     */
+    public Builder<K, V> name(String name) {
+      this.name = Objects.requireNonNull(name, "name");
+      return this;
+    }
 
     /**
      * Standard Kafka consumer properties ({@code bootstrap.servers}, {@code group.id},
@@ -636,29 +940,7 @@ public record PipelineConfig<K, V>(
             "Concurrency not configured. Call concurrency(ThreadMode, int) to set thread model and"
                 + " worker count");
       }
-      return new PipelineConfig<>(
-          consumerProperties,
-          topics,
-          handler,
-          batchHandler,
-          concurrency,
-          threadMode,
-          backpressure,
-          byteBackpressure,
-          heapBackpressure,
-          List.copyOf(customSensors),
-          errorStrategy,
-          lifecycleHook,
-          commitInterval,
-          drainTimeout,
-          shutdownTimeout,
-          pollTimeout,
-          dispatchQueueCapacity,
-          maxWindowSize,
-          maxConcurrencyPerPartition,
-          ordering,
-          skipCompletedOnRestart,
-          processingTimeout);
+      return new PipelineConfig<>(this);
     }
   }
 }

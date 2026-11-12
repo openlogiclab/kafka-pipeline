@@ -2,6 +2,7 @@
 
 [![Build](https://github.com/openlogiclab/kafka-pipeline/actions/workflows/gradle.yml/badge.svg)](https://github.com/openlogiclab/kafka-pipeline/actions/workflows/gradle.yml)
 [![codecov](https://codecov.io/gh/openlogiclab/kafka-pipeline/branch/main/graph/badge.svg)](https://codecov.io/gh/openlogiclab/kafka-pipeline)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.openlogiclab/kafka-pipeline)](https://central.sonatype.com/artifact/io.github.openlogiclab/kafka-pipeline)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 A lightweight Java library that wraps `KafkaConsumer` and handles the tedious parts — concurrent processing, backpressure, offset tracking, error handling — so you can focus on what matters: your record processing logic.
@@ -22,14 +23,16 @@ This library packages all of that into a clean pipeline that you configure once 
 
 ## Installation
 
+Replace `VERSION` with the latest release shown on the Maven Central badge above.
+
 **Gradle (Kotlin DSL)**
 ```kotlin
-implementation("io.github.openlogiclab:kafka-pipeline:0.1.0")
+implementation("io.github.openlogiclab:kafka-pipeline:VERSION")
 ```
 
 **Gradle (Groovy)**
 ```groovy
-implementation 'io.github.openlogiclab:kafka-pipeline:0.1.0'
+implementation 'io.github.openlogiclab:kafka-pipeline:VERSION'
 ```
 
 **Maven**
@@ -37,14 +40,13 @@ implementation 'io.github.openlogiclab:kafka-pipeline:0.1.0'
 <dependency>
     <groupId>io.github.openlogiclab</groupId>
     <artifactId>kafka-pipeline</artifactId>
-    <version>0.1.0</version>
+    <version>VERSION</version>
 </dependency>
 ```
 
 ## Requirements
 
 - **Java 21+** (virtual threads support)
-- **Kafka clients 4.2.0+**
 
 ## Getting Started
 
@@ -120,9 +122,12 @@ flowchart TB
     RebalanceListener -->|"add / remove queues"| RecordDispatcher
 
     MetricsCollector -->|"snapshot()"| PipelineMetrics
+    RetryExecutor -->|"each handler attempt"| Exporters["MetricsExporter(s)"]
+    PipelineMetrics -->|"pull on scrape"| Exporters
   end
 
   UserCode["User Code"] -->|"pipeline.metrics()"| PipelineMetrics
+  Exporters --> Monitoring["Prometheus / OpenTelemetry / logs"]
 ```
 
 **Solid arrows** = data / control flow. The main path reads top-to-bottom: poll → dispatch → process → track → commit.
@@ -148,9 +153,10 @@ A concrete walkthrough of what happens to a single batch of records, from poll t
 │ Poll Loop (single thread)                                           │
 │                                                                     │
 │  for each record:                                                   │
-│    1. offsetTracker.register(tp, offset)   → state: REGISTERED      │
-│    2. sensor.recordRegistered()            → in-flight count +1     │
-│    3. dispatcher.dispatch(record)          → enqueue to partition-0 │
+│    1. offsetTracker.registerUnlessDone()   → state: REGISTERED      │
+│       (skipped if it already finished before a restart)             │
+│    2. inFlightCounter.registered()         → in-flight count +1     │
+│    3. dispatcher.dispatch(tp, record)      → enqueue to partition-0 │
 └─────────────────────────────────────────────────────────────────────┘
      │
      ▼
@@ -176,7 +182,7 @@ A concrete walkthrough of what happens to a single batch of records, from poll t
      │   3. handler.handle(record)                     → YOUR CODE
      │   4. hook.afterProcess(record, ctx)
      │   5. offsetTracker.ack(tp, offset)              → DONE
-     │   6. sensor.recordCompleted()                   → in-flight count -1
+     │   6. inFlightCounter.completed()                → in-flight count -1
      │
      ▼
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -212,20 +218,21 @@ handler.handle(record) throws
      │
      ▼
 Retry loop (attempt 1, 2, ... maxRetries)
-  backoff: 1s → 2s → 4s → ... (exponential, capped at maxBackoff)
+  backoff: retryBackoff (default 1s); doubles up to maxBackoff with exponentialBackoff(true)
+  an attempt past processingTimeout (if set) is interrupted and counts as a failure
   hook.onError() called on each failure
      │
-     ├── retry succeeds → ack, done
+     ├── retry succeeds → ack, done                       (recordsProcessed)
      │
      ▼  all retries exhausted
 DLQ handler (if configured)
      │
-     ├── DLQ send succeeds → ack, done (offset advances, record is "handled")
+     ├── DLQ send succeeds → ack, done                    (dlqSuccesses)
      │
      ▼  DLQ fails or not configured
 FinalFailureHandler (log, file, alert, etc.)
      │
-     └── SKIP → ack anyway, move on (system never halts)
+     └── SKIP → ack anyway, move on                       (recordsFailed)
 ```
 
 ### Rebalance Flow
@@ -240,7 +247,8 @@ onPartitionsRevoked([partition-0, partition-2])
      → clear queued records, adjust sensor count
      
   2. offsetTracker.drainPartition(tp, drainTimeout)
-     → wait for in-flight workers to finish (up to 30s default)
+     → wait for in-flight workers to finish (up to 30s default),
+       all revoked partitions in parallel
      → returns: {completed: 47, abandoned: 2, timedOut: true/false}
      
   3. committer.commitSync()
@@ -361,7 +369,7 @@ The limit never drops below a fair share of the pool: the enforced value is `max
 | 4 | 50 |
 | 20 or more | 20 |
 
-So a pod that ends up with a single partition still uses every worker, and the cap only bites once there are enough partitions to compete. Applies to per-record mode only; batch mode submits at most one batch per partition per poll.
+So a pod that ends up with a single partition still uses every worker, and the cap only bites once there are enough partitions to compete. In batch mode the same limit caps how many batches of one partition are processed at once.
 
 ### Ordering
 
@@ -413,9 +421,19 @@ The `FinalFailureHandler` is the **final preservation** mechanism — invoked on
 For simple cases there are factory methods:
 
 ```java
-ErrorStrategy.skipOnError()          // Fallback.SKIP — no retries, skip immediately
+ErrorStrategy.skipOnError()          // Fallback.SKIP — no retries, skip immediately (the default)
 ErrorStrategy.withDlq(dlqHandler, 3) // Fallback.DLQ_THEN_SKIP — 3 retries, then DLQ, then skip
 ```
+
+#### Processing timeout
+
+A handler that hangs (a stuck HTTP call, a lock that never frees) holds its worker and keeps its partition from committing. Bound each attempt:
+
+```java
+.processingTimeout(Duration.ofSeconds(30))
+```
+
+Off by default. An attempt that runs longer is interrupted and counts as a failure, so it goes through the same retry → DLQ → skip chain. An attempt that finishes after the deadline anyway is treated as processed. A handler that ignores interrupts (a busy loop, some blocking I/O) cannot be stopped; it keeps its worker until it returns. Pick the value from `metrics().handlerDuration()`, and watch `processingTimeouts` to see how often it fires.
 
 ### Batch Mode
 
@@ -449,9 +467,11 @@ Enabled by default. Uses high/low watermark hysteresis to prevent pause/resume f
 .backpressure(BackpressureConfig.builder()
     .highWatermark(10_000)     // pause polling when in-flight records reach this
     .lowWatermark(6_000)       // resume polling when count drops to this
-    .criticalThreshold(50_000) // hard stop
+    .criticalThreshold(50_000) // report CRITICAL instead of THROTTLE
     .build())
 ```
+
+THROTTLE and CRITICAL both pause the consumer; CRITICAL is the stronger signal, reported by `metrics().backpressureStatus()` so a health check can tell "busy" from "in trouble" (see [Metrics](#metrics)).
 
 #### Byte-Level Backpressure
 
@@ -461,7 +481,7 @@ Protects against memory pressure when individual records are large (e.g. 10 MB f
 .byteBackpressure(ByteBackpressureConfig.builder()
     .lowWatermarkBytes(128 * 1024 * 1024)     // 128 MB — resume
     .highWatermarkBytes(256 * 1024 * 1024)    // 256 MB — pause
-    .criticalThresholdBytes(512 * 1024 * 1024) // 512 MB — hard stop
+    .criticalThresholdBytes(512 * 1024 * 1024) // 512 MB — report CRITICAL
     .build())
 ```
 
@@ -473,7 +493,7 @@ Monitors overall JVM heap usage via `MemoryMXBean` and pauses the consumer when 
 .heapBackpressure(HeapBackpressureConfig.builder()
     .resumeThreshold(0.5)     // resume polling at 50% heap usage
     .throttleThreshold(0.7)   // pause polling at 70% heap usage
-    .criticalThreshold(0.9)   // hard stop at 90% heap usage
+    .criticalThreshold(0.9)   // report CRITICAL at 90% heap usage
     .build())
 ```
 
@@ -518,7 +538,7 @@ When backpressure kicks in, the consumer is paused (not disconnected) — it sta
 
 ### Lifecycle Hooks
 
-For cross-cutting concerns — deduplication, metrics, tracing — without cluttering your handler:
+For cross-cutting concerns — deduplication, tracing, audit logging — without cluttering your handler. (For metrics, use a [metrics exporter](#exporting-metrics) instead.)
 
 ```java
 .lifecycleHook(new ProcessingLifecycleHook<>() {
@@ -531,12 +551,11 @@ For cross-cutting concerns — deduplication, metrics, tracing — without clutt
     @Override
     public void afterProcess(ConsumerRecord<String, String> record, ProcessingContext ctx) {
         dedupStore.mark(ctx.topic(), ctx.partition(), ctx.offset());
-        metrics.recordProcessed(ctx.topic());
     }
 
     @Override
     public void onError(ConsumerRecord<String, String> record, ProcessingContext ctx, Exception error) {
-        metrics.recordFailed(ctx.topic(), error);
+        log.warn("Attempt {} failed for {}-{}@{}", ctx.attempt(), ctx.topic(), ctx.partition(), ctx.offset(), error);
     }
 })
 ```
@@ -545,79 +564,170 @@ For cross-cutting concerns — deduplication, metrics, tracing — without clutt
 
 ### Metrics
 
-The pipeline collects operational metrics internally — throughput, backpressure, retries, commits, rebalances — and exposes them via an on-demand snapshot API. No background threads, no timers, no external dependencies. You call `metrics()` when you want a reading; the library doesn't push anything.
+The pipeline collects operational metrics internally: throughput, record outcomes, handler time, backpressure, retries, commits, rebalances and per-partition state. There are two ways to read them:
+
+- **`pipeline.metrics()`** returns a snapshot on demand, for logs, health checks and tests.
+- **A [metrics exporter](#exporting-metrics)** publishes them to your monitoring system (Prometheus, OpenTelemetry, ...).
+
+The core has no metrics dependencies and runs no background threads for this.
 
 ```java
 PipelineMetrics m = pipeline.metrics();
 
-System.out.println("Processed: " + m.recordsProcessed());
-System.out.println("In-flight: " + m.inFlightRecords());
-System.out.println("Retries:   " + m.retryAttempts());
-System.out.println("Backpressure: " + m.backpressureStatus());
+m.recordsProcessed();                       // handler succeeded
+m.recordsFailed();                          // dropped after retries and DLQ: data loss
+m.inFlightRecords();
+m.backpressureStatus();
+m.handlerDuration().mean();
+m.partitions().get(tp).commitStallMillis(); // how long this partition's commits are stuck
 ```
 
-The returned `PipelineMetrics` record is immutable and safe to pass across threads, serialize, or log. Each call reads the current counter values — there's no stale cache.
+`PipelineMetrics` and the other metrics types live in `io.github.openlogiclab.kafkapipeline.metrics`. A snapshot is immutable and safe to pass across threads or log. The types are sealed interfaces: you read them, only the pipeline creates them, so new metrics can be added in later releases without breaking your code.
 
 #### Counter vs. Gauge
 
-- **Counters** (`recordsProcessed`, `retryAttempts`, `commitSuccesses`, etc.) are monotonically increasing cumulative totals since pipeline start. Compute rates by diffing two snapshots:
+- **Counters** (`recordsProcessed`, `retryAttempts`, `commitSuccesses`, ...) are cumulative totals since pipeline start. Compute rates by diffing two snapshots:
   ```java
   long rate = (current.recordsProcessed() - previous.recordsProcessed()) / elapsedSeconds;
   ```
-- **Gauges** (`inFlightRecords`, `inFlightBytes`, `backpressureStatus`, `assignedPartitions`) are instantaneous values that go up and down.
+- **Gauges** (`inFlightRecords`, `inFlightBytes`, `backpressureStatus`, the per-partition values) are instantaneous values that go up and down.
+
+#### Record outcomes
+
+Every record the pipeline finishes is counted in exactly one outcome, so the four add up to the total:
+
+| Outcome | Counter |
+|---|---|
+| Handler succeeded (possibly after retries) | `recordsProcessed` |
+| Skipped by the lifecycle hook (`beforeProcess` returned `false`) | `recordsSkipped` |
+| Sent to the DLQ | `dlqSuccesses` |
+| Dropped: retries failed, and no DLQ or the DLQ send failed | `recordsFailed` |
+
+Records left unfinished by a shutdown or rebalance are in none of them; they are redelivered (`recordsAbandoned`). Alert on `recordsFailed`: it is data loss.
 
 #### Available Metrics
 
 | Category | Metric | Type | Description |
 |---|---|---|---|
-| Throughput | `recordsProcessed` | Counter | Records successfully handled |
-| | `recordsFailed` | Counter | Records with unrecoverable failures (skipped after FinalFailureHandler) |
-| | `recordsSkipped` | Counter | Records skipped by hook or after failure |
+| Identity | `name` | — | Pipeline name (`name(...)`, default `group.id`) |
+| Throughput | `recordsProcessed` | Counter | Records whose handler succeeded |
+| | `recordsSkipped` | Counter | Records skipped by the lifecycle hook |
+| | `recordsFailed` | Counter | Records dropped after retries and DLQ failed |
+| | `handlerDuration` | Counter | Count and total time of handler attempts (`count()`, `total()`, `mean()`); retries, failed and timed-out attempts included, a batch call counts once |
 | | `pollCount` | Counter | Total `consumer.poll()` calls |
 | | `emptyPollCount` | Counter | Polls that returned zero records |
 | Pressure | `inFlightRecords` | Gauge | Records between poll and ack |
 | | `inFlightBytes` | Gauge | Estimated bytes of in-flight records |
 | | `backpressureStatus` | Gauge | Current backpressure level (OK / THROTTLE / CRITICAL) |
 | | `throttleCount` | Counter | Times backpressure activated |
-| | `partitionLags` | Gauge | Per-partition processing lag (Map) |
-| | `partitionFailures` | Gauge | Per-partition failure count (Map) |
-| Errors | `retryAttempts` | Counter | Total retry attempts across all records |
-| | `dlqSuccesses` | Counter | Records sent to DLQ successfully |
-| | `dlqFailures` | Counter | DLQ send failures |
-| | `partitionFailures` | Counter | Partitions entered failed state |
+| Errors | `retryAttempts` | Counter | Retry attempts across all records |
+| | `processingTimeouts` | Counter | Attempts interrupted by `processingTimeout` |
+| | `dlqSuccesses` | Counter | Records sent to the DLQ |
+| | `dlqFailures` | Counter | Records whose DLQ send failed |
+| | `finalFailures` | Counter | `FinalFailureHandler` calls, one per dropped record |
 | | `commitSuccesses` | Counter | Successful offset commits |
 | | `commitFailures` | Counter | Failed offset commits |
 | Rebalance | `rebalanceCount` | Counter | Consumer group rebalances |
-| | `drainTimeouts` | Counter | Drains that didn't complete in time |
-| | `recordsAbandoned` | Counter | Records abandoned during rebalance |
-| | `assignedPartitions` | Gauge | Currently assigned partitions (Set) |
+| | `drainTimeouts` | Counter | Drains that didn't finish within `drainTimeout` |
+| | `recordsAbandoned` | Counter | Records abandoned during rebalance, redelivered to the new owner |
+| | `assignedPartitions` | Gauge | Currently assigned partitions |
 
-#### Export Examples
+`partitions()` has an entry for **every** assigned partition, idle ones included, so each partition always reports a value:
 
-The library collects; you decide how to export. A few common patterns:
+| Metric | Type | Description |
+|---|---|---|
+| `lag` | Gauge | Records polled but not yet committable |
+| `failures` | Counter | Dropped records on this partition since it was assigned |
+| `commitStallMillis` | Gauge | How long the committable offset hasn't moved while records wait; growing means a stuck record at the head |
+| `windowSize` / `windowCapacity` | Gauge | Entries in the partition's offset window, and its limit (`maxWindowSize`) |
+| `windowFill` | Gauge | `windowSize / windowCapacity`; near 0.8 the partition is about to pause — an earlier warning than lag |
 
-**Periodic logging**
+#### Exporting metrics
+
+Register one or more exporters on the builder:
+
 ```java
-scheduler.scheduleAtFixedRate(() -> {
-    logger.info("pipeline: {}", pipeline.metrics());
-}, 0, 30, TimeUnit.SECONDS);
+KafkaPipeline.<String, String>builder()
+    // ...
+    .metricsExporter(new MicrometerExporter(meterRegistry))
+    .build();
 ```
 
-**Prometheus gauge**
+An exporter implements `MetricsExporter`. When the pipeline starts, it calls `bind` with a `MetricsBinding` that offers two things:
+
+- **Pull:** `snapshot()` for counters and gauges. Read it whenever your monitoring system collects; it is cheap and thread-safe.
+- **Push:** `onHandlerAttempt(listener)` delivers every handler attempt (partition, duration, outcome `SUCCESS` / `FAILURE` / `TIMEOUT`). Use it for histograms and percentiles, which a snapshot cannot carry.
+
+A minimal Micrometer exporter:
+
 ```java
-Gauge inFlight = Gauge.build("kafka_pipeline_in_flight_records", "In-flight records").register();
-scheduler.scheduleAtFixedRate(() -> {
-    inFlight.set(pipeline.metrics().inFlightRecords());
-}, 0, 15, TimeUnit.SECONDS);
+import io.github.openlogiclab.kafkapipeline.metrics.AttemptOutcome;
+import io.github.openlogiclab.kafkapipeline.metrics.MetricsBinding;
+import io.github.openlogiclab.kafkapipeline.metrics.MetricsExporter;
+import io.micrometer.core.instrument.*;  // Timer is Micrometer's, not java.util.Timer
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
+public final class MicrometerExporter implements MetricsExporter {
+    private final MeterRegistry registry;
+    private final List<Meter> meters = new ArrayList<>();
+
+    public MicrometerExporter(MeterRegistry registry) { this.registry = registry; }
+
+    @Override
+    public void bind(MetricsBinding binding) {
+        Tags tags = Tags.of("pipeline", binding.pipelineName());
+
+        // Pull: read on every scrape.
+        meters.add(FunctionCounter.builder("kafka.pipeline.records.processed", binding,
+                b -> b.snapshot().recordsProcessed()).tags(tags).register(registry));
+        meters.add(FunctionCounter.builder("kafka.pipeline.records.failed", binding,
+                b -> b.snapshot().recordsFailed()).tags(tags).register(registry));
+        meters.add(Gauge.builder("kafka.pipeline.in.flight.records", binding,
+                b -> b.snapshot().inFlightRecords()).tags(tags).register(registry));
+
+        // Push: one timer per outcome, recorded on every attempt, with percentiles.
+        Map<AttemptOutcome, Timer> timers = new EnumMap<>(AttemptOutcome.class);
+        for (AttemptOutcome outcome : AttemptOutcome.values()) {
+            Timer timer = Timer.builder("kafka.pipeline.handler.duration")
+                    .tags(tags).tag("outcome", outcome.name().toLowerCase())
+                    .publishPercentileHistogram()
+                    .register(registry);
+            timers.put(outcome, timer);
+            meters.add(timer);
+        }
+        binding.onHandlerAttempt(a ->
+                timers.get(a.outcome()).record(a.durationNanos(), TimeUnit.NANOSECONDS));
+    }
+
+    @Override
+    public void close() { meters.forEach(registry::remove); }
+}
 ```
 
-**Health-check endpoint**
+What the pipeline guarantees, and what to keep in mind when writing one:
+
+- **Lifecycle.** `bind` runs in `start()`, so an exporter that throws there fails `start()`, like any other setup error. `close` runs once at the end of shutdown, after the final commit, so the last values are published. Exporters are closed in reverse order.
+- **Isolation.** After `bind`, a failing exporter never affects processing. An exception from a listener or from `close` is logged (WARNING once, then DEBUG) and ignored.
+- **Listeners run on the worker thread**, right after each attempt. Record into a histogram and return; don't block.
+- **Per-partition series.** Partitions come and go with rebalances: register a series when a partition appears in `snapshot().partitions()` and remove it when it disappears.
+- **Several pipelines.** An exporter registered with several pipelines is bound once per pipeline; tag by `pipelineName()`.
+- **Snapshot cost.** `snapshot()` builds the per-partition map on every call. With many pull meters, cache it for the duration of one scrape.
+
+For a quick look without an exporter, log the snapshot periodically:
+
 ```java
-app.get("/health", ctx -> {
-    PipelineMetrics m = pipeline.metrics();
-    ctx.status(m.backpressureStatus() == BackpressureStatus.CRITICAL ? 503 : 200);
-    ctx.json(m);
-});
+scheduler.scheduleAtFixedRate(() -> logger.info("pipeline: {}", pipeline.metrics()), 0, 30, TimeUnit.SECONDS);
+```
+
+Or use it in a health check:
+
+```java
+app.get("/health", ctx ->
+    ctx.status(pipeline.metrics().backpressureStatus() == BackpressureStatus.CRITICAL ? 503 : 200));
 ```
 
 #### Diagnostic Quick Reference
@@ -625,9 +735,11 @@ app.get("/health", ctx -> {
 | Symptom | Check | Likely Cause |
 |---|---|---|
 | Throughput drops to zero | `backpressureStatus`, `inFlightRecords` | Backpressure triggered — workers slower than poll rate |
-| Consumer lag growing | `partitionLags`, `retryAttempts` | Retry storms or slow handler |
+| Consumer lag growing | `partitions()` → `lag`, `retryAttempts` | Retry storms or slow handler |
+| One partition stops committing | `partitions()` → `commitStallMillis`, `windowFill` | A stuck record at the head of the partition; consider `processingTimeout` |
+| Handlers slow or timing out | `handlerDuration().mean()`, `processingTimeouts` | Slow downstream, or `processingTimeout` too close to normal handler time |
 | Frequent rebalances | `rebalanceCount`, `drainTimeouts` | Pods restarting or scaling without static membership, or `session.timeout.ms` too low (see [Running in Production](#running-in-production)) |
-| Data loss suspected | `recordsSkipped`, `dlqSuccesses` | Fallback=SKIP dropping records |
+| Data loss suspected | `recordsFailed`, `dlqFailures` | Records dropped after retries; check the DLQ and the final failure logs |
 | Memory pressure | `inFlightRecords`, `inFlightBytes` | Backpressure thresholds too high |
 
 ### Async Start
@@ -657,16 +769,20 @@ pipeline.awaitShutdown();
 | `byteBackpressure` | disabled | Byte-level watermarks for memory protection |
 | `heapBackpressure` | disabled | JVM heap usage watermarks (via `MemoryMXBean`) |
 | `addBackpressureSensor` | none | Custom backpressure sensor(s) |
-| `errorStrategy` | fail-fast | Retry + DLQ + fallback chain |
+| `errorStrategy` | `skipOnError()` | Retry + DLQ + fallback chain; the default retries nothing and skips, logging the record's metadata (see [Error Handling](#error-handling)) |
+| `processingTimeout` | 0 (off) | Max duration of one handler attempt before it is interrupted and counted as failed (see [Processing timeout](#processing-timeout)) |
 | `lifecycleHook` | no-op | Before/after/error callbacks (per-record mode only) |
 | `commitInterval` | 5s | How often to commit offsets async |
 | `drainTimeout` | 30s | Max wait for in-flight records during rebalance |
 | `shutdownTimeout` | 30s | Max wait for records already being processed to finish on shutdown; queued records that haven't started are redelivered on the next start |
 | `pollTimeout` | 100ms | Kafka consumer poll timeout |
 | `dispatchQueueCapacity` | 500 | Bounded queue capacity for pending work (see below) |
-| `maxConcurrencyPerPartition` | 0 (unlimited) | Max records of one partition processed at once, so a slow partition can't take every worker (per-record mode; see [Noisy partitions](#noisy-partitions)) |
+| `maxConcurrencyPerPartition` | 0 (unlimited) | Max records (batches, in batch mode) of one partition processed at once, so a slow partition can't take every worker (see [Noisy partitions](#noisy-partitions)) |
+| `maxWindowSize` | 10,000 | Max tracked offsets per partition; the partition pauses at 80% and resumes at 50%. Must be ≥ `max.poll.records` (see [Sliding Window](#sliding-window)) |
 | `ordering` | `UNORDERED` | `KEY` or `PARTITION` to keep records in order (see [Ordering](#ordering)) |
 | `skipCompletedOnRestart` | `true` | Record finished offsets past the committed one in commit metadata and skip them on the next assignment (see [The Duplicate Processing Problem](#the-duplicate-processing-problem)) |
+| `name` | `group.id` | Identifies the pipeline in metrics, e.g. as a tag when several run in one JVM |
+| `metricsExporter` | none | Exporter(s) that publish metrics to your monitoring system; call once per exporter (see [Exporting metrics](#exporting-metrics)) |
 
 ### Tuning `dispatchQueueCapacity`
 

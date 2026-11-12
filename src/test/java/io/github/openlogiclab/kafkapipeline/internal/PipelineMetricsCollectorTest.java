@@ -17,12 +17,14 @@ package io.github.openlogiclab.kafkapipeline.internal;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureStatus;
 import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
+import io.github.openlogiclab.kafkapipeline.metrics.AttemptOutcome;
+import io.github.openlogiclab.kafkapipeline.metrics.PartitionMetrics;
+import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
 import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
 import java.util.Set;
@@ -53,7 +55,8 @@ class PipelineMetricsCollectorTest {
         new BackpressureController(bpConfig, new RecordCountSensor(bpConfig, inFlightCounter));
     offsetTracker = new UnorderedOffsetTracker();
     collector =
-        new PipelineMetricsCollector(inFlightCounter, backpressureController, offsetTracker);
+        new PipelineMetricsCollector(
+            "orders", inFlightCounter, backpressureController, offsetTracker);
   }
 
   @Nested
@@ -65,6 +68,16 @@ class PipelineMetricsCollectorTest {
       collector.recordProcessed(5);
       PipelineMetrics m = collector.snapshot();
       assertEquals(6, m.recordsProcessed());
+    }
+
+    @Test
+    void recordHandlerAttemptAccumulatesCountAndTime() {
+      collector.onAttempt(TP0, 1_000_000, AttemptOutcome.SUCCESS);
+      collector.onAttempt(TP0, 3_000_000, AttemptOutcome.FAILURE);
+      var d = collector.snapshot().handlerDuration();
+      assertEquals(2, d.count());
+      assertEquals(4_000_000, d.totalNanos());
+      assertEquals(java.time.Duration.ofMillis(2), d.mean());
     }
 
     @Test
@@ -143,9 +156,26 @@ class PipelineMetricsCollectorTest {
       offsetTracker.register(TP0, 2);
       collector.partitionAssigned(TP0);
 
-      PipelineMetrics m = collector.snapshot();
-      assertTrue(m.partitionLags().containsKey(TP0));
-      assertTrue(m.partitionLags().get(TP0) >= 0);
+      PartitionMetrics p = collector.snapshot().partitions().get(TP0);
+      assertEquals(3, p.lag());
+      assertEquals(3, p.windowSize());
+      assertEquals(offsetTracker.maxWindowSize(), p.windowCapacity());
+      assertEquals(3.0 / offsetTracker.maxWindowSize(), p.windowFill(), 1e-9);
+    }
+
+    @Test
+    void everyAssignedPartitionReportsEvenWhenIdle() {
+      offsetTracker.initPartition(TP0, 0);
+      offsetTracker.initPartition(TP1, 0);
+      collector.partitionAssigned(TP0);
+      collector.partitionAssigned(TP1);
+
+      PartitionMetrics idle = collector.snapshot().partitions().get(TP1);
+      assertNotNull(idle, "idle partitions are reported, not omitted");
+      assertEquals(0, idle.lag());
+      assertEquals(0, idle.failures());
+      assertEquals(0, idle.commitStallMillis());
+      assertEquals(0.0, idle.windowFill());
     }
 
     @Test
@@ -157,16 +187,15 @@ class PipelineMetricsCollectorTest {
 
       // No failures yet
       PipelineMetrics m1 = collector.snapshot();
-      assertTrue(m1.partitionFailures().isEmpty());
+      assertEquals(0, m1.partitions().get(TP0).failures());
 
       // Mark failures on TP0
       offsetTracker.markFailed(TP0);
       offsetTracker.markFailed(TP0);
 
       PipelineMetrics m2 = collector.snapshot();
-      assertEquals(1, m2.partitionFailures().size());
-      assertEquals(2, m2.partitionFailures().get(TP0));
-      assertFalse(m2.partitionFailures().containsKey(TP1));
+      assertEquals(2, m2.partitions().get(TP0).failures());
+      assertEquals(0, m2.partitions().get(TP1).failures());
     }
   }
 
@@ -263,6 +292,14 @@ class PipelineMetricsCollectorTest {
       Set<TopicPartition> snapshot = collector.snapshot().assignedPartitions();
       assertThrows(UnsupportedOperationException.class, () -> snapshot.add(TP1));
     }
+
+    @Test
+    void revokedPartitionIsRemovedFromPartitions() {
+      collector.partitionAssigned(TP0);
+      collector.partitionAssigned(TP1);
+      collector.partitionRevoked(TP0);
+      assertEquals(Set.of(TP1), collector.snapshot().partitions().keySet());
+    }
   }
 
   @Nested
@@ -280,8 +317,10 @@ class PipelineMetricsCollectorTest {
       assertEquals(0, m.inFlightBytes());
       assertEquals(BackpressureStatus.OK, m.backpressureStatus());
       assertEquals(0, m.throttleCount());
-      assertTrue(m.partitionLags().isEmpty());
-      assertTrue(m.partitionFailures().isEmpty());
+      assertEquals("orders", m.name());
+      assertEquals(0, m.handlerDuration().count());
+      assertEquals(java.time.Duration.ZERO, m.handlerDuration().mean());
+      assertTrue(m.partitions().isEmpty());
       assertEquals(0, m.retryAttempts());
       assertEquals(0, m.dlqSuccesses());
       assertEquals(0, m.dlqFailures());

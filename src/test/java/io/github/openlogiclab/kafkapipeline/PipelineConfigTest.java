@@ -69,6 +69,46 @@ class PipelineConfigTest {
         minimalBuilder().topics("orders-us", "orders-eu").build().topics());
   }
 
+  @Test
+  void name_defaultsToGroupIdThenToDefaultName() {
+    assertEquals(PipelineConfig.DEFAULT_NAME, minimalBuilder().build().name());
+
+    Properties withGroup = props();
+    withGroup.put("group.id", "orders-consumer");
+    assertEquals("orders-consumer", minimalBuilder().consumerProperties(withGroup).build().name());
+  }
+
+  @Test
+  void name_explicitWinsAndBlankIsRejected() {
+    Properties withGroup = props();
+    withGroup.put("group.id", "orders-consumer");
+    assertEquals(
+        "orders", minimalBuilder().consumerProperties(withGroup).name("orders").build().name());
+    assertThrows(IllegalArgumentException.class, () -> minimalBuilder().name(" ").build());
+    assertThrows(NullPointerException.class, () -> minimalBuilder().name(null));
+  }
+
+  @Test
+  void consumerProperties_areCopiedInAndOut() {
+    Properties original = props();
+    PipelineConfig<String, String> config = minimalBuilder().consumerProperties(original).build();
+
+    original.put("max.poll.records", "1");
+    config.consumerProperties().put("max.poll.records", "2");
+
+    assertNull(config.consumerProperties().get("max.poll.records"));
+  }
+
+  @Test
+  void toString_leavesOutConsumerProperties() {
+    Properties withSecret = props();
+    withSecret.put("sasl.jaas.config", "password=hunter2");
+    String text = minimalBuilder().consumerProperties(withSecret).build().toString();
+
+    assertTrue(text.contains("test-topic"));
+    assertFalse(text.contains("hunter2"));
+  }
+
   // ── Builder Required Fields ──────────────────────────────────
 
   @Nested

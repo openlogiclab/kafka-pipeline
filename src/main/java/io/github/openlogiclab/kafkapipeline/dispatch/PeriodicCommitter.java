@@ -15,7 +15,7 @@
  */
 package io.github.openlogiclab.kafkapipeline.dispatch;
 
-import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.internal.CommitMetrics;
 import io.github.openlogiclab.kafkapipeline.offset.CommitPoint;
 import io.github.openlogiclab.kafkapipeline.offset.CommitSource;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
@@ -50,7 +50,7 @@ public final class PeriodicCommitter {
   private final Duration commitInterval;
   private final AtomicBoolean running = new AtomicBoolean(false);
   private long nextCommitNanos; // poll thread only
-  private final PipelineMetricsCollector metricsCollector;
+  private final CommitMetrics metrics;
 
   /**
    * Creates a periodic committer.
@@ -58,17 +58,17 @@ public final class PeriodicCommitter {
    * @param offsetTracker the offset tracker to read committable offsets from
    * @param consumer the Kafka consumer to commit offsets with
    * @param commitInterval the interval between periodic commits
-   * @param metricsCollector the metrics collector
+   * @param metrics the metrics this component records
    */
   public PeriodicCommitter(
       CommitSource offsetTracker,
       Consumer<?, ?> consumer,
       Duration commitInterval,
-      PipelineMetricsCollector metricsCollector) {
+      CommitMetrics metrics) {
     this.offsetTracker = offsetTracker;
     this.consumer = consumer;
     this.commitInterval = commitInterval;
-    this.metricsCollector = metricsCollector;
+    this.metrics = metrics;
   }
 
   /** Starts periodic commits; the first one is due one interval from now. */
@@ -119,18 +119,18 @@ public final class PeriodicCommitter {
           offsets,
           (committedOffsets, exception) -> {
             if (exception != null) {
-              metricsCollector.recordCommitFailure();
+              metrics.recordCommitFailure();
               if (metadataTooLarge(exception)) return;
               logger.log(
                   System.Logger.Level.WARNING, "Async commit failed: {0}", exception.getMessage());
             } else {
               markCommitted(committedOffsets);
-              metricsCollector.recordCommitSuccess();
+              metrics.recordCommitSuccess();
               logger.log(System.Logger.Level.DEBUG, "Committed offsets: {0}", committedOffsets);
             }
           });
     } catch (Exception e) {
-      metricsCollector.recordCommitFailure();
+      metrics.recordCommitFailure();
       logger.log(System.Logger.Level.WARNING, "Error during async commit: {0}", e.getMessage());
     }
   }
@@ -152,10 +152,10 @@ public final class PeriodicCommitter {
         consumer.commitSync(offsets);
       }
       markCommitted(offsets);
-      metricsCollector.recordCommitSuccess();
+      metrics.recordCommitSuccess();
       logger.log(System.Logger.Level.INFO, "Sync committed offsets: {0}", offsets);
     } catch (Exception e) {
-      metricsCollector.recordCommitFailure();
+      metrics.recordCommitFailure();
       if (metadataTooLarge(e) && !retriedWithoutMetadata) {
         // Commit the offsets again, now without metadata, rather than losing this final commit.
         retriedWithoutMetadata = true;

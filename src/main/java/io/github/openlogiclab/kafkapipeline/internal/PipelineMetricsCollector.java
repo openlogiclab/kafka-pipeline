@@ -15,9 +15,11 @@
  */
 package io.github.openlogiclab.kafkapipeline.internal;
 
-import io.github.openlogiclab.kafkapipeline.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.metrics.AttemptOutcome;
+import io.github.openlogiclab.kafkapipeline.metrics.PartitionMetrics;
+import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetStats;
 import java.util.HashMap;
 import java.util.Map;
@@ -30,17 +32,26 @@ import org.apache.kafka.common.TopicPartition;
  * Internal metrics collector that aggregates pipeline events using lock-free {@link LongAdder}
  * counters.
  *
- * <p>Write methods ({@code recordXxx}) are called on the hot path (poll loop, worker threads,
- * committer thread) and consist of a single {@code LongAdder.increment()} — cell-striped, no
- * contention, same design as {@link InFlightCounter}.
+ * <p>It implements one narrow interface per recording component ({@link PollMetrics}, {@link
+ * CommitMetrics}, {@link RebalanceMetrics}, {@link WorkerMetrics}, {@link RetryMetrics}, {@link
+ * HandlerAttemptObserver}), and each component depends only on its own. Write methods are called on
+ * the hot path (poll loop, worker threads, committer thread) and consist of a single {@code
+ * LongAdder} update — cell-striped, no contention, same design as {@link InFlightCounter}.
  *
  * <p>The read method ({@link #snapshot()}) is called on-demand from user code and assembles an
  * immutable {@link PipelineMetrics} record from all counter/gauge values.
  *
  * <p><strong>This is an internal API — not intended for direct use by library consumers.</strong>
  */
-public class PipelineMetricsCollector {
+public final class PipelineMetricsCollector
+    implements PollMetrics,
+        CommitMetrics,
+        RebalanceMetrics,
+        WorkerMetrics,
+        RetryMetrics,
+        HandlerAttemptObserver {
 
+  private final String name;
   private final InFlightCounter inFlightCounter;
   private final BackpressureController backpressureController;
   private final OffsetStats offsetTracker;
@@ -51,6 +62,8 @@ public class PipelineMetricsCollector {
   private final LongAdder recordsSkipped = new LongAdder();
   private final LongAdder pollCount = new LongAdder();
   private final LongAdder emptyPollCount = new LongAdder();
+  private final LongAdder handlerAttempts = new LongAdder();
+  private final LongAdder handlerNanos = new LongAdder();
 
   // ── Pressure counters ─────────────────────────────────────────
   private final LongAdder throttleCount = new LongAdder();
@@ -75,14 +88,17 @@ public class PipelineMetricsCollector {
   /**
    * Creates a metrics collector.
    *
+   * @param name the pipeline name, reported as {@link PipelineMetrics#name()}
    * @param inFlightCounter the in-flight counter
    * @param backpressureController the backpressure controller
    * @param offsetTracker the offset tracker
    */
   public PipelineMetricsCollector(
+      String name,
       InFlightCounter inFlightCounter,
       BackpressureController backpressureController,
       OffsetStats offsetTracker) {
+    this.name = name;
     this.inFlightCounter = inFlightCounter;
     this.backpressureController = backpressureController;
     this.offsetTracker = offsetTracker;
@@ -90,124 +106,99 @@ public class PipelineMetricsCollector {
 
   // ── Hot-path write methods ────────────────────────────────────
 
-  /**
-   * Records successfully processed records.
-   *
-   * @param count number of records processed
-   */
+  @Override
   public void recordProcessed(long count) {
     recordsProcessed.add(count);
   }
 
-  /** Records a handler attempt interrupted by the processing timeout. */
+  /** Adds the attempt to {@link PipelineMetrics#handlerDuration()}. */
+  @Override
+  public void onAttempt(TopicPartition tp, long nanos, AttemptOutcome outcome) {
+    handlerAttempts.increment();
+    handlerNanos.add(nanos);
+  }
+
+  @Override
   public void recordProcessingTimeout() {
     processingTimeouts.increment();
   }
 
-  /**
-   * Records failed records (after all retries and DLQ attempts).
-   *
-   * @param count number of records failed
-   */
+  @Override
   public void recordFailed(int count) {
     recordsFailed.add(count);
   }
 
-  /**
-   * Records skipped records.
-   *
-   * @param count number of records skipped
-   */
+  @Override
   public void recordSkipped(int count) {
     recordsSkipped.add(count);
   }
 
-  /** Records a poll operation. */
+  @Override
   public void recordPoll() {
     pollCount.increment();
   }
 
-  /** Records an empty poll (no records returned). */
+  @Override
   public void recordEmptyPoll() {
     emptyPollCount.increment();
   }
 
-  /** Records a throttle event (backpressure triggered). */
+  @Override
   public void recordThrottle() {
     throttleCount.increment();
   }
 
-  /** Records a retry attempt. */
+  @Override
   public void recordRetry() {
     retryAttempts.increment();
   }
 
-  /**
-   * Records successful DLQ sends.
-   *
-   * @param count number of records sent to DLQ
-   */
+  @Override
   public void recordDlqSuccess(int count) {
     dlqSuccesses.add(count);
   }
 
-  /**
-   * Records failed DLQ sends.
-   *
-   * @param count number of records that failed to send to DLQ
-   */
+  @Override
   public void recordDlqFailure(int count) {
     dlqFailures.add(count);
   }
 
-  /** Records a final failure (record dropped after all recovery attempts). */
+  @Override
   public void recordFinalFailure() {
     finalFailures.increment();
   }
 
-  /** Records a successful offset commit. */
+  @Override
   public void recordCommitSuccess() {
     commitSuccesses.increment();
   }
 
-  /** Records a failed offset commit. */
+  @Override
   public void recordCommitFailure() {
     commitFailures.increment();
   }
 
-  /** Records a rebalance event. */
+  @Override
   public void recordRebalance() {
     rebalanceCount.increment();
   }
 
-  /** Records a drain timeout event. */
+  @Override
   public void recordDrainTimeout() {
     drainTimeouts.increment();
   }
 
-  /**
-   * Records abandoned records during drain.
-   *
-   * @param count number of records abandoned
-   */
+  @Override
   public void recordAbandoned(long count) {
     recordsAbandoned.add(count);
   }
 
-  /**
-   * Records a partition assignment.
-   *
-   * @param tp the assigned partition
-   */
+  @Override
   public void partitionAssigned(TopicPartition tp) {
     assignedPartitions.add(tp);
   }
 
-  /**
-   * Records a partition revocation.
-   *
-   * @param tp the revoked partition
-   */
+  @Override
   public void partitionRevoked(TopicPartition tp) {
     assignedPartitions.remove(tp);
   }
@@ -220,44 +211,41 @@ public class PipelineMetricsCollector {
    * @return current metrics snapshot
    */
   public PipelineMetrics snapshot() {
-    Map<TopicPartition, Long> lags = new HashMap<>();
-    Map<TopicPartition, Integer> failures = new HashMap<>();
-    Map<TopicPartition, Long> stalls = new HashMap<>();
+    Map<TopicPartition, PartitionMetrics> partitions = new HashMap<>();
+    int windowCapacity = offsetTracker.maxWindowSize();
     for (TopicPartition tp : Set.copyOf(assignedPartitions)) {
-      lags.put(tp, offsetTracker.lag(tp));
-      int failureCount = offsetTracker.failureCount(tp);
-      if (failureCount > 0) {
-        failures.put(tp, failureCount);
-      }
-      long stall = offsetTracker.commitStallMillis(tp);
-      if (stall > 0) {
-        stalls.put(tp, stall);
-      }
+      partitions.put(
+          tp,
+          new PartitionMetricsSnapshot(
+              offsetTracker.lag(tp),
+              offsetTracker.failureCount(tp),
+              offsetTracker.commitStallMillis(tp),
+              offsetTracker.windowSize(tp),
+              windowCapacity));
     }
 
-    return new PipelineMetrics(
+    return new PipelineMetricsSnapshot(
+        name,
         recordsProcessed.sum(),
         recordsFailed.sum(),
         recordsSkipped.sum(),
+        new DurationStatsSnapshot(handlerAttempts.sum(), handlerNanos.sum()),
         pollCount.sum(),
         emptyPollCount.sum(),
         inFlightCounter.records(),
         inFlightCounter.bytes(),
         backpressureController.lastStatus(),
         throttleCount.sum(),
-        Map.copyOf(lags),
-        Map.copyOf(failures),
         retryAttempts.sum(),
         dlqSuccesses.sum(),
         dlqFailures.sum(),
         finalFailures.sum(),
         commitSuccesses.sum(),
         commitFailures.sum(),
+        processingTimeouts.sum(),
         rebalanceCount.sum(),
         drainTimeouts.sum(),
         recordsAbandoned.sum(),
-        Set.copyOf(assignedPartitions),
-        Map.copyOf(stalls),
-        processingTimeouts.sum());
+        partitions);
   }
 }

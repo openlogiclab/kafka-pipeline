@@ -24,8 +24,8 @@ import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
-import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
+import io.github.openlogiclab.kafkapipeline.internal.WorkerMetrics;
 import io.github.openlogiclab.kafkapipeline.offset.ProcessingProgress;
 import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
 import java.util.List;
@@ -58,7 +58,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private final ProcessingProgress offsetTracker;
   private final RecordDispatcher<K, V> dispatcher;
   private final InFlightCounter counter;
-  private final PipelineMetricsCollector metricsCollector;
+  private final WorkerMetrics metrics;
   private final FailureResolver<K, V> failures;
 
   /**
@@ -72,7 +72,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
    * @param offsetTracker the offset tracker
    * @param dispatcher the record dispatcher
    * @param counter the in-flight counter
-   * @param metricsCollector the metrics collector
+   * @param metrics the metrics this component records
    */
   public SingleRecordWorkerPool(
       int concurrency,
@@ -83,7 +83,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       ProcessingProgress offsetTracker,
       RecordDispatcher<K, V> dispatcher,
       InFlightCounter counter,
-      PipelineMetricsCollector metricsCollector) {
+      WorkerMetrics metrics) {
     super(concurrency, threadMode, "kafka-pipeline-worker-", 0);
     this.handler = handler;
     this.hook = hook;
@@ -91,8 +91,8 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     this.offsetTracker = offsetTracker;
     this.dispatcher = dispatcher;
     this.counter = counter;
-    this.metricsCollector = metricsCollector;
-    this.failures = new FailureResolver<>(retryExecutor, offsetTracker, metricsCollector);
+    this.metrics = metrics;
+    this.failures = new FailureResolver<>(retryExecutor, offsetTracker);
   }
 
   @Override
@@ -208,7 +208,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
 
     if (skippedByHook(record, new ProcessingContext(tp, offset, 0))) {
       ack(tp, offset, generation);
-      metricsCollector.recordSkipped(1);
+      metrics.recordSkipped(1);
       return;
     }
 
@@ -228,7 +228,7 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       // Outside the retry loop: a hook that throws must not re-run a handler that succeeded.
       notifyAfterProcess(record, new ProcessingContext(tp, offset, lastAttempt[0]));
       ack(tp, offset, generation);
-      metricsCollector.recordProcessed(1);
+      metrics.recordProcessed(1);
       return;
     }
 

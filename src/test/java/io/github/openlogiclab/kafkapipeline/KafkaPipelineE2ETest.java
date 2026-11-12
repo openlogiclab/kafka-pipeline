@@ -24,6 +24,7 @@ import io.github.openlogiclab.kafkapipeline.backpressure.ByteBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
+import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
@@ -348,7 +349,9 @@ class KafkaPipelineE2ETest {
 
       PipelineMetrics m = pipeline.metrics();
       assertEquals(2, m.recordsProcessed(), "Two good records processed");
-      assertEquals(1, m.recordsSkipped(), "One poison record skipped");
+      assertEquals(1, m.recordsFailed(), "One poison record dropped");
+      assertEquals(0, m.recordsSkipped(), "A dropped record is not a hook skip");
+      assertEquals(1, m.finalFailures(), "Final failure handler ran once");
 
       Map<TopicPartition, OffsetAndMetadata> committed = mockConsumer.committed(Set.of(TP0));
       assertNotNull(committed.get(TP0));

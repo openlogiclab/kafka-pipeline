@@ -15,7 +15,6 @@
  */
 package io.github.openlogiclab.kafkapipeline.worker;
 
-import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.offset.ProcessingProgress;
 import java.util.List;
 import java.util.function.BooleanSupplier;
@@ -36,15 +35,10 @@ final class FailureResolver<K, V> {
 
   private final RetryExecutor<K, V> retryExecutor;
   private final ProcessingProgress progress;
-  private final PipelineMetricsCollector metricsCollector;
 
-  FailureResolver(
-      RetryExecutor<K, V> retryExecutor,
-      ProcessingProgress progress,
-      PipelineMetricsCollector metricsCollector) {
+  FailureResolver(RetryExecutor<K, V> retryExecutor, ProcessingProgress progress) {
     this.retryExecutor = retryExecutor;
     this.progress = progress;
-    this.metricsCollector = metricsCollector;
   }
 
   /**
@@ -71,8 +65,8 @@ final class FailureResolver<K, V> {
     }
     RetryExecutor.FailureResolution resolution =
         retryExecutor.handleFailure(records, tp, error, desc);
+    // Outcome metrics (DLQ'd vs. failed) are recorded by handleFailure, which knows the split.
     if (resolution == RetryExecutor.FailureResolution.SKIPPED) {
-      metricsCollector.recordFailed(records.size());
       if (ack.getAsBoolean()) progress.markFailed(tp);
     } else {
       ack.getAsBoolean();

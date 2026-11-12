@@ -17,7 +17,7 @@ package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
-import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.internal.RebalanceMetrics;
 import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
 import io.github.openlogiclab.kafkapipeline.offset.PartitionDrainResult;
 import io.github.openlogiclab.kafkapipeline.offset.PartitionLifecycle;
@@ -54,7 +54,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
   private final InFlightCounter counter;
   private final Consumer<?, ?> consumer;
   private final Duration drainTimeout;
-  private final PipelineMetricsCollector metricsCollector;
+  private final RebalanceMetrics metrics;
   private final ExecutorService drainExecutor;
   private final boolean readCommittedMetadata;
 
@@ -78,7 +78,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
    * @param counter the in-flight counter
    * @param consumer the Kafka consumer
    * @param drainTimeout timeout for draining in-flight records
-   * @param metricsCollector the metrics collector
+   * @param metrics the metrics this component records
    */
   public PipelineRebalanceListener(
       PartitionLifecycle offsetTracker,
@@ -87,16 +87,8 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       InFlightCounter counter,
       Consumer<?, ?> consumer,
       Duration drainTimeout,
-      PipelineMetricsCollector metricsCollector) {
-    this(
-        offsetTracker,
-        dispatcher,
-        commitSync,
-        counter,
-        consumer,
-        drainTimeout,
-        metricsCollector,
-        false);
+      RebalanceMetrics metrics) {
+    this(offsetTracker, dispatcher, commitSync, counter, consumer, drainTimeout, metrics, false);
   }
 
   /**
@@ -108,7 +100,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
    * @param counter the in-flight counter
    * @param consumer the Kafka consumer
    * @param drainTimeout timeout for draining in-flight records
-   * @param metricsCollector the metrics collector
+   * @param metrics the metrics this component records
    * @param readCommittedMetadata whether to read the committed metadata of newly assigned
    *     partitions, so records the previous owner already finished are skipped
    */
@@ -119,7 +111,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
       InFlightCounter counter,
       Consumer<?, ?> consumer,
       Duration drainTimeout,
-      PipelineMetricsCollector metricsCollector,
+      RebalanceMetrics metrics,
       boolean readCommittedMetadata) {
     this.readCommittedMetadata = readCommittedMetadata;
     this.offsetTracker = offsetTracker;
@@ -128,7 +120,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     this.counter = counter;
     this.consumer = consumer;
     this.drainTimeout = drainTimeout;
-    this.metricsCollector = metricsCollector;
+    this.metrics = metrics;
     this.drainExecutor =
         Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("kafka-pipeline-drain-", 0).factory());
@@ -139,7 +131,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     if (partitions.isEmpty()) return;
 
     logger.log(System.Logger.Level.INFO, "Partitions revoked: {0}", partitions);
-    metricsCollector.recordRebalance();
+    metrics.recordRebalance();
     pendingInit.removeAll(partitions);
     dropQueued(partitions);
 
@@ -164,8 +156,8 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
     try {
       PartitionDrainResult result = offsetTracker.drainPartition(tp, drainTimeout);
       if (!result.allCompleted()) {
-        metricsCollector.recordDrainTimeout();
-        metricsCollector.recordAbandoned(result.abandonedCount());
+        metrics.recordDrainTimeout();
+        metrics.recordAbandoned(result.abandonedCount());
       }
       logger.log(System.Logger.Level.INFO, "Drained {0}: {1}", tp, result);
     } catch (Exception e) {
@@ -199,7 +191,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
         "Partitions lost (consumer was removed from the group): {0}. Uncommitted records will be"
             + " redelivered.",
         partitions);
-    metricsCollector.recordRebalance();
+    metrics.recordRebalance();
     pendingInit.removeAll(partitions);
     dropQueued(partitions);
     clearTracking(partitions);
@@ -207,11 +199,11 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
 
   private void dropQueued(Collection<TopicPartition> partitions) {
     for (TopicPartition tp : partitions) {
-      metricsCollector.partitionRevoked(tp);
+      metrics.partitionRevoked(tp);
       List<? extends ConsumerRecord<?, ?>> abandoned = dispatcher.removePartition(tp);
       if (!abandoned.isEmpty()) {
         counter.completed(abandoned.size(), RecordSize.estimateBytes(abandoned));
-        metricsCollector.recordAbandoned(abandoned.size());
+        metrics.recordAbandoned(abandoned.size());
       }
     }
   }
@@ -250,7 +242,7 @@ public final class PipelineRebalanceListener implements ConsumerRebalanceListene
         String metadata = last != null && last.offset() == position ? last.metadata() : null;
         offsetTracker.initPartition(tp, position, metadata);
         dispatcher.addPartition(tp, offsetTracker.generation(tp));
-        metricsCollector.partitionAssigned(tp);
+        metrics.partitionAssigned(tp);
         pendingInit.remove(tp);
         logger.log(System.Logger.Level.DEBUG, "Initialized {0} at offset {1}", tp, position);
       } catch (RuntimeException e) {
