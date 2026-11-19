@@ -2,6 +2,8 @@
 
 This is the map for contributors: what the parts are, which thread runs what, and how a record moves through the pipeline. For how to use the library, see the [README](README.md). For the reasoning behind the sink and exactly-once work, see [docs/design](docs/design).
 
+Everything below is in the `kafka-pipeline` module, which has everything Kafka: besides the pipeline, the Kafka sink (`sink.kafka.KafkaRecordSink`) and the Kafka DLQ (`error.KafkaDLQHandler`). The pipeline sees the Kafka sink only through the `RecordSink` SPI, like any other sink. Sinks for other destinations, which bring their own dependencies, go in separate modules.
+
 ## The idea
 
 Kafka orders records within a partition, and a plain consumer processes them one at a time. When processing waits on I/O, throughput is capped at *partitions ÷ per-record latency*. kafka-pipeline separates concurrency from the partition count: many workers process records of the same partition at once, ordering is kept only where you ask for it (per key or per partition), and offsets are committed only past records that are finished. Backpressure is global, so a slow downstream pauses fetching for everyone instead of piling up memory.
@@ -31,8 +33,8 @@ RecordDispatcher.dispatch → lane of its partition
                                                    maxConcurrencyPerPartition)
                                                 markInProgress
                                                 processor / handler   (retries, timeout)
-                                                  ├─ no outputs ────────► ack, release
-                                                  ├─ outputs ───────────► sink.write ──► stage completes
+                                                  ├─ Optional.empty() ──► ack, release
+                                                  ├─ an output ─────────► sink.write ──► stage completes
                                                   │                                       ├─ ok → ack, release
                                                   │                                       └─ fail → retry write → DLQ / drop → ack, release
                                                   └─ failed ────────────► DLQ / drop → ack, release
@@ -46,7 +48,7 @@ Batch mode skips the dispatcher: `BatchWorkerPool` submits one task per partitio
 
 ## Offsets: one window per partition
 
-`offset.PartitionWindow` holds the state of each polled offset (`REGISTERED → IN_PROGRESS → DONE`). Records finish in any order, so the window accepts acks in any order; the committable offset only moves past a contiguous run of `DONE` offsets. A stuck record therefore holds back its partition's commit, never another partition's, and never lets an unfinished record be committed.
+`offset.PartitionWindow` holds the state of each polled offset (`REGISTERED → IN_PROGRESS → DONE`). Records finish in any order, so the window accepts acks in any order; the committable offset only moves past a contiguous run of `DONE` offsets. After every poll, the poll thread also tells the window where the consumer fetches next; once every registered record is done, the committable offset moves up to that position, past offsets that are not records (transaction markers, aborted or compacted-away offsets). A stuck record therefore holds back its partition's commit, never another partition's, and never lets an unfinished record be committed.
 
 With `skipCompletedOnRestart` (on by default), each commit also stores, in the commit metadata, which offsets after the committed one are already done (`offset.CompletedOffsetsCodec`). The next owner of the partition skips those records instead of processing them again.
 
@@ -65,13 +67,13 @@ The global throttle relieves pressure. The others are limits of one partition an
 
 ## Failures
 
-`worker.RetryExecutor` retries a processing attempt with the error strategy's backoff. Sink write and DLQ failures are classified first (`WriteFailure`, from `RecordSink.classify` / `DLQHandler.classify`): `FATAL` stops the pipeline with the record unacked, `TRANSIENT` is retried until the destination recovers (an outage becomes backpressure; after `writeOutageTimeout` the pipeline stops), and only `RECORD` failures use the retry budget and can end in a drop. Retry backoffs end at once when the pipeline starts stopping. When the retries are used up, `worker.FailureResolver` sends the record to the DLQ or drops it (`FinalFailureHandler` first), and acks it either way, so the partition keeps moving. Errors that retrying cannot fix (authentication, authorization, fencing, `OutOfMemoryError`; see `internal.FatalErrors`) stop the pipeline; `start()` rethrows them and `failure()` returns them.
+`worker.RetryExecutor` retries a processing attempt with the error strategy's backoff. Sink write and DLQ failures are classified first (`WriteFailure`, from `RecordSink.classify` / `DLQHandler.classify`): `FATAL` stops the pipeline with the record unacked, `TRANSIENT` is retried until the destination recovers (an outage becomes backpressure; after `writeOutageTimeout` the pipeline stops), and only `RECORD` failures use the retry budget and can end in a drop. Retry backoffs end at once when the pipeline starts stopping. When the retries are used up, `worker.FailureResolver` sends the record to the DLQ or drops it (`FinalFailureHandler` first), and acks it either way, so the partition keeps moving. A `classify` that returns null or throws counts as `RECORD`, and every write outcome is reported exactly once, so a broken classifier can neither hang a record nor stop the pipeline. Errors that retrying cannot fix (authentication, authorization, fencing, `OutOfMemoryError`; see `internal.FatalErrors`) stop the pipeline; `start()` rethrows them and `failure()` returns them.
 
 ## Rebalances
 
 - **Revoked**: drop queued records of the partition, tell the sink (`onPartitionRevoked`), wait up to `drainTimeout` for in-flight ones, commit, forget the partition. Late acks from records still running are discarded by a generation check.
 - **Lost** (this consumer was removed from the group): drop and forget without committing.
-- **Assigned**: create the window at the consumer's position, reading the committed metadata to skip records already done. A partition that fails to initialize stays paused and is retried.
+- **Assigned**: create the window at the consumer's position, reading the committed metadata to skip records already done. If the group has no committed offset there (a new group, or a reset or seek), the first commit writes that position even before any record finishes, so a later owner resumes there instead of applying `auto.offset.reset` and skipping records. A partition that fails to initialize stays paused and is retried.
 
 ## Shutdown
 

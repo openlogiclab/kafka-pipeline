@@ -23,7 +23,7 @@ This library packages all of that into a clean pipeline that you configure once 
 
 ## Installation
 
-Replace `VERSION` with the latest release shown on the Maven Central badge above.
+Replace `VERSION` with the latest release shown on the Maven Central badge above. The artifact has everything for Kafka: the pipeline, the sink SPI, the Kafka sink (`KafkaRecordSink`) and the Kafka DLQ (`KafkaDLQHandler`). Its only dependency is `kafka-clients`.
 
 **Gradle (Kotlin DSL)**
 ```kotlin
@@ -430,7 +430,7 @@ Off by default. An attempt that runs longer is interrupted and counts as a failu
 
 ### Writing output: processor and sink
 
-When processing produces something to write (another topic, a database, object storage, an HTTP service), split it into a **processor** and a **sink** instead of writing inside a `handler`:
+When processing produces something to write (another topic, a database, object storage, an HTTP service), split it into a **processor** and a **sink** instead of writing inside a `handler`. The processor returns `Optional<O>`: the output to write, or `Optional.empty()` when there is nothing to write (the record is acked without a write). `KafkaRecordSink` writes to Kafka; any other destination is a `RecordSink` you implement.
 
 ```java
 KafkaRecordSink<String, EnrichedOrder> output = KafkaRecordSink.<String, EnrichedOrder>builder()
@@ -450,7 +450,7 @@ KafkaPipeline<String, Order> pipeline = new KafkaPipeline<>(
         .processor(record -> {                                    // business logic, may block on I/O
             Order order = record.value();
             Customer customer = customers.get(order.customerId());
-            return List.of(new EnrichedOrder(order, customer));   // List.of() = nothing to write
+            return Optional.of(new EnrichedOrder(order, customer)); // Optional.empty() = nothing to write
         })
         .sink(output)                                             // acked only once written
         .errorStrategy(ErrorStrategy.<String, Order>builder()
@@ -458,7 +458,7 @@ KafkaPipeline<String, Order> pipeline = new KafkaPipeline<>(
             .retryBackoff(Duration.ofMillis(200))
             .exponentialBackoff(true)
             .dlqHandler(KafkaDLQHandler.<String, Order>builder()
-                .sharing(output)                                  // same producer
+                .producer(output.producer())                      // share the sink's producer
                 .topic("orders-dlq")
                 .keySerializer(new StringSerializer())
                 .valueSerializer(new OrderSerializer())
@@ -469,18 +469,27 @@ KafkaPipeline<String, Order> pipeline = new KafkaPipeline<>(
 
 What the library does with the pair:
 
-- **A record is acked only when its outputs are durable.** The worker hands the outputs to the sink and moves on to the next record; the record stays in flight (backpressure) and in progress (its partition's commit point) until the sink's `CompletionStage` completes. A fire-and-forget `producer.send()` can no longer get a record committed before its output lands.
-- **Order is kept through the write.** With `ordering(KEY)` the next record of a key starts only after the previous record's output is written, so each key's outputs come out in input order (keep the output key derived from the input key so they land in one output partition). `PARTITION` does the same per partition. `UNORDERED` keeps no order.
+- **A record is acked only when its output is durable.** The worker hands the output to the sink and moves on to the next record; the record stays in flight (backpressure) and in progress (its partition's commit point) until the sink's `CompletionStage` completes. A fire-and-forget `producer.send()` can no longer get a record committed before its output lands.
+- **Order is kept through the write.** With `ordering(KEY)` the next record of a key starts only after the previous record's output is written, so each key's output comes out in input order (keep the output key derived from the input key so they land in one output partition). `PARTITION` does the same per partition. `UNORDERED` keeps no order.
 - **Failed writes are retried, not reprocessed.** Only the write is retried, never the processor. The sink classifies each failure (`RecordSink.classify`, a `WriteFailure`; the default understands Kafka errors):
   - `TRANSIENT` (a broker timeout, a leader election) is retried until the destination recovers, so an outage holds records back as backpressure instead of dropping them. If it stays down longer than `writeOutageTimeout` (default 5 minutes), the pipeline stops, still without dropping or committing the record.
   - `FATAL` (a missing ACL on the output topic, bad credentials, a closed producer) stops the pipeline with the record unacked.
   - `RECORD` (a record too large, invalid data) is retried up to the error strategy's `maxRetries`, then goes to the DLQ or is dropped, and the partition moves on.
 
-  The DLQ is treated the same way (`DLQHandler.classify`): a DLQ that is briefly down is retried, not a reason to drop. A retry resends all of the record's outputs, so downstream may see duplicates (see below). Writes of a partition that is revoked meanwhile are abandoned, never retried or dead-lettered by the old owner.
+  The DLQ is treated the same way (`DLQHandler.classify`): a DLQ that is briefly down is retried, not a reason to drop. A retry resends the record's output, so downstream may see duplicates (see below). Writes of a partition that is revoked meanwhile are abandoned, never retried or dead-lettered by the old owner.
 - **Downstream pressure is global.** `KafkaRecordSink` reports unsent producer records (`maxPendingSends`, default 10,000) to the global backpressure, like the in-flight count: it throttles all partitions, never just one.
-- **Shutdown waits for writes.** Writes still in flight get the rest of `shutdownTimeout`; those that finish are committed, the rest are redelivered. The processor and the sink are closed after the final commit (and a `KafkaDLQHandler`; your own `DLQHandler` keeps its own lifecycle).
+- **Shutdown waits for writes.** Writes still in flight get the rest of `shutdownTimeout`; those that finish are committed, the rest are redelivered. The processor and the sink are closed after the final commit. The DLQ handler is not: it belongs to the `ErrorStrategy`, which can be shared between pipelines. A `KafkaDLQHandler` that shares the sink's producer, as above, has nothing of its own to close; one built with `producerProperties(...)` owns its producer, so close it after the pipeline stops.
 
-`RecordProcessor` and `RecordSink` each have one abstract method, so lambdas, method references and classes all work. A sink returns a `CompletionStage`; wrap blocking code with `RecordSink.blocking(...)`. Writes are at-least-once: a record can be processed and written again after a crash or rebalance. Every output of the Kafka sinks carries a `kp-source` header (`topic-partition-offset` of the input), and `SinkContext.recordId()` gives custom sinks the same id, so downstream writes can be made idempotent (upserts, deterministic object keys, idempotency keys).
+`RecordProcessor` and `RecordSink` each have one abstract method, so lambdas, method references and classes all work. A sink returns a `CompletionStage`; wrap blocking code with `RecordSink.blocking(...)`. A processor that returns `null` instead of an `Optional` fails the attempt like an exception (it is retried, then dead-lettered or dropped).
+
+For several outputs per record, return a list and wrap the sink in `RecordSink.forEach`. Every element is written with the inner sink, in list order, and the record is acked once all of them are durable; if one fails, the whole list is written again:
+
+```java
+.processor(record -> Optional.of(splitIntoLines(record.value())))   // Optional<List<Line>>
+.sink(RecordSink.forEach(lineSink))                                  // lineSink is a RecordSink<Line>
+```
+
+Writes are at-least-once: a record can be processed and written again after a crash or rebalance. Every output of `KafkaRecordSink` carries a `kp-source` header (`topic-partition-offset` of the input) and a `kp-output-index` header (its position among the record's outputs, `0` when there is one); the two together identify an output, so dedupe on both. Custom sinks get the same from `SinkContext`: `recordId()` for the input record and `outputId()` for the output, to make downstream writes idempotent (upserts, deterministic object keys, idempotency keys).
 
 Use `handler` when processing has only side effects and nothing to write; `handler`, `batchHandler` and `processor(...).sink(...)` are mutually exclusive. Batch mode does not support sinks yet.
 
@@ -808,7 +817,7 @@ pipeline.awaitShutdown();
 | `topic` / `topics` | *required* | Topic to subscribe to; one per pipeline is recommended (see [One topic per pipeline](#one-topic-per-pipeline)) |
 | `handler` | *one required* | Your `RecordHandler<K,V>` for per-record mode |
 | `batchHandler` | *one required* | Your `BatchRecordHandler<K,V>` for batch mode |
-| `processor(...).sink(...)` | *one required* | A `RecordProcessor<K,V,O>` and the `RecordSink<O>` its outputs go to; records are acked once written (see [Writing output](#writing-output-processor-and-sink)) |
+| `processor(...).sink(...)` | *one required* | A `RecordProcessor<K,V,O>` (returns `Optional<O>`) and the `RecordSink<O>` its output goes to; records are acked once written (see [Writing output](#writing-output-processor-and-sink)) |
 | `concurrency(ThreadMode, int)` | *required* | Thread model and worker count |
 | `recordBackpressure` | high=10,000, low=6,000 | Pause every partition when this many records are in flight |
 | `byteBackpressure` | disabled | Pause every partition when this many serialized bytes are in flight |
@@ -817,7 +826,7 @@ pipeline.awaitShutdown();
 | `errorStrategy` | `dropOnError()` | Retry + DLQ + fallback chain; the default retries nothing and drops, logging the record's metadata (see [Error Handling](#error-handling)) |
 | `writeOutageTimeout` | 5 minutes | How long a sink or DLQ write may keep failing transiently (destination down) before the pipeline stops; records are never dropped for an outage |
 | `processingTimeout` | 0 (off) | Max duration of one handler attempt before it is interrupted and counted as failed (see [Processing timeout](#processing-timeout)) |
-| `lifecycleHook` | no-op | Before/after/error callbacks (per-record mode only) |
+| `lifecycleHook` | no-op | Before/after/error callbacks; per-record mode only (rejected with `batchHandler`) |
 | `commitInterval` | 5s | How often to commit offsets async |
 | `drainTimeout` | 30s | Max wait for in-flight records during rebalance |
 | `shutdownTimeout` | 30s | Max wait for records already being processed to finish on shutdown; queued records that haven't started are redelivered on the next start |
@@ -1017,6 +1026,8 @@ The library doesn't try to solve idempotency for you — that's deeply tied to y
 ./gradlew integrationTest    # against a real Kafka broker in Docker (Testcontainers)
 ./gradlew check              # both, plus formatting checks
 ```
+
+The library is the `kafka-pipeline` module; shared build settings live in `build-logic`, ready for sinks of other destinations to get their own modules. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Integration tests are skipped automatically when Docker is not available.
 

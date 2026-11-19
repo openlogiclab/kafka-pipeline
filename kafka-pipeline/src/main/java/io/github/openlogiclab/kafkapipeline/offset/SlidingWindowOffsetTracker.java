@@ -1,0 +1,338 @@
+/*
+ * Copyright 2026 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.github.openlogiclab.kafkapipeline.offset;
+
+import java.time.Duration;
+import java.util.BitSet;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.OptionalLong;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
+
+/**
+ * Tracks which offsets of each assigned partition are done and how far each partition can be
+ * committed.
+ *
+ * <p>Each partition has a {@link PartitionWindow}: a sliding window of per-offset states. Records
+ * may finish in any order, so the window accepts acks in any order, and the committable offset only
+ * advances past a contiguous run of finished offsets. A record that is still running therefore
+ * holds back the commit, and nothing unfinished is ever committed.
+ *
+ * <p>This tracker serves every {@link io.github.openlogiclab.kafkapipeline.ProcessingOrder}.
+ * Ordering is enforced earlier, by the dispatcher deciding which records may run; with {@code KEY}
+ * ordering, different keys still finish out of order, and with {@code PARTITION} ordering acks
+ * simply arrive in offset order.
+ */
+public final class SlidingWindowOffsetTracker implements OffsetTracker {
+
+  private static final System.Logger logger =
+      System.getLogger(SlidingWindowOffsetTracker.class.getName());
+
+  private final ConcurrentHashMap<TopicPartition, PartitionWindow> partitions =
+      new ConcurrentHashMap<>();
+
+  private final int maxWindowSize;
+  private volatile boolean skipCompletedOnRestart;
+  private final AtomicLong nextGeneration = new AtomicLong();
+
+  /** Creates a tracker with the default window size. */
+  public SlidingWindowOffsetTracker() {
+    this(PartitionWindow.DEFAULT_MAX_WINDOW_SIZE);
+  }
+
+  /**
+   * Creates a tracker whose partition windows hold at most {@code maxWindowSize} entries.
+   *
+   * @param maxWindowSize per-partition window capacity
+   */
+  public SlidingWindowOffsetTracker(int maxWindowSize) {
+    this(maxWindowSize, false);
+  }
+
+  /**
+   * Creates a tracker.
+   *
+   * @param maxWindowSize per-partition window capacity
+   * @param skipCompletedOnRestart whether commit points record offsets that finished beyond the
+   *     committed one, and whether {@link #initPartition(TopicPartition, long, OffsetAndMetadata)}
+   *     skips the ones a previous owner recorded
+   */
+  public SlidingWindowOffsetTracker(int maxWindowSize, boolean skipCompletedOnRestart) {
+    if (maxWindowSize <= 0) {
+      throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
+    }
+    this.maxWindowSize = maxWindowSize;
+    this.skipCompletedOnRestart = skipCompletedOnRestart;
+  }
+
+  @Override
+  public void register(TopicPartition tp, long offset) {
+    getOrThrow(tp).register(offset);
+  }
+
+  @Override
+  public void advanceFetchPosition(TopicPartition tp, long position) {
+    PartitionWindow window = partitions.get(tp);
+    if (window != null) window.advanceFetchPosition(position);
+  }
+
+  @Override
+  public void registerBatch(TopicPartition tp, long[] offsets) {
+    if (Objects.isNull(offsets)) {
+      throw new IllegalArgumentException("offset cannot be Null");
+    }
+    if (offsets.length == 0) {
+      throw new IllegalArgumentException("offset cannot be empty");
+    }
+    getOrThrow(tp).registerBatch(offsets);
+  }
+
+  @Override
+  public boolean registerUnlessDone(TopicPartition tp, long offset) {
+    return getOrThrow(tp).registerUnlessDone(offset);
+  }
+
+  @Override
+  public long[] registerBatchUnlessDone(TopicPartition tp, long[] offsets) {
+    if (Objects.isNull(offsets) || offsets.length == 0) {
+      throw new IllegalArgumentException("offsets cannot be null or empty");
+    }
+    return getOrThrow(tp).registerBatchUnlessDone(offsets);
+  }
+
+  @Override
+  public void markInProgress(TopicPartition tp, long offset) {
+    getOrThrow(tp).markInProgress(offset);
+  }
+
+  @Override
+  public int markBatchInProgress(TopicPartition tp, long[] offsets) {
+    return getOrThrow(tp).markBatchInProgress(offsets);
+  }
+
+  @Override
+  public void ack(TopicPartition tp, long offset) {
+    getOrThrow(tp).ack(offset);
+  }
+
+  @Override
+  public int ackBatch(TopicPartition tp, long[] offsets) {
+    return getOrThrow(tp).ackBatch(offsets);
+  }
+
+  @Override
+  public long generation(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.generation() : NO_GENERATION;
+  }
+
+  @Override
+  public void markInProgress(TopicPartition tp, long offset, long generation) {
+    getOrThrow(tp, generation).markInProgress(offset);
+  }
+
+  @Override
+  public int markBatchInProgress(TopicPartition tp, long[] offsets, long generation) {
+    return getOrThrow(tp, generation).markBatchInProgress(offsets);
+  }
+
+  @Override
+  public void ack(TopicPartition tp, long offset, long generation) {
+    getOrThrow(tp, generation).ack(offset);
+  }
+
+  @Override
+  public int ackBatch(TopicPartition tp, long[] offsets, long generation) {
+    return getOrThrow(tp, generation).ackBatch(offsets);
+  }
+
+  @Override
+  public OptionalLong getCommittableOffset(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    if (Objects.isNull(window)) {
+      return OptionalLong.empty();
+    }
+    return window.getCommittableOffset();
+  }
+
+  @Override
+  public Map<TopicPartition, CommitPoint> getUncommittedCommitPoints() {
+    Map<TopicPartition, CommitPoint> result = new HashMap<>();
+    partitions.forEach(
+        (tp, window) -> window.getUncommittedCommitPoint().ifPresent(p -> result.put(tp, p)));
+    return result;
+  }
+
+  @Override
+  public Map<TopicPartition, CommitPoint> getAllCommitPoints() {
+    Map<TopicPartition, CommitPoint> result = new HashMap<>();
+    partitions.forEach((tp, window) -> window.getCommitPoint().ifPresent(p -> result.put(tp, p)));
+    return result;
+  }
+
+  @Override
+  public void disableSkipCompletedOnRestart() {
+    skipCompletedOnRestart = false;
+    partitions.values().forEach(PartitionWindow::disableSkipCompletedOnRestart);
+  }
+
+  @Override
+  public void markCommitted(TopicPartition tp, CommitPoint point) {
+    PartitionWindow window = partitions.get(tp);
+    if (window != null) {
+      window.markCommitted(point);
+    }
+  }
+
+  @Override
+  public void initPartition(TopicPartition tp, long startOffset) {
+    initPartition(tp, startOffset, new OffsetAndMetadata(startOffset));
+  }
+
+  @Override
+  public void initPartition(TopicPartition tp, long startOffset, OffsetAndMetadata committed) {
+    // The metadata only describes records after the committed offset, so it applies only when the
+    // consumer resumes exactly there.
+    boolean startOffsetCommitted = committed != null && committed.offset() == startOffset;
+    BitSet preDone =
+        skipCompletedOnRestart && startOffsetCommitted
+            ? CompletedOffsetsCodec.decode(committed.metadata(), startOffset)
+            : new BitSet();
+    PartitionWindow window =
+        new PartitionWindow(
+            startOffset,
+            maxWindowSize,
+            nextGeneration.incrementAndGet(),
+            skipCompletedOnRestart,
+            preDone,
+            startOffsetCommitted);
+    PartitionWindow existing = partitions.putIfAbsent(tp, window);
+    if (existing != null) {
+      throw new IllegalStateException(
+          "Partition " + tp + " already initialized. Call clearPartition first.");
+    }
+    if (!preDone.isEmpty()) {
+      logger.log(
+          System.Logger.Level.INFO,
+          "{0}: {1} records after offset {2} were already processed by the previous owner and will"
+              + " be skipped",
+          tp,
+          preDone.cardinality(),
+          startOffset);
+    }
+  }
+
+  @Override
+  public PartitionDrainResult drainPartition(TopicPartition tp, Duration timeout) {
+    PartitionWindow window = partitions.get(tp);
+    if (window == null) {
+      return new PartitionDrainResult(true, 0, 0, OptionalLong.empty());
+    }
+    return window.drain(timeout);
+  }
+
+  @Override
+  public void clearPartition(TopicPartition tp) {
+    PartitionWindow window = partitions.remove(tp);
+    if (window != null) {
+      int pending = window.pendingCount();
+      int inProgress = window.inProgressCount();
+      if (pending > 0 || inProgress > 0) {
+        logger.log(
+            System.Logger.Level.WARNING,
+            "Clearing partition {0} with {1} pending and {2} in-progress. "
+                + "These records will be re-consumed by the new owner.",
+            tp,
+            pending,
+            inProgress);
+      }
+    }
+  }
+
+  @Override
+  public int pendingCount(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.pendingCount() : 0;
+  }
+
+  @Override
+  public int inProgressCount(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.inProgressCount() : 0;
+  }
+
+  @Override
+  public long uncommittedOffsets(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.uncommittedOffsets() : 0;
+  }
+
+  @Override
+  public void markDropped(TopicPartition tp) {
+    getOrThrow(tp).markDropped();
+  }
+
+  @Override
+  public long droppedCount(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.droppedCount() : 0;
+  }
+
+  @Override
+  public int windowSize(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.windowSize() : 0;
+  }
+
+  @Override
+  public long commitStallMillis(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    return window != null ? window.commitStallMillis() : 0;
+  }
+
+  @Override
+  public int maxWindowSize() {
+    return maxWindowSize;
+  }
+
+  private PartitionWindow getOrThrow(TopicPartition tp, long generation) {
+    PartitionWindow window = getOrThrow(tp);
+    if (generation != NO_GENERATION && window.generation() != generation) {
+      throw new IllegalStateException(
+          "Partition "
+              + tp
+              + " was re-assigned since this record was fetched (generation "
+              + generation
+              + ", now "
+              + window.generation()
+              + ")");
+    }
+    return window;
+  }
+
+  private PartitionWindow getOrThrow(TopicPartition tp) {
+    PartitionWindow window = partitions.get(tp);
+    if (window == null) {
+      throw new IllegalStateException(
+          "Partition " + tp + " not initialized. Call initPartition first.");
+    }
+    return window;
+  }
+}

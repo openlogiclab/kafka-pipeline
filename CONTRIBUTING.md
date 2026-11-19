@@ -19,18 +19,28 @@ You need JDK 21. Docker is only needed for the integration tests.
 
 Run `./gradlew spotlessApply build jacocoTestCoverageVerification javadoc` before you push.
 
-Integration tests are skipped when Docker is not available, so a green `check` on a machine without Docker has not run them.
+Each task runs in every module; prefix it with a module to run one, for example `./gradlew :kafka-pipeline:test`. Integration tests are skipped when Docker is not available, so a green `check` on a machine without Docker has not run them.
 
 ## Where things are
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) first. In short:
+Read [ARCHITECTURE.md](ARCHITECTURE.md) first. The build is multi-module:
+
+| Module | Published as | What it has |
+|---|---|---|
+| `kafka-pipeline` | `io.github.openlogiclab:kafka-pipeline` | Everything Kafka: the pipeline, the sink SPI, the Kafka sink and the Kafka DLQ, error handling, backpressure, metrics |
+| `build-logic` | not published | The convention plugin every module applies: Java 21, formatting, tests, coverage, publishing |
+
+What decides whether code gets its own module is the dependencies it brings. Anything that needs only `kafka-clients` belongs in `kafka-pipeline`. A sink for another destination (a database, object storage, HTTP) brings its own client, driver or SDK, so it goes in its own module, such as `kafka-pipeline-jdbc` or `kafka-pipeline-s3`, released with the same version. Users then only get the dependencies they use. Sinks use only the public API (the exported packages), as `KafkaRecordSink` does, so the pipeline sees every sink through the `RecordSink` SPI.
+
+The packages of `kafka-pipeline`:
 
 | Package | Role | Threads | Public? |
 |---|---|---|---|
-| root | `KafkaPipeline`, `PipelineConfig` and its builder, `ProcessingOrder`, `ThreadMode` | any | yes |
+| root | `KafkaPipeline`, `PipelineConfig` and its builder, `ProcessingOrder`, `ThreadMode`, `KafkaHeaders` | any | yes |
 | `handler` | `RecordHandler`, `BatchRecordHandler`, `ProcessingLifecycleHook` | workers | yes |
-| `sink`, `sink.kafka` | `RecordProcessor`, `RecordSink`, `SinkContext`; `KafkaRecordSink`, `KafkaDLQHandler`, `KafkaHeaders` | workers, sink I/O | yes |
-| `error` | `ErrorStrategy`, `Fallback`, `DLQHandler`, `FinalFailureHandler` | workers | yes |
+| `sink` | `RecordProcessor`, `RecordSink` (with `forEach` and `blocking`), `SinkContext` | workers, sink I/O | yes |
+| `sink.kafka` | `KafkaRecordSink` | workers, producer callbacks | yes |
+| `error` | `ErrorStrategy`, `Fallback`, `DLQHandler`, `KafkaDLQHandler`, `WriteFailure`, `FinalFailureHandler` | workers | yes |
 | `backpressure` | settings records and the `BackpressureSensor` SPI | poll thread | yes |
 | `metrics` | `PipelineMetrics`, `PartitionMetrics`, `MetricsExporter` SPI | any | yes |
 | `consumer` | `PollLoop`, `PartitionPauseController`, `PipelineRebalanceListener` | poll thread only | no |
@@ -78,7 +88,7 @@ The library is read far more often than it is written. Prefer the clear name ove
 - Every bug fix comes with a test that fails without the fix.
 - Concurrency tests wait for a condition (`await(() -> ..., timeout)`), never for a fixed sleep alone, and assert the invariant (committable offset, in-flight count) rather than timing.
 - `MockConsumer.rebalance(...)` runs the rebalance listener on the calling thread. Wait until the pipeline has subscribed (`consumer.subscription()` is not empty) before calling it.
-- Anything that needs real fetch, commit or group behaviour belongs in `src/integrationTest` (Testcontainers).
+- Anything that needs real fetch, commit or group behaviour belongs in `src/integrationTest` (Testcontainers) of the module it tests.
 
 ## Pull requests
 
