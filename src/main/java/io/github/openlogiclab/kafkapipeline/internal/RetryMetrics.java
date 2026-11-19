@@ -49,8 +49,5 @@ public interface RetryMetrics {
    *
    * @param count number of records dropped
    */
-  void recordFailed(int count);
-
-  /** Records a final failure handler invocation, one per dropped record. */
-  void recordFinalFailure();
+  void recordDropped(int count);
 }

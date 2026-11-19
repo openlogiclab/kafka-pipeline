@@ -17,13 +17,14 @@ package io.github.openlogiclab.kafkapipeline.worker;
 
 import io.github.openlogiclab.kafkapipeline.ProcessingOrder;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
 import io.github.openlogiclab.kafkapipeline.internal.WorkerMetrics;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.offset.ProcessingProgress;
 import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -132,7 +133,8 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
     this.offsetTracker = offsetTracker;
     this.counter = counter;
     this.metrics = metrics;
-    this.failures = new FailureResolver<>(retryExecutor, offsetTracker);
+    this.failures =
+        new FailureResolver<>(retryExecutor, offsetTracker, this::stopping, this::escalateFatal);
     this.handlerPermits = threadMode == ThreadMode.VIRTUAL ? new Semaphore(concurrency) : null;
   }
 
@@ -231,6 +233,16 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
   }
 
   @Override
+  public void onPartitionsDrained(Collection<TopicPartition> partitions) {
+    retryExecutor.partitionsChanged(); // retries of their batches give up at once
+  }
+
+  @Override
+  protected void onStopping() {
+    retryExecutor.beginShutdown(); // ends retry and DLQ backoffs at once
+  }
+
+  @Override
   public boolean canResume(TopicPartition tp) {
     return taskQueueDrained() && !atLimit(tp);
   }
@@ -294,7 +306,11 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
 
     Exception lastError =
         retryExecutor.executeWithRetries(
-            attempt -> handler.handleBatch(tp, batch), tp, desc, this::stopping);
+            attempt -> handler.handleBatch(tp, batch),
+            tp,
+            desc,
+            this::stopping,
+            () -> owns(offsetTracker, tp, generation));
 
     if (lastError == null) {
       ackBatch(tp, offsets, generation, desc);
@@ -302,7 +318,13 @@ public final class BatchWorkerPool<K, V> extends WorkerPool<K, V> {
       return;
     }
 
-    failures.resolve(batch, tp, lastError, desc, () -> ackBatch(tp, offsets, generation, desc));
+    failures.resolve(
+        batch,
+        tp,
+        lastError,
+        desc,
+        () -> ackBatch(tp, offsets, generation, desc),
+        () -> owns(offsetTracker, tp, generation));
   }
 
   /**

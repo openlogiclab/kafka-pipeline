@@ -79,8 +79,5 @@ public final class NoOpMetricsCollector
   public void recordDlqFailure(int count) {}
 
   @Override
-  public void recordFailed(int count) {}
-
-  @Override
-  public void recordFinalFailure() {}
+  public void recordDropped(int count) {}
 }

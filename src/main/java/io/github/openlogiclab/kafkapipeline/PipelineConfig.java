@@ -15,19 +15,25 @@
  */
 package io.github.openlogiclab.kafkapipeline;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.ByteBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.backpressure.HeapBackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.backpressure.RecordBackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.consumer.PartitionPauseController;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.handler.BatchRecordHandler;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
+import io.github.openlogiclab.kafkapipeline.internal.ProcessorBinding;
 import io.github.openlogiclab.kafkapipeline.metrics.MetricsExporter;
+import io.github.openlogiclab.kafkapipeline.sink.RecordProcessor;
+import io.github.openlogiclab.kafkapipeline.sink.RecordSink;
+import io.github.openlogiclab.kafkapipeline.worker.RetryExecutor;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.OptionalInt;
 import java.util.Properties;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 
@@ -48,9 +54,10 @@ public final class PipelineConfig<K, V> {
   private final List<String> topics;
   private final RecordHandler<K, V> handler;
   private final BatchRecordHandler<K, V> batchHandler;
+  private final ProcessorBinding<K, V, ?> processorBinding;
   private final int concurrency;
   private final ThreadMode threadMode;
-  private final BackpressureConfig backpressure;
+  private final RecordBackpressureConfig recordBackpressure;
   private final ByteBackpressureConfig byteBackpressure;
   private final HeapBackpressureConfig heapBackpressure;
   private final List<BackpressureSensor> customSensors;
@@ -66,6 +73,7 @@ public final class PipelineConfig<K, V> {
   private final ProcessingOrder ordering;
   private final boolean skipCompletedOnRestart;
   private final Duration processingTimeout;
+  private final Duration writeOutageTimeout;
   private final String name;
   private final List<MetricsExporter> metricsExporters;
 
@@ -75,9 +83,10 @@ public final class PipelineConfig<K, V> {
     this.topics = b.topics == null ? null : List.copyOf(b.topics);
     this.handler = b.handler;
     this.batchHandler = b.batchHandler;
+    this.processorBinding = b.processorBinding;
     this.concurrency = b.concurrency;
     this.threadMode = b.threadMode;
-    this.backpressure = b.backpressure;
+    this.recordBackpressure = b.recordBackpressure;
     this.byteBackpressure = b.byteBackpressure;
     this.heapBackpressure = b.heapBackpressure;
     this.customSensors = List.copyOf(b.customSensors);
@@ -93,11 +102,12 @@ public final class PipelineConfig<K, V> {
     this.ordering = b.ordering;
     this.skipCompletedOnRestart = b.skipCompletedOnRestart;
     this.processingTimeout = b.processingTimeout;
+    this.writeOutageTimeout = b.writeOutageTimeout;
     this.metricsExporters = List.copyOf(b.metricsExporters);
     Objects.requireNonNull(consumerProperties, "consumerProperties");
     Objects.requireNonNull(topics, "topics");
     Objects.requireNonNull(threadMode, "threadMode");
-    Objects.requireNonNull(backpressure, "backpressure");
+    Objects.requireNonNull(recordBackpressure, "recordBackpressure");
     Objects.requireNonNull(byteBackpressure, "byteBackpressure");
     Objects.requireNonNull(heapBackpressure, "heapBackpressure");
     Objects.requireNonNull(errorStrategy, "errorStrategy");
@@ -108,12 +118,19 @@ public final class PipelineConfig<K, V> {
     requireNonNegative(shutdownTimeout, "shutdownTimeout");
     requireNonNegative(pollTimeout, "pollTimeout");
     requireNonNegative(processingTimeout, "processingTimeout");
+    requirePositive(writeOutageTimeout, "writeOutageTimeout");
 
-    if (handler == null && batchHandler == null) {
-      throw new IllegalArgumentException("Either handler or batchHandler must be set");
+    int steps =
+        (handler != null ? 1 : 0)
+            + (batchHandler != null ? 1 : 0)
+            + (processorBinding != null ? 1 : 0);
+    if (steps == 0) {
+      throw new IllegalArgumentException(
+          "Set one of handler(...), batchHandler(...) or processor(...).sink(...)");
     }
-    if (handler != null && batchHandler != null) {
-      throw new IllegalArgumentException("Cannot set both handler and batchHandler");
+    if (steps > 1) {
+      throw new IllegalArgumentException(
+          "handler(...), batchHandler(...) and processor(...).sink(...) are mutually exclusive");
     }
     if (topics.isEmpty()) {
       throw new IllegalArgumentException("topics must not be empty");
@@ -139,6 +156,20 @@ public final class PipelineConfig<K, V> {
               + ") must be >= max.poll.records ("
               + maxPollRecords
               + "), otherwise a single poll may never fit in a partition window");
+    }
+    if (processorBinding != null) {
+      OptionalInt buffered = processorBinding.sink().maxBufferedRecordsPerPartition();
+      long pauseAt = (long) maxWindowSize * PartitionPauseController.PAUSE_RATIO_PERCENT / 100;
+      if (buffered.isPresent() && buffered.getAsInt() >= pauseAt) {
+        // The partition would pause (window 80% full) before the sink's buffer could fill, and the
+        // buffer only empties when it fills or ages out: the partition would crawl.
+        throw new IllegalArgumentException(
+            "The sink buffers up to "
+                + buffered.getAsInt()
+                + " records per partition, which must be below 80% of maxWindowSize ("
+                + pauseAt
+                + "); raise maxWindowSize or lower the sink's buffer");
+      }
     }
     long maxPollIntervalMs = maxPollIntervalMs(consumerProperties);
     if (drainTimeout.toMillis() >= maxPollIntervalMs) {
@@ -211,10 +242,10 @@ public final class PipelineConfig<K, V> {
   /**
    * Returns the record-count backpressure configuration.
    *
-   * @return the backpressure
+   * @return the record backpressure configuration
    */
-  public BackpressureConfig backpressure() {
-    return backpressure;
+  public RecordBackpressureConfig recordBackpressure() {
+    return recordBackpressure;
   }
 
   /**
@@ -356,6 +387,16 @@ public final class PipelineConfig<K, V> {
   }
 
   /**
+   * Returns how long a sink or DLQ write may keep failing with transient errors before the pipeline
+   * stops.
+   *
+   * @return the write outage timeout
+   */
+  public Duration writeOutageTimeout() {
+    return writeOutageTimeout;
+  }
+
+  /**
    * Returns the name that identifies this pipeline in metrics. Defaults to the consumer's {@code
    * group.id}, or {@value #DEFAULT_NAME}.
    *
@@ -385,7 +426,7 @@ public final class PipelineConfig<K, V> {
         + ", topics="
         + topics
         + ", mode="
-        + (isBatchMode() ? "batch" : "record")
+        + (isBatchMode() ? "batch" : processorBinding != null ? "processor+sink" : "record")
         + ", concurrency="
         + concurrency
         + ", threadMode="
@@ -459,6 +500,15 @@ public final class PipelineConfig<K, V> {
     }
   }
 
+  /**
+   * The processor and sink, if this pipeline was built with {@code processor(...).sink(...)}.
+   *
+   * @return the binding, or null
+   */
+  ProcessorBinding<K, V, ?> processorBinding() {
+    return processorBinding;
+  }
+
   boolean isBatchMode() {
     return batchHandler != null;
   }
@@ -485,13 +535,14 @@ public final class PipelineConfig<K, V> {
     private List<String> topics;
     private RecordHandler<K, V> handler;
     private BatchRecordHandler<K, V> batchHandler;
+    private ProcessorBinding<K, V, ?> processorBinding;
     private int concurrency = -1;
     private ThreadMode threadMode;
-    private BackpressureConfig backpressure = BackpressureConfig.defaults();
+    private RecordBackpressureConfig recordBackpressure = RecordBackpressureConfig.defaults();
     private ByteBackpressureConfig byteBackpressure = ByteBackpressureConfig.disabled();
     private HeapBackpressureConfig heapBackpressure = HeapBackpressureConfig.disabled();
     private List<BackpressureSensor> customSensors = new ArrayList<>();
-    private ErrorStrategy<K, V> errorStrategy = ErrorStrategy.skipOnError();
+    private ErrorStrategy<K, V> errorStrategy = ErrorStrategy.dropOnError();
     private ProcessingLifecycleHook<K, V> lifecycleHook = ProcessingLifecycleHook.noOp();
     private Duration commitInterval = Duration.ofSeconds(5);
     private Duration drainTimeout = Duration.ofSeconds(30);
@@ -502,6 +553,7 @@ public final class PipelineConfig<K, V> {
     private ProcessingOrder ordering = ProcessingOrder.UNORDERED;
     private boolean skipCompletedOnRestart = true;
     private Duration processingTimeout = Duration.ZERO;
+    private Duration writeOutageTimeout = RetryExecutor.DEFAULT_WRITE_OUTAGE_TIMEOUT;
     private int maxWindowSize = 10_000;
     private String name;
     private final List<MetricsExporter> metricsExporters = new ArrayList<>();
@@ -591,7 +643,8 @@ public final class PipelineConfig<K, V> {
     }
 
     /**
-     * Per-record handler. Mutually exclusive with {@link #batchHandler}; exactly one must be set.
+     * Per-record handler, for processing that only has side effects. Set exactly one of {@code
+     * handler}, {@link #processor} (with a sink) or {@link #batchHandler}.
      *
      * @param handler the record handler
      * @return this builder
@@ -602,9 +655,34 @@ public final class PipelineConfig<K, V> {
     }
 
     /**
+     * Processes each record and writes its outputs to a sink; continue with {@link
+     * ProcessorStep#sink}. An alternative to {@link #handler}, for pipelines that write somewhere
+     * (Kafka, a database, object storage, HTTP).
+     *
+     * <p>The processor holds the business logic and may block on I/O. Its outputs go to the sink,
+     * and the record is acked only once they are durable, so nothing is committed before it is
+     * written. Mutually exclusive with {@link #handler} and {@link #batchHandler}; per-record mode
+     * only.
+     *
+     * <pre>{@code
+     * .processor(record -> List.of(enrich(record.value())))
+     * .sink(KafkaRecordSink.<String, EnrichedOrder>builder()...build())
+     * }</pre>
+     *
+     * @param processor the processor (a lambda, method reference or class)
+     * @param <O> output type
+     * @return a step whose {@code sink(...)} completes the pairing and returns this builder
+     * @see RecordProcessor
+     * @see RecordSink
+     */
+    public <O> ProcessorStep<K, V, O> processor(RecordProcessor<K, V, O> processor) {
+      return new ProcessorStep<>(this, Objects.requireNonNull(processor, "processor"));
+    }
+
+    /**
      * Batch handler for high-throughput scenarios (bulk inserts, aggregations). Records from each
-     * partition in a single poll are delivered as one batch. Mutually exclusive with {@link
-     * #handler}; exactly one must be set.
+     * partition in a single poll are delivered as one batch. Set exactly one of {@link #handler},
+     * {@link #processor} (with a sink) or {@code batchHandler}.
      *
      * @param batchHandler the batch handler
      * @return this builder
@@ -635,17 +713,16 @@ public final class PipelineConfig<K, V> {
     }
 
     /**
-     * Record-count backpressure thresholds. Enabled by default with sensible defaults (high=10k,
-     * low=6k, critical=50k). The poll loop pauses when in-flight record count crosses the high
-     * watermark and resumes when it drops below the low watermark.
+     * Backpressure on the number of records in flight. On by default: fetching pauses on every
+     * partition at 10,000 records in flight and resumes at 6,000. Use {@link
+     * RecordBackpressureConfig#disabled()} to turn it off; the other sensors still apply.
      *
-     * @param backpressure the backpressure configuration
+     * @param config the watermarks
      * @return this builder
-     * @see BackpressureConfig#defaults()
-     * @see BackpressureConfig#builder()
+     * @see RecordBackpressureConfig#builder()
      */
-    public Builder<K, V> backpressure(BackpressureConfig backpressure) {
-      this.backpressure = backpressure;
+    public Builder<K, V> recordBackpressure(RecordBackpressureConfig config) {
+      this.recordBackpressure = config;
       return this;
     }
 
@@ -678,8 +755,8 @@ public final class PipelineConfig<K, V> {
     }
 
     /**
-     * Registers a custom backpressure sensor. Multiple sensors can be added; the pipeline evaluates
-     * all of them (built-in and custom) on each poll cycle and applies the worst status.
+     * Adds a custom backpressure sensor. The pipeline evaluates every sensor (built-in and custom)
+     * before each poll and pauses all partitions while any of them says THROTTLE.
      *
      * @param sensor the custom sensor to add
      * @return this builder
@@ -692,8 +769,8 @@ public final class PipelineConfig<K, V> {
 
     /**
      * Error handling chain applied when {@code handler.handle()} or {@code batchHandler} throws.
-     * The chain is: retry → DLQ → skip. Defaults to {@link ErrorStrategy#skipOnError()} (no
-     * retries, skip failed records with logging).
+     * The chain is: retry → DLQ → drop. Defaults to {@link ErrorStrategy#dropOnError()} (no
+     * retries, drop failed records with logging).
      *
      * @param errorStrategy the error strategy
      * @return this builder
@@ -769,7 +846,7 @@ public final class PipelineConfig<K, V> {
     /**
      * Maximum duration of one handler attempt. An attempt still running after this is interrupted
      * and counted as a failed attempt, so it goes through the error strategy (retry, then DLQ or
-     * skip) and its partition can commit past it. Without a timeout, a handler call that never
+     * drop) and its partition can commit past it. Without a timeout, a handler call that never
      * returns holds back its partition's commits until a rebalance.
      *
      * <p>The timeout works by interrupting the worker thread: a handler that ignores interrupts
@@ -783,6 +860,25 @@ public final class PipelineConfig<K, V> {
      */
     public Builder<K, V> processingTimeout(Duration timeout) {
       this.processingTimeout = timeout;
+      return this;
+    }
+
+    /**
+     * How long a destination may stay unavailable before the pipeline stops. A sink write or DLQ
+     * send that fails with a transient error (a broker timeout, a leader election; see {@code
+     * WriteFailure.TRANSIENT}) is retried without dropping the record, which holds its slot so the
+     * outage turns into backpressure. If the same write keeps failing transiently for longer than
+     * this, the destination is treated as gone: the pipeline stops, still without dropping or
+     * committing the record, so the problem is noticed instead of stalling forever. A misspelled
+     * output topic, for example, shows up this way.
+     *
+     * <p>Default: 5 minutes.
+     *
+     * @param timeout the outage limit; must be positive
+     * @return this builder
+     */
+    public Builder<K, V> writeOutageTimeout(Duration timeout) {
+      this.writeOutageTimeout = timeout;
       return this;
     }
 
@@ -941,6 +1037,42 @@ public final class PipelineConfig<K, V> {
                 + " worker count");
       }
       return new PipelineConfig<>(this);
+    }
+  }
+
+  /**
+   * The step after {@link Builder#processor}: pairs the processor with the sink its outputs go to.
+   * The output types must match, and there is no way back to the builder without a sink.
+   *
+   * @param <K> record key type
+   * @param <V> record value type
+   * @param <O> output type
+   */
+  public static final class ProcessorStep<K, V, O> {
+    private final Builder<K, V> builder;
+    private final RecordProcessor<K, V, O> processor;
+
+    private ProcessorStep(Builder<K, V> builder, RecordProcessor<K, V, O> processor) {
+      this.builder = builder;
+      this.processor = processor;
+    }
+
+    /**
+     * Sets where the processor's outputs are written.
+     *
+     * @param sink the sink (a lambda, method reference or class)
+     * @return the pipeline builder
+     */
+    public Builder<K, V> sink(RecordSink<? super O> sink) {
+      builder.processorBinding = bind(processor, sink);
+      return builder;
+    }
+
+    // Captures the sink's output type, so a sink of a supertype (RecordSink<Order> for
+    // SpecialOrder outputs) is accepted.
+    private static <K, V, S> ProcessorBinding<K, V, S> bind(
+        RecordProcessor<K, V, ? extends S> processor, RecordSink<S> sink) {
+      return ProcessorBinding.of(processor, sink);
     }
   }
 }

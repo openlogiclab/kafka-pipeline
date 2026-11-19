@@ -17,16 +17,16 @@ package io.github.openlogiclab.kafkapipeline.internal;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureStatus;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
-import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
+import io.github.openlogiclab.kafkapipeline.backpressure.RecordBackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.BackpressureController;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.BuiltInSensors;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.metrics.AttemptOutcome;
 import io.github.openlogiclab.kafkapipeline.metrics.PartitionMetrics;
 import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
-import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
+import io.github.openlogiclab.kafkapipeline.offset.SlidingWindowOffsetTracker;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -50,10 +50,11 @@ class PipelineMetricsCollectorTest {
   @BeforeEach
   void setUp() {
     inFlightCounter = new InFlightCounter();
-    BackpressureConfig bpConfig = BackpressureConfig.builder().build();
+    RecordBackpressureConfig bpConfig = RecordBackpressureConfig.builder().build();
     backpressureController =
-        new BackpressureController(bpConfig, new RecordCountSensor(bpConfig, inFlightCounter));
-    offsetTracker = new UnorderedOffsetTracker();
+        new BackpressureController(
+            java.util.List.of(BuiltInSensors.records(bpConfig, inFlightCounter)));
+    offsetTracker = new SlidingWindowOffsetTracker();
     collector =
         new PipelineMetricsCollector(
             "orders", inFlightCounter, backpressureController, offsetTracker);
@@ -81,16 +82,16 @@ class PipelineMetricsCollectorTest {
     }
 
     @Test
-    void recordFailedIncrements() {
-      collector.recordFailed(1);
-      collector.recordFailed(1);
-      assertEquals(2, collector.snapshot().recordsFailed());
+    void recordDroppedIncrements() {
+      collector.recordDropped(1);
+      collector.recordDropped(1);
+      assertEquals(2, collector.snapshot().recordsDropped());
     }
 
     @Test
-    void recordFailedWithCount() {
-      collector.recordFailed(5);
-      assertEquals(5, collector.snapshot().recordsFailed());
+    void recordDroppedWithCount() {
+      collector.recordDropped(5);
+      assertEquals(5, collector.snapshot().recordsDropped());
     }
 
     @Test
@@ -157,7 +158,7 @@ class PipelineMetricsCollectorTest {
       collector.partitionAssigned(TP0);
 
       PartitionMetrics p = collector.snapshot().partitions().get(TP0);
-      assertEquals(3, p.lag());
+      assertEquals(3, p.uncommittedOffsets());
       assertEquals(3, p.windowSize());
       assertEquals(offsetTracker.maxWindowSize(), p.windowCapacity());
       assertEquals(3.0 / offsetTracker.maxWindowSize(), p.windowFill(), 1e-9);
@@ -172,8 +173,8 @@ class PipelineMetricsCollectorTest {
 
       PartitionMetrics idle = collector.snapshot().partitions().get(TP1);
       assertNotNull(idle, "idle partitions are reported, not omitted");
-      assertEquals(0, idle.lag());
-      assertEquals(0, idle.failures());
+      assertEquals(0, idle.uncommittedOffsets());
+      assertEquals(0, idle.dropped());
       assertEquals(0, idle.commitStallMillis());
       assertEquals(0.0, idle.windowFill());
     }
@@ -187,15 +188,15 @@ class PipelineMetricsCollectorTest {
 
       // No failures yet
       PipelineMetrics m1 = collector.snapshot();
-      assertEquals(0, m1.partitions().get(TP0).failures());
+      assertEquals(0, m1.partitions().get(TP0).dropped());
 
       // Mark failures on TP0
-      offsetTracker.markFailed(TP0);
-      offsetTracker.markFailed(TP0);
+      offsetTracker.markDropped(TP0);
+      offsetTracker.markDropped(TP0);
 
       PipelineMetrics m2 = collector.snapshot();
-      assertEquals(2, m2.partitions().get(TP0).failures());
-      assertEquals(0, m2.partitions().get(TP1).failures());
+      assertEquals(2, m2.partitions().get(TP0).dropped());
+      assertEquals(0, m2.partitions().get(TP1).dropped());
     }
   }
 
@@ -229,12 +230,6 @@ class PipelineMetricsCollectorTest {
       PipelineMetrics m = collector.snapshot();
       assertEquals(5, m.dlqSuccesses());
       assertEquals(3, m.dlqFailures());
-    }
-
-    @Test
-    void finalFailureIncrements() {
-      collector.recordFinalFailure();
-      assertEquals(1, collector.snapshot().finalFailures());
     }
 
     @Test
@@ -309,7 +304,7 @@ class PipelineMetricsCollectorTest {
     void freshCollectorReturnsZeroSnapshot() {
       PipelineMetrics m = collector.snapshot();
       assertEquals(0, m.recordsProcessed());
-      assertEquals(0, m.recordsFailed());
+      assertEquals(0, m.recordsDropped());
       assertEquals(0, m.recordsSkipped());
       assertEquals(0, m.pollCount());
       assertEquals(0, m.emptyPollCount());
@@ -324,7 +319,6 @@ class PipelineMetricsCollectorTest {
       assertEquals(0, m.retryAttempts());
       assertEquals(0, m.dlqSuccesses());
       assertEquals(0, m.dlqFailures());
-      assertEquals(0, m.finalFailures());
       assertEquals(0, m.commitSuccesses());
       assertEquals(0, m.commitFailures());
       assertEquals(0, m.rebalanceCount());

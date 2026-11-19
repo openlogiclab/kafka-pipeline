@@ -17,6 +17,9 @@ package io.github.openlogiclab.kafkapipeline.worker;
 
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
 import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
+import io.github.openlogiclab.kafkapipeline.internal.LogRateLimit;
+import io.github.openlogiclab.kafkapipeline.offset.PartitionGeneration;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -39,8 +42,10 @@ import org.apache.kafka.common.TopicPartition;
  * and the processing model (per-record vs. batch). The pipeline poll loop simply calls {@link
  * #dispatch(ConsumerRecords)} without knowing which mode is active.
  *
- * <p>Shared lifecycle (executor creation, stop, running flag) lives here; subclasses only implement
- * {@link #start()} and {@link #dispatch(ConsumerRecords)}.
+ * <p>Shared lifecycle (executor creation, stop, running flag, error reporting) lives here;
+ * subclasses implement {@link #start()}, {@link #dispatch(ConsumerRecords)} and {@link
+ * #canResume(TopicPartition)}, and may override {@link #holdsPartition(TopicPartition)} and {@link
+ * #stop(long)}.
  *
  * @param <K> record key type
  * @param <V> record value type
@@ -114,17 +119,42 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
   }
 
   /**
-   * Logs an unexpected throwable from a worker and escalates it if the JVM may be unusable.
+   * Logs an unexpected throwable from a worker, and stops the pipeline if it is fatal (a JVM error
+   * or a fatal client error, see {@link FatalErrors#isFatal}).
    *
    * @param t the throwable
    */
   protected void reportWorkerError(Throwable t) {
-    if (FatalErrors.isJvmFatal(t)) {
-      logger.log(System.Logger.Level.ERROR, "Fatal error in worker, stopping the pipeline", t);
-      fatalErrorHandler.accept(t);
+    if (FatalErrors.isFatal(t)) {
+      escalateFatal(t);
     } else {
       logger.log(System.Logger.Level.ERROR, "Unexpected error in worker", t);
     }
+  }
+
+  /**
+   * Stops the pipeline because of an error it cannot continue after: a JVM error, or a fatal client
+   * error such as a missing ACL on the output topic. The records involved are left unacked.
+   *
+   * @param t the error
+   */
+  protected void escalateFatal(Throwable t) {
+    logger.log(System.Logger.Level.ERROR, "Fatal error, stopping the pipeline", t);
+    fatalErrorHandler.accept(t);
+  }
+
+  /**
+   * Whether this consumer still owns the partition in the assignment a record was fetched under.
+   * Records without a generation (tests that drive a pool directly) always count as owned, matching
+   * the tracker's own generation check.
+   *
+   * @param progress the offset tracker
+   * @param tp the partition
+   * @param generation the record's generation
+   * @return true while the partition is still in that assignment
+   */
+  protected static boolean owns(PartitionGeneration progress, TopicPartition tp, long generation) {
+    return generation == PartitionGeneration.NO_GENERATION || progress.generation(tp) == generation;
   }
 
   /**
@@ -174,12 +204,18 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
    * Returns whether the bounded task queue (PLATFORM threads with a task queue capacity) has room
    * for one more task. Always true for unbounded executors. The poll thread is the only submitter,
    * so a {@code true} result stays true until it submits.
+   *
+   * @return true if one more task fits
    */
   protected boolean hasTaskQueueRoom() {
     return !(executor instanceof ThreadPoolExecutor tpe) || tpe.getQueue().remainingCapacity() > 0;
   }
 
-  /** Returns whether the bounded task queue has drained to at most half its capacity. */
+  /**
+   * Returns whether the bounded task queue has drained to at most half its capacity.
+   *
+   * @return true if at most half full (always true for unbounded executors)
+   */
   protected boolean taskQueueDrained() {
     if (!(executor instanceof ThreadPoolExecutor tpe)) return true;
     var queue = tpe.getQueue();
@@ -187,19 +223,19 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
     return queue.size() <= capacity / 2;
   }
 
-  // Rate limit for the "task queue full" warning: at most one log line per interval.
-  private static final long QUEUE_FULL_LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
-  private final AtomicLong lastQueueFullLogNanos =
-      new AtomicLong(System.nanoTime() - QUEUE_FULL_LOG_INTERVAL_NANOS);
+  // Repeated warnings are logged at most once per interval.
+  private final LogRateLimit queueFullLog = new LogRateLimit();
+  private final LogRateLimit dispatchFailureLog = new LogRateLimit();
   private final AtomicLong queueFullCount = new AtomicLong();
 
-  /** Logs a rate-limited warning that a partition was paused because the task queue was full. */
+  /**
+   * Logs a rate-limited warning that a partition was paused because the task queue was full.
+   *
+   * @param tp the partition
+   */
   protected void reportTaskQueueFull(TopicPartition tp) {
     long count = queueFullCount.incrementAndGet();
-    long now = System.nanoTime();
-    long last = lastQueueFullLogNanos.get();
-    if (now - last >= QUEUE_FULL_LOG_INTERVAL_NANOS
-        && lastQueueFullLogNanos.compareAndSet(last, now)) {
+    if (queueFullLog.tryAcquire()) {
       queueFullCount.addAndGet(-count);
       logger.log(
           System.Logger.Level.WARNING,
@@ -210,9 +246,6 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
     }
   }
 
-  private final AtomicLong lastDispatchFailureLogNanos =
-      new AtomicLong(System.nanoTime() - QUEUE_FULL_LOG_INTERVAL_NANOS);
-
   /**
    * Logs (rate-limited) that a partition's records were sent back because registering failed.
    *
@@ -221,10 +254,7 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
    * @param e the failure
    */
   protected void reportDispatchFailure(TopicPartition tp, long offset, RuntimeException e) {
-    long now = System.nanoTime();
-    long last = lastDispatchFailureLogNanos.get();
-    if (now - last >= QUEUE_FULL_LOG_INTERVAL_NANOS
-        && lastDispatchFailureLogNanos.compareAndSet(last, now)) {
+    if (dispatchFailureLog.tryAcquire()) {
       logger.log(
           System.Logger.Level.WARNING,
           "Could not register {0} from offset {1}, fetching it again later: {2}",
@@ -235,12 +265,34 @@ public abstract sealed class WorkerPool<K, V> permits SingleRecordWorkerPool, Ba
   }
 
   /**
+   * Called by {@link #stop} right after the pool is marked as stopping and before it waits for the
+   * workers, so subclasses can end retry backoffs at once instead of letting them hold shutdown.
+   */
+  protected void onStopping() {}
+
+  /**
+   * The partitions are being revoked; their in-flight records are about to be drained. Called on
+   * the poll thread.
+   *
+   * @param partitions the partitions
+   */
+  public void onPartitionsDraining(Collection<TopicPartition> partitions) {}
+
+  /**
+   * The partitions are gone (drained and committed, or lost). Called on the poll thread.
+   *
+   * @param partitions the partitions
+   */
+  public void onPartitionsDrained(Collection<TopicPartition> partitions) {}
+
+  /**
    * Stops the worker pool and waits for termination.
    *
    * @param timeoutMs max time to wait in milliseconds
    */
   public void stop(long timeoutMs) {
     running.set(false);
+    onStopping();
     executor.shutdown();
     try {
       if (!executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)) {

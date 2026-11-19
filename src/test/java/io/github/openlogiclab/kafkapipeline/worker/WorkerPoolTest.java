@@ -18,14 +18,14 @@ package io.github.openlogiclab.kafkapipeline.worker;
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
-import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.offset.SlidingWindowOffsetTracker;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
@@ -45,13 +45,13 @@ class WorkerPoolTest {
 
   private static final TopicPartition TP0 = new TopicPartition("test", 0);
 
-  private UnorderedOffsetTracker tracker;
+  private SlidingWindowOffsetTracker tracker;
   private RecordDispatcher<String, String> dispatcher;
   private InFlightCounter counter;
 
   @BeforeEach
   void setUp() {
-    tracker = new UnorderedOffsetTracker();
+    tracker = new SlidingWindowOffsetTracker();
     tracker.initPartition(TP0, 0);
     dispatcher = new RecordDispatcher<>(100);
     dispatcher.addPartition(TP0);
@@ -82,7 +82,7 @@ class WorkerPoolTest {
   }
 
   private WorkerPool<String, String> pool(RecordHandler<String, String> handler) {
-    return pool(1, ErrorStrategy.skipOnError(), handler, ProcessingLifecycleHook.noOp());
+    return pool(1, ErrorStrategy.dropOnError(), handler, ProcessingLifecycleHook.noOp());
   }
 
   @Nested
@@ -92,14 +92,14 @@ class WorkerPoolTest {
     void rejectsZeroConcurrency() {
       assertThrows(
           IllegalArgumentException.class,
-          () -> pool(0, ErrorStrategy.skipOnError(), r -> {}, ProcessingLifecycleHook.noOp()));
+          () -> pool(0, ErrorStrategy.dropOnError(), r -> {}, ProcessingLifecycleHook.noOp()));
     }
 
     @Test
     void rejectsNegativeConcurrency() {
       assertThrows(
           IllegalArgumentException.class,
-          () -> pool(-1, ErrorStrategy.skipOnError(), r -> {}, ProcessingLifecycleHook.noOp()));
+          () -> pool(-1, ErrorStrategy.dropOnError(), r -> {}, ProcessingLifecycleHook.noOp()));
     }
   }
 
@@ -158,7 +158,7 @@ class WorkerPoolTest {
   class MarkInProgressFailure {
 
     @Test
-    void markInProgressThrows_recordSkipped() throws Exception {
+    void markInProgressThrows_recordIsNotProcessed() throws Exception {
       CopyOnWriteArrayList<String> processed = new CopyOnWriteArrayList<>();
       WorkerPool<String, String> wp = pool(record -> processed.add(record.value()));
 
@@ -190,7 +190,7 @@ class WorkerPoolTest {
       WorkerPool<String, String> wp =
           pool(
               1,
-              ErrorStrategy.skipOnError(),
+              ErrorStrategy.dropOnError(),
               record -> processed.add(record.value()),
               throwingHook);
 
@@ -208,7 +208,7 @@ class WorkerPoolTest {
   class DlqFailsThenFallback {
 
     @Test
-    void dlqFails_fallbackSkip() throws Exception {
+    void dlqFails_fallbackDrop() throws Exception {
       AtomicInteger dlqAttempts = new AtomicInteger();
 
       ErrorStrategy<String, String> strategy =
@@ -241,11 +241,11 @@ class WorkerPoolTest {
   }
 
   @Nested
-  class NoDlqSkip {
+  class NoDlqDrop {
 
     @Test
-    void noDlq_skip() throws Exception {
-      ErrorStrategy<String, String> strategy = ErrorStrategy.skipOnError();
+    void noDlq_drop() throws Exception {
+      ErrorStrategy<String, String> strategy = ErrorStrategy.dropOnError();
 
       WorkerPool<String, String> wp =
           pool(
@@ -263,8 +263,8 @@ class WorkerPoolTest {
     }
 
     @Test
-    void noDlq_skip_continuesProcessing() throws Exception {
-      ErrorStrategy<String, String> strategy = ErrorStrategy.skipOnError();
+    void noDlq_drop_continuesProcessing() throws Exception {
+      ErrorStrategy<String, String> strategy = ErrorStrategy.dropOnError();
       CopyOnWriteArrayList<String> processed = new CopyOnWriteArrayList<>();
 
       WorkerPool<String, String> wp =
@@ -272,7 +272,7 @@ class WorkerPoolTest {
               1,
               strategy,
               record -> {
-                if (record.offset() == 0) throw new RuntimeException("skip me");
+                if (record.offset() == 0) throw new RuntimeException("drop me");
                 processed.add(record.value());
               },
               ProcessingLifecycleHook.noOp());
@@ -365,7 +365,7 @@ class WorkerPoolTest {
     @Test
     void dispatch_stopsAtFullWindowPerPartition_andReportsFirstUndispatchedOffset() {
       TopicPartition tp1 = new TopicPartition("test", 1);
-      tracker = new UnorderedOffsetTracker(3);
+      tracker = new SlidingWindowOffsetTracker(3);
       tracker.initPartition(TP0, 0);
       tracker.initPartition(tp1, 10);
       dispatcher.addPartition(tp1);

@@ -16,23 +16,24 @@
 package io.github.openlogiclab.kafkapipeline.error;
 
 /**
- * Error handling strategy after all retries are exhausted.
+ * What happens to a record whose retries are used up.
  *
- * <p>This is a best-effort strategy: the system always continues processing. Failed records are
- * always skipped after invoking the {@link FinalFailureHandler}.
+ * <p>The pipeline never stops for a bad record: a record is either dead-lettered or dropped, and
+ * acked either way, so its partition keeps moving. "Dropped" means given up on: the {@link
+ * FinalFailureHandler} is called with the record and the error, the drop is counted in the metrics,
+ * and the record is not processed again.
  */
 public enum Fallback {
 
   /**
-   * Direct skip — do not attempt DLQ, skip the record immediately. The {@link FinalFailureHandler}
-   * is called before skipping for logging/alerting.
+   * Drop the record without trying the DLQ. The {@link FinalFailureHandler} is called first, for
+   * logging or alerting.
    */
-  SKIP,
+  DROP,
 
   /**
-   * Try DLQ first, then skip if DLQ fails. If a {@link DLQHandler} is configured, the record is
-   * sent there. If DLQ succeeds, the record is acked normally. If DLQ fails (or is not configured),
-   * the {@link FinalFailureHandler} is called and the record is skipped.
+   * Send the record to the {@link DLQHandler}; if that fails, or no DLQ is configured, drop it
+   * (calling the {@link FinalFailureHandler} first). The default.
    */
-  DLQ_THEN_SKIP
+  DLQ_THEN_DROP
 }

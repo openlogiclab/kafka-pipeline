@@ -53,12 +53,17 @@ public interface ProcessingLifecycleHook<K, V> {
   }
 
   /**
-   * Called once after the {@link RecordHandler} completes successfully, after any retries. The
-   * context carries the attempt that succeeded.
+   * Called once after a record is processed successfully, after any retries: when the {@link
+   * RecordHandler} returns, or, with a processor and sink, once the sink has written the outputs
+   * durably. The context carries the processing attempt that succeeded.
    *
    * <p>Use this to record the successful processing in a dedup store, emit metrics, or close
    * tracing spans. If it throws, the exception is logged and the record is still acked; the handler
    * is not run again.
+   *
+   * <p>With a sink, this runs on a pipeline thread after the write, not on the worker that ran the
+   * processor, so {@code ThreadLocal} state such as a logging MDC set by the processor is not
+   * visible here. Carry what you need in the record or in your own map keyed by offset.
    *
    * @param record the record that was processed
    * @param context metadata (partition, offset, attempt number)
@@ -67,7 +72,7 @@ public interface ProcessingLifecycleHook<K, V> {
 
   /**
    * Called when the {@link RecordHandler} throws an exception. This is purely observational — error
-   * handling strategy (retry, DLQ, skip, fail) is configured separately on the pipeline.
+   * handling strategy (retry, then DLQ or drop) is configured separately on the pipeline.
    *
    * @param record the record that failed
    * @param context metadata (partition, offset, attempt number)

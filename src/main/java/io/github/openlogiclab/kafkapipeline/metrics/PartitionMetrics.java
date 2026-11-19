@@ -30,18 +30,24 @@ import io.github.openlogiclab.kafkapipeline.internal.PartitionMetricsSnapshot;
 public sealed interface PartitionMetrics permits PartitionMetricsSnapshot {
 
   /**
-   * Distance between the highest polled offset and the committable offset. (Gauge)
+   * Offsets polled but not committable yet: from the committable offset up to the highest offset
+   * polled for this partition. (Gauge)
    *
-   * @return records polled but not yet committable
+   * <p>This is not Kafka consumer lag (log end minus committed offset), which the pipeline cannot
+   * see without asking the broker. It shows work this consumer holds: a growing value means records
+   * are being polled faster than they finish, or one record is holding back the commit.
+   *
+   * @return offsets polled but not committable
    */
-  long lag();
+  long uncommittedOffsets();
 
   /**
-   * Unrecoverable failures on this partition since it was assigned. (Counter)
+   * Records of this partition dropped since it was assigned: given up on after their retries
+   * without reaching a DLQ (none configured, {@code Fallback.DROP}, or the send failed). (Counter)
    *
-   * @return failure count
+   * @return records dropped
    */
-  int failures();
+  long dropped();
 
   /**
    * Time, in milliseconds, since the committable offset last moved while records are pending or in
@@ -74,7 +80,8 @@ public sealed interface PartitionMetrics permits PartitionMetricsSnapshot {
   /**
    * Fraction of the window in use, from 0.0 to 1.0. (Gauge)
    *
-   * <p>Approaching 1.0 means the partition is about to pause. This is an earlier warning than lag.
+   * <p>Approaching 1.0 means the partition is about to pause. This is an earlier warning than
+   * {@link #uncommittedOffsets()}.
    *
    * @return window fill ratio
    */

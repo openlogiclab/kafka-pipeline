@@ -33,4 +33,4 @@ package io.github.openlogiclab.kafkapipeline.offset;
  */
 public sealed interface OffsetTracker
     extends ProcessingProgress, CommitSource, PartitionLifecycle, OffsetStats
-    permits UnorderedOffsetTracker {}
+    permits SlidingWindowOffsetTracker {}

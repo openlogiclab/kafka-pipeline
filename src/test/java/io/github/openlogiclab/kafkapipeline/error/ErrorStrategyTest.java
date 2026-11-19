@@ -29,11 +29,11 @@ class ErrorStrategyTest {
   class Factories {
 
     @Test
-    void skipOnError_noRetriesWithDefaultHandler() {
-      ErrorStrategy<String, String> s = ErrorStrategy.skipOnError();
+    void dropOnError_noRetriesWithDefaultHandler() {
+      ErrorStrategy<String, String> s = ErrorStrategy.dropOnError();
       assertEquals(0, s.maxRetries());
       assertFalse(s.hasDlq());
-      assertEquals(Fallback.SKIP, s.fallback());
+      assertEquals(Fallback.DROP, s.fallback());
       assertNotNull(s.finalFailureHandler());
     }
 
@@ -44,7 +44,7 @@ class ErrorStrategyTest {
       assertEquals(3, s.maxRetries());
       assertTrue(s.hasDlq());
       assertSame(dlq, s.dlqHandler());
-      assertEquals(Fallback.DLQ_THEN_SKIP, s.fallback());
+      assertEquals(Fallback.DLQ_THEN_DROP, s.fallback());
       assertNotNull(s.finalFailureHandler());
     }
   }
@@ -60,7 +60,7 @@ class ErrorStrategyTest {
           IllegalArgumentException.class,
           () ->
               new ErrorStrategy<>(
-                  -1, Duration.ZERO, false, Duration.ZERO, null, Fallback.SKIP, (r, e) -> {}));
+                  -1, Duration.ZERO, false, Duration.ZERO, null, Fallback.DROP, (r, e) -> {}));
     }
 
     @Test
@@ -68,7 +68,7 @@ class ErrorStrategyTest {
       assertDoesNotThrow(
           () ->
               new ErrorStrategy<>(
-                  0, Duration.ZERO, false, Duration.ZERO, null, Fallback.SKIP, (r, e) -> {}));
+                  0, Duration.ZERO, false, Duration.ZERO, null, Fallback.DROP, (r, e) -> {}));
     }
 
     @Test
@@ -82,7 +82,7 @@ class ErrorStrategyTest {
                   false,
                   Duration.ZERO,
                   null,
-                  Fallback.SKIP,
+                  Fallback.DROP,
                   (r, e) -> {}));
     }
 
@@ -97,7 +97,7 @@ class ErrorStrategyTest {
                   true,
                   Duration.ofMillis(-1),
                   null,
-                  Fallback.SKIP,
+                  Fallback.DROP,
                   (r, e) -> {}));
     }
   }
@@ -109,7 +109,7 @@ class ErrorStrategyTest {
 
     @Test
     void noDlq_returnsFalse() {
-      ErrorStrategy<String, String> s = ErrorStrategy.skipOnError();
+      ErrorStrategy<String, String> s = ErrorStrategy.dropOnError();
       assertFalse(s.hasDlq());
     }
 
@@ -239,7 +239,7 @@ class ErrorStrategyTest {
       assertFalse(s.exponentialBackoff());
       assertEquals(Duration.ofMinutes(1), s.maxBackoff());
       assertNull(s.dlqHandler());
-      assertEquals(Fallback.DLQ_THEN_SKIP, s.fallback());
+      assertEquals(Fallback.DLQ_THEN_DROP, s.fallback());
       assertNotNull(s.finalFailureHandler());
     }
 
@@ -254,7 +254,7 @@ class ErrorStrategyTest {
               .exponentialBackoff(true)
               .maxBackoff(Duration.ofSeconds(30))
               .dlqHandler(dlq)
-              .fallback(Fallback.DLQ_THEN_SKIP)
+              .fallback(Fallback.DLQ_THEN_DROP)
               .onFinalFailure(ffh)
               .build();
 
@@ -263,7 +263,7 @@ class ErrorStrategyTest {
       assertTrue(s.exponentialBackoff());
       assertEquals(Duration.ofSeconds(30), s.maxBackoff());
       assertSame(dlq, s.dlqHandler());
-      assertEquals(Fallback.DLQ_THEN_SKIP, s.fallback());
+      assertEquals(Fallback.DLQ_THEN_DROP, s.fallback());
       assertSame(ffh, s.finalFailureHandler());
     }
 

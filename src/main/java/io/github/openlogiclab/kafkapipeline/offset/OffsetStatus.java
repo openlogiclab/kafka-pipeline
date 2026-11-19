@@ -15,9 +15,16 @@
  */
 package io.github.openlogiclab.kafkapipeline.offset;
 
+/**
+ * State of one offset in a {@link PartitionWindow}. An offset moves {@code REGISTERED → IN_PROGRESS
+ * → DONE}; a record that was dropped after its retries is also {@code DONE}, because it is finished
+ * with and may be committed.
+ */
 enum OffsetStatus {
+  /** Polled and queued, not started yet. */
   REGISTERED,
+  /** A worker is processing it (or its sink write is in flight). */
   IN_PROGRESS,
-  DONE,
-  FAILED
+  /** Finished: processed, dead-lettered or dropped. Committable once nothing before it is open. */
+  DONE
 }

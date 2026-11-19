@@ -22,12 +22,16 @@ import io.github.openlogiclab.kafkapipeline.metrics.PartitionMetrics;
  *
  * <p><strong>This is an internal API, not intended for direct use by library consumers.</strong>
  *
- * @param lag see {@link PartitionMetrics#lag()}
- * @param failures see {@link PartitionMetrics#failures()}
+ * @param uncommittedOffsets see {@link PartitionMetrics#uncommittedOffsets()}
+ * @param dropped see {@link PartitionMetrics#dropped()}
  * @param commitStallMillis see {@link PartitionMetrics#commitStallMillis()}
  * @param windowSize see {@link PartitionMetrics#windowSize()}
  * @param windowCapacity see {@link PartitionMetrics#windowCapacity()}
  */
 public record PartitionMetricsSnapshot(
-    long lag, int failures, long commitStallMillis, int windowSize, int windowCapacity)
+    long uncommittedOffsets,
+    long dropped,
+    long commitStallMillis,
+    int windowSize,
+    int windowCapacity)
     implements PartitionMetrics {}

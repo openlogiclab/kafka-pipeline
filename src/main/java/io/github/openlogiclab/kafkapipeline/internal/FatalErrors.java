@@ -20,6 +20,7 @@ import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.errors.AuthorizationException;
 import org.apache.kafka.common.errors.FencedInstanceIdException;
 import org.apache.kafka.common.errors.InvalidGroupIdException;
+import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 
 /**
@@ -32,8 +33,8 @@ public final class FatalErrors {
 
   /**
    * Returns whether the throwable, or any of its causes, means the consumer cannot make progress
-   * without operator action: bad credentials or ACLs, an invalid or fenced group member, a broker
-   * that does not support the client, a partition with no offset and {@code
+   * without operator action: bad credentials or ACLs, an invalid or fenced group member, a fenced
+   * producer, a broker that does not support the client, a partition with no offset and {@code
    * auto.offset.reset=none}, or a JVM error (see {@link #isJvmFatal}).
    *
    * @param t the throwable
@@ -46,6 +47,7 @@ public final class FatalErrors {
           || c instanceof AuthorizationException
           || c instanceof InvalidGroupIdException
           || c instanceof FencedInstanceIdException
+          || c instanceof ProducerFencedException
           || c instanceof UnsupportedVersionException
           || c instanceof NoOffsetForPartitionException) {
         return true;
@@ -62,7 +64,7 @@ public final class FatalErrors {
    * is treated as an ordinary handler failure rather than stopping the pipeline.
    *
    * @param t the throwable
-   * @return true if the pipeline must stop instead of skipping the record
+   * @return true if the pipeline must stop instead of dropping the record
    */
   public static boolean isJvmFatal(Throwable t) {
     return t instanceof VirtualMachineError && !(t instanceof StackOverflowError);

@@ -88,21 +88,21 @@ class PartitionWindowTest {
 
     @Test
     void lag_beforeAnyRegistration() {
-      assertEquals(0, window.lag());
+      assertEquals(0, window.uncommittedOffsets());
     }
 
     @Test
     void lag_afterRegistration() {
       window.register(100);
       window.register(101);
-      assertEquals(2, window.lag());
+      assertEquals(2, window.uncommittedOffsets());
     }
 
     @Test
     void lag_afterArrayBatchRegistration() {
       long[] offsets = {100, 200, 300};
       window.registerBatch(offsets);
-      assertEquals(201, window.lag());
+      assertEquals(201, window.uncommittedOffsets());
     }
 
     @Test
@@ -528,29 +528,29 @@ class PartitionWindowTest {
   class FailedStateTracking {
 
     @Test
-    void isFailed_initiallyFalse() {
-      assertFalse(window.isFailed());
+    void dropped_initiallyFalse() {
+      assertEquals(0, window.droppedCount());
     }
 
     @Test
-    void markFailed_setsFailedFlag() {
-      assertFalse(window.isFailed());
-      window.markFailed();
-      assertTrue(window.isFailed());
+    void markDropped_countsTheDrop() {
+      assertEquals(0, window.droppedCount());
+      window.markDropped();
+      assertTrue(window.droppedCount() > 0);
     }
 
     @Test
-    void failureCount_initiallyZero() {
-      assertEquals(0, window.failureCount());
+    void droppedCount_initiallyZero() {
+      assertEquals(0, window.droppedCount());
     }
 
     @Test
-    void markFailed_incrementsFailureCount() {
-      assertEquals(0, window.failureCount());
-      window.markFailed();
-      assertEquals(1, window.failureCount());
-      window.markFailed();
-      assertEquals(2, window.failureCount());
+    void markDropped_incrementsDroppedCount() {
+      assertEquals(0, window.droppedCount());
+      window.markDropped();
+      assertEquals(1, window.droppedCount());
+      window.markDropped();
+      assertEquals(2, window.droppedCount());
     }
 
     @Test
@@ -558,8 +558,8 @@ class PartitionWindowTest {
       window.register(100);
       window.markInProgress(100);
 
-      window.markFailed();
-      assertTrue(window.isFailed());
+      window.markDropped();
+      assertTrue(window.droppedCount() > 0);
 
       window.ack(100);
       assertEquals(OptionalLong.of(101), window.getCommittableOffset());
