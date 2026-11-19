@@ -46,14 +46,14 @@ class PartitionWindowCommitPointCacheTest {
   }
 
   @Test
-  void stopTrackingCompleted_invalidatesCachedPoint() {
+  void disableSkipCompletedOnRestart_invalidatesCachedPoint() {
     PartitionWindow w = trackingWindow();
     for (long o = 0; o < 3; o++) w.register(o);
     w.markInProgress(1);
     w.ack(1);
     assertFalse(w.getCommitPoint().orElseThrow().metadata().isEmpty());
 
-    w.stopTrackingCompleted();
+    w.disableSkipCompletedOnRestart();
     assertTrue(
         w.getCommitPoint().map(CommitPoint::metadata).orElse("").isEmpty(),
         "a cached point with metadata must not be reused after tracking stopped");

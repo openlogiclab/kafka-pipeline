@@ -17,8 +17,8 @@ package io.github.openlogiclab.kafkapipeline;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.backpressure.HeapBackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.backpressure.RecordBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
 import java.time.Duration;
 import java.util.HashMap;
@@ -232,12 +232,8 @@ class KafkaPipelineTest {
       PipelineConfig<String, String> config =
           baseBuilder()
               .concurrency(ThreadMode.PLATFORM, 1)
-              .backpressure(
-                  BackpressureConfig.builder()
-                      .highWatermark(5)
-                      .lowWatermark(2)
-                      .criticalThreshold(15)
-                      .build())
+              .recordBackpressure(
+                  RecordBackpressureConfig.builder().highWatermark(5).lowWatermark(2).build())
               .handler(
                   record -> {
                     if (record.offset() == 0L) {

@@ -17,7 +17,7 @@ This library packages all of that into a clean pipeline that you configure once 
 
 ## Design Guarantees
 
-> **At-least-once delivery.** This library guarantees that every record is delivered to your handler at least once. It will **never** silently drop data. The tradeoff: duplicate delivery is possible after a crash (see [The Duplicate Processing Problem](#the-duplicate-processing-problem)). If you need exactly-once, implement idempotent processing in your handler.
+> **At-least-once delivery.** Every record is delivered to your handler or processor at least once, and its offset is committed only after it is finished (processed, written, dead-lettered or dropped). The pipeline itself never loses a record on throttling, shutdown or a rebalance. A record is dropped only after your error strategy gives up on it: the default, `ErrorStrategy.dropOnError()`, retries nothing and drops a failed record with an ERROR log, so configure retries and a DLQ (see [Error Handling](#error-handling)) if failed records must be kept. The tradeoff: duplicate delivery is possible after a crash (see [The Duplicate Processing Problem](#the-duplicate-processing-problem)). If you need exactly-once results, make processing and writes idempotent.
 >
 > **Pausing under pressure, not dropping or blocking.** When internal queues fill up (misconfigured backpressure, unexpected burst, slow downstream), the affected partition is **paused** and the records that did not fit are fetched again later, rather than discarded. The poll thread itself never blocks, so heartbeats, rebalances and `stop()` keep working even when handlers are stuck. A rate-limited `WARNING` log is emitted when this happens — if you see it in production, tune your backpressure thresholds or concurrency. See [Tuning `dispatchQueueCapacity`](#tuning-dispatchqueuecapacity) for details.
 
@@ -103,7 +103,7 @@ flowchart TB
     BackpressureController --- Sensors
     subgraph Sensors["Sensors"]
       direction LR
-      RecordCount["RecordCount"] ~~~ ByteSize["ByteSize"] ~~~ Heap["Heap"] ~~~ Custom["Custom"]
+      RecordCount["record-count"] ~~~ ByteSize["byte-size"] ~~~ Heap["heap"] ~~~ Sink["sink"] ~~~ Custom["custom"]
     end
 
     KafkaConsumer -->|"dispatch"| RecordDispatcher
@@ -114,8 +114,8 @@ flowchart TB
 
     WorkerPool -->|"throws"| RetryExecutor
     subgraph ErrorHandling["Error Handling"]
-      RetryExecutor -->|"exhausted"| DlqHandler["DLQ Handler"]
-      DlqHandler -->|"fails"| FinalHandler["FinalFailureHandler\n→ SKIP"]
+      RetryExecutor -->|"exhausted"| DLQHandler["DLQHandler"]
+      DLQHandler -->|"fails"| FinalHandler["FinalFailureHandler\n→ drop"]
     end
 
     RebalanceListener -->|"drain + commit"| OffsetTracker
@@ -186,7 +186,7 @@ A concrete walkthrough of what happens to a single batch of records, from poll t
      │
      ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ OffsetTracker (UnorderedOffsetTracker / PartitionWindow)            │
+│ OffsetTracker (SlidingWindowOffsetTracker / PartitionWindow)            │
 │                                                                     │
 │  Suppose workers finish in order: 10, 12, 11, 14, 13                │
 │                                                                     │
@@ -232,7 +232,7 @@ DLQ handler (if configured)
      ▼  DLQ fails or not configured
 FinalFailureHandler (log, file, alert, etc.)
      │
-     └── SKIP → ack anyway, move on                       (recordsFailed)
+     └── drop → ack anyway, move on                       (recordsDropped)
 ```
 
 ### Rebalance Flow
@@ -271,30 +271,23 @@ onPartitionsAssigned([partition-0, partition-5])
 ```
 Poll loop evaluates all sensors before each poll:
 
-  BackpressureController.evaluate():
-    for each sensor in [record-count, byte-size, heap, ...custom]:
-      status = sensor.currentStatus()
-      worst  = max(worst, status)
+  for each sensor in [record-count, byte-size, heap, sink, ...custom]:
+    status = sensor.evaluate()           every sensor, so each keeps its hysteresis current
+  throttle if any sensor says THROTTLE
 
-  Record-count sensor:
-    in-flight < highWatermark           → OK
-    in-flight >= highWatermark          → THROTTLE
-    in-flight >= criticalThreshold      → CRITICAL
+  Every built-in sensor uses the same rule (hysteresis):
+    reading >= highWatermark                   → THROTTLE
+    throttled and reading <= lowWatermark      → OK
+    otherwise                                  → unchanged
 
-  Byte-size sensor (if enabled):
-    inFlightBytes < highWatermarkBytes  → OK
-    inFlightBytes >= highWatermarkBytes → THROTTLE
-    inFlightBytes >= criticalBytes      → CRITICAL
+    record-count: records in flight           (on by default: 10,000 / 6,000)
+    byte-size:    serialized bytes in flight  (opt in)
+    heap:         heap used / max heap        (opt in)
+    sink:         e.g. unsent producer records (KafkaRecordSink: maxPendingSends)
 
-  Heap sensor (if enabled):
-    heapUsed/heapMax < throttleThreshold  → OK
-    heapUsed/heapMax >= throttleThreshold → THROTTLE
-    heapUsed/heapMax >= criticalThreshold → CRITICAL
-
-  Action based on worst status:
+  Action:
     OK       → poll normally
-    THROTTLE → consumer.pause(assignment)  → heartbeats only
-    CRITICAL → consumer.pause(assignment)  → heartbeats only
+    THROTTLE → consumer.pause(every partition) → heartbeats only
 
   Once paused, workers keep draining...
     
@@ -399,8 +392,8 @@ The pipeline supports two error handling strategies via `Fallback`:
 
 | Option | Behavior |
 |--------|----------|
-| `Fallback.SKIP` | Direct skip — no DLQ, skip failed records immediately |
-| `Fallback.DLQ_THEN_SKIP` | Try DLQ first, skip if DLQ also fails |
+| `Fallback.DROP` | Drop failed records without trying the DLQ |
+| `Fallback.DLQ_THEN_DROP` | Try the DLQ first; drop the record if the DLQ fails too (the builder's default `fallback`) |
 
 ```java
 .errorStrategy(ErrorStrategy.<String, String>builder()
@@ -409,20 +402,20 @@ The pipeline supports two error handling strategies via `Fallback`:
     .exponentialBackoff(true)
     .maxBackoff(Duration.ofSeconds(30))
     .dlqHandler((record, error) -> dlqProducer.send(toDlqRecord(record, error)))
-    .fallback(Fallback.DLQ_THEN_SKIP)  // try DLQ, skip if fails
+    .fallback(Fallback.DLQ_THEN_DROP)  // try DLQ, drop if it fails
     .onFinalFailure((record, error) -> log.error("Unrecoverable: {}", record.offset(), error))
     .build())
 ```
 
 The `FinalFailureHandler` is the **final preservation** mechanism — invoked only when all retries AND DLQ fail. After it returns, the record is **permanently dropped** and the offset is committed.
 
-**Trade-off:** The system prioritizes throughput over blocking on unprocessable data. Records that cannot be processed (after retries and DLQ) are skipped, and the offset advances immediately so the pipeline keeps moving. If `FinalFailureHandler` doesn't preserve the data, it's lost forever. The default handler only logs metadata — implement your own to save raw data (PVC, S3, database) if preservation is critical.
+**Trade-off:** The system prioritizes throughput over blocking on unprocessable data. Records that cannot be processed (after retries and DLQ) are dropped, and the offset advances immediately so the pipeline keeps moving. If `FinalFailureHandler` doesn't preserve the data, it's lost forever. The default handler only logs metadata — implement your own to save raw data (PVC, S3, database) if preservation is critical.
 
 For simple cases there are factory methods:
 
 ```java
-ErrorStrategy.skipOnError()          // Fallback.SKIP — no retries, skip immediately (the default)
-ErrorStrategy.withDlq(dlqHandler, 3) // Fallback.DLQ_THEN_SKIP — 3 retries, then DLQ, then skip
+ErrorStrategy.dropOnError()          // Fallback.DROP — no retries, drop at once (the pipeline's default errorStrategy)
+ErrorStrategy.withDlq(dlqHandler, 3) // Fallback.DLQ_THEN_DROP — 3 retries, then DLQ, then drop
 ```
 
 #### Processing timeout
@@ -433,7 +426,63 @@ A handler that hangs (a stuck HTTP call, a lock that never frees) holds its work
 .processingTimeout(Duration.ofSeconds(30))
 ```
 
-Off by default. An attempt that runs longer is interrupted and counts as a failure, so it goes through the same retry → DLQ → skip chain. An attempt that finishes after the deadline anyway is treated as processed. A handler that ignores interrupts (a busy loop, some blocking I/O) cannot be stopped; it keeps its worker until it returns. Pick the value from `metrics().handlerDuration()`, and watch `processingTimeouts` to see how often it fires.
+Off by default. An attempt that runs longer is interrupted and counts as a failure, so it goes through the same retry → DLQ → drop chain. An attempt that finishes after the deadline anyway is treated as processed. A handler that ignores interrupts (a busy loop, some blocking I/O) cannot be stopped; it keeps its worker until it returns. Pick the value from `metrics().handlerDuration()`, and watch `processingTimeouts` to see how often it fires.
+
+### Writing output: processor and sink
+
+When processing produces something to write (another topic, a database, object storage, an HTTP service), split it into a **processor** and a **sink** instead of writing inside a `handler`:
+
+```java
+KafkaRecordSink<String, EnrichedOrder> output = KafkaRecordSink.<String, EnrichedOrder>builder()
+    .producerProperties(producerProps)
+    .topic("orders-enriched")
+    .keyFrom(EnrichedOrder::orderId)
+    .keySerializer(new StringSerializer())
+    .valueSerializer(new EnrichedOrderSerializer())
+    .build();
+
+KafkaPipeline<String, Order> pipeline = new KafkaPipeline<>(
+    KafkaPipeline.<String, Order>builder()
+        .consumerProperties(consumerProps)
+        .topic("orders")
+        .concurrency(ThreadMode.VIRTUAL, 500)
+        .ordering(ProcessingOrder.KEY)
+        .processor(record -> {                                    // business logic, may block on I/O
+            Order order = record.value();
+            Customer customer = customers.get(order.customerId());
+            return List.of(new EnrichedOrder(order, customer));   // List.of() = nothing to write
+        })
+        .sink(output)                                             // acked only once written
+        .errorStrategy(ErrorStrategy.<String, Order>builder()
+            .maxRetries(3)
+            .retryBackoff(Duration.ofMillis(200))
+            .exponentialBackoff(true)
+            .dlqHandler(KafkaDLQHandler.<String, Order>builder()
+                .sharing(output)                                  // same producer
+                .topic("orders-dlq")
+                .keySerializer(new StringSerializer())
+                .valueSerializer(new OrderSerializer())
+                .build())
+            .build())
+        .build());
+```
+
+What the library does with the pair:
+
+- **A record is acked only when its outputs are durable.** The worker hands the outputs to the sink and moves on to the next record; the record stays in flight (backpressure) and in progress (its partition's commit point) until the sink's `CompletionStage` completes. A fire-and-forget `producer.send()` can no longer get a record committed before its output lands.
+- **Order is kept through the write.** With `ordering(KEY)` the next record of a key starts only after the previous record's output is written, so each key's outputs come out in input order (keep the output key derived from the input key so they land in one output partition). `PARTITION` does the same per partition. `UNORDERED` keeps no order.
+- **Failed writes are retried, not reprocessed.** Only the write is retried, never the processor. The sink classifies each failure (`RecordSink.classify`, a `WriteFailure`; the default understands Kafka errors):
+  - `TRANSIENT` (a broker timeout, a leader election) is retried until the destination recovers, so an outage holds records back as backpressure instead of dropping them. If it stays down longer than `writeOutageTimeout` (default 5 minutes), the pipeline stops, still without dropping or committing the record.
+  - `FATAL` (a missing ACL on the output topic, bad credentials, a closed producer) stops the pipeline with the record unacked.
+  - `RECORD` (a record too large, invalid data) is retried up to the error strategy's `maxRetries`, then goes to the DLQ or is dropped, and the partition moves on.
+
+  The DLQ is treated the same way (`DLQHandler.classify`): a DLQ that is briefly down is retried, not a reason to drop. A retry resends all of the record's outputs, so downstream may see duplicates (see below). Writes of a partition that is revoked meanwhile are abandoned, never retried or dead-lettered by the old owner.
+- **Downstream pressure is global.** `KafkaRecordSink` reports unsent producer records (`maxPendingSends`, default 10,000) to the global backpressure, like the in-flight count: it throttles all partitions, never just one.
+- **Shutdown waits for writes.** Writes still in flight get the rest of `shutdownTimeout`; those that finish are committed, the rest are redelivered. The processor and the sink are closed after the final commit (and a `KafkaDLQHandler`; your own `DLQHandler` keeps its own lifecycle).
+
+`RecordProcessor` and `RecordSink` each have one abstract method, so lambdas, method references and classes all work. A sink returns a `CompletionStage`; wrap blocking code with `RecordSink.blocking(...)`. Writes are at-least-once: a record can be processed and written again after a crash or rebalance. Every output of the Kafka sinks carries a `kp-source` header (`topic-partition-offset` of the input), and `SinkContext.recordId()` gives custom sinks the same id, so downstream writes can be made idempotent (upserts, deterministic object keys, idempotency keys).
+
+Use `handler` when processing has only side effects and nothing to write; `handler`, `batchHandler` and `processor(...).sink(...)` are mutually exclusive. Batch mode does not support sinks yet.
 
 ### Batch Mode
 
@@ -453,7 +502,7 @@ KafkaPipeline<String, String> pipeline = new KafkaPipeline<>(
 
 Batch mode uses the same error chain (retry → DLQ → fallback), but applied to the entire batch. The sliding window still tracks out-of-order batch completion correctly — if batch A finishes before batch B, the commit offset won't advance past batch B's range until it completes.
 
-You must use either `handler` (per-record) or `batchHandler` (batch), not both.
+You must use exactly one of `handler` (per-record), `processor(...).sink(...)` (per-record with output) or `batchHandler` (batch).
 
 ### Backpressure
 
@@ -464,14 +513,13 @@ The pipeline supports multiple backpressure layers that work together. The poll 
 Enabled by default. Uses high/low watermark hysteresis to prevent pause/resume flapping:
 
 ```java
-.backpressure(BackpressureConfig.builder()
-    .highWatermark(10_000)     // pause polling when in-flight records reach this
-    .lowWatermark(6_000)       // resume polling when count drops to this
-    .criticalThreshold(50_000) // report CRITICAL instead of THROTTLE
+.recordBackpressure(RecordBackpressureConfig.builder()
+    .highWatermark(10_000)     // pause fetching when in-flight records reach this
+    .lowWatermark(6_000)       // resume when the count drops to this
     .build())
 ```
 
-THROTTLE and CRITICAL both pause the consumer; CRITICAL is the stronger signal, reported by `metrics().backpressureStatus()` so a health check can tell "busy" from "in trouble" (see [Metrics](#metrics)).
+Use `RecordBackpressureConfig.disabled()` to turn it off; the other sensors still apply.
 
 #### Byte-Level Backpressure
 
@@ -479,9 +527,8 @@ Protects against memory pressure when individual records are large (e.g. 10 MB f
 
 ```java
 .byteBackpressure(ByteBackpressureConfig.builder()
-    .lowWatermarkBytes(128 * 1024 * 1024)     // 128 MB — resume
-    .highWatermarkBytes(256 * 1024 * 1024)    // 256 MB — pause
-    .criticalThresholdBytes(512 * 1024 * 1024) // 512 MB — report CRITICAL
+    .highWatermarkBytes(256L * 1024 * 1024)   // 256 MiB — pause
+    .lowWatermarkBytes(128L * 1024 * 1024)    // 128 MiB — resume
     .build())
 ```
 
@@ -491,13 +538,12 @@ Monitors overall JVM heap usage via `MemoryMXBean` and pauses the consumer when 
 
 ```java
 .heapBackpressure(HeapBackpressureConfig.builder()
-    .resumeThreshold(0.5)     // resume polling at 50% heap usage
-    .throttleThreshold(0.7)   // pause polling at 70% heap usage
-    .criticalThreshold(0.9)   // report CRITICAL at 90% heap usage
+    .highWatermark(0.7)   // pause fetching at 70% heap usage
+    .lowWatermark(0.5)    // resume at 50%
     .build())
 ```
 
-Thresholds are ratios (0.0–1.0) of `heapUsed / heapMax` (your `-Xmx` or `-XX:MaxRAMPercentage`). The same hysteresis logic applies — once throttled at 70%, the consumer stays paused until usage drops back to 50%.
+Watermarks are ratios (0–1) of the maximum heap (your `-Xmx` or `-XX:MaxRAMPercentage`). Usage is the lower of the current heap usage and the heap occupied right after the most recent GC, so garbage the collector hasn't reclaimed yet doesn't pause fetching. The same hysteresis applies: once paused at 70%, fetching stays paused until usage drops to 50%.
 
 Unlike record-count and byte-level sensors which only track the pipeline's own in-flight data, the heap sensor captures **all** JVM memory pressure. This makes it a good safety net when your handler allocates significant memory beyond the records themselves.
 
@@ -509,7 +555,7 @@ Unlike record-count and byte-level sensors which only track the pipeline's own i
 | Byte-level | No | Payload bytes of in-flight records | Large/variable record sizes |
 | Heap | No | JVM heap usage (`used/max`) | Producer buffering, caches, or any heap-heavy workload |
 
-All active sensors run in parallel. The poll loop checks every sensor on each cycle and applies the worst status — if any single sensor says THROTTLE, the consumer pauses until **all** sensors return OK.
+The poll thread evaluates every active sensor, one after another, before each poll. If any sensor says THROTTLE, every partition pauses until **all** sensors return OK.
 
 #### Custom Backpressure Sensors
 
@@ -518,9 +564,8 @@ You can plug in your own sensors for domain-specific pressure signals — extern
 ```java
 .addBackpressureSensor(new BackpressureSensor() {
     @Override
-    public BackpressureStatus currentStatus() {
-        if (downstreamService.isOverloaded()) return BackpressureStatus.CRITICAL;
-        if (downstreamService.queueDepth() > 10_000) return BackpressureStatus.THROTTLE;
+    public BackpressureStatus evaluate() {   // poll thread only, once per poll
+        if (downstreamService.isOverloaded()) return BackpressureStatus.THROTTLE;
         return BackpressureStatus.OK;
     }
 
@@ -532,7 +577,7 @@ You can plug in your own sensors for domain-specific pressure signals — extern
 })
 ```
 
-Custom sensors are evaluated alongside the built-in ones — the worst status across all of them determines whether the consumer pauses.
+Custom sensors are evaluated alongside the built-in ones: if any of them says THROTTLE, every partition pauses. For a simple count with hysteresis, `BackpressureSensor.watermark("name", supplier, high, low)` builds one for you.
 
 When backpressure kicks in, the consumer is paused (not disconnected) — it stays in the group and responds to heartbeats, but stops fetching new records until workers catch up.
 
@@ -575,7 +620,7 @@ The core has no metrics dependencies and runs no background threads for this.
 PipelineMetrics m = pipeline.metrics();
 
 m.recordsProcessed();                       // handler succeeded
-m.recordsFailed();                          // dropped after retries and DLQ: data loss
+m.recordsDropped();                          // dropped after retries and DLQ: data loss
 m.inFlightRecords();
 m.backpressureStatus();
 m.handlerDuration().mean();
@@ -601,9 +646,9 @@ Every record the pipeline finishes is counted in exactly one outcome, so the fou
 | Handler succeeded (possibly after retries) | `recordsProcessed` |
 | Skipped by the lifecycle hook (`beforeProcess` returned `false`) | `recordsSkipped` |
 | Sent to the DLQ | `dlqSuccesses` |
-| Dropped: retries failed, and no DLQ or the DLQ send failed | `recordsFailed` |
+| Dropped: retries failed, and no DLQ or the DLQ send failed | `recordsDropped` |
 
-Records left unfinished by a shutdown or rebalance are in none of them; they are redelivered (`recordsAbandoned`). Alert on `recordsFailed`: it is data loss.
+Records left unfinished by a shutdown or rebalance are in none of them; they are redelivered (`recordsAbandoned`). Alert on `recordsDropped`: it is data loss.
 
 #### Available Metrics
 
@@ -612,19 +657,18 @@ Records left unfinished by a shutdown or rebalance are in none of them; they are
 | Identity | `name` | — | Pipeline name (`name(...)`, default `group.id`) |
 | Throughput | `recordsProcessed` | Counter | Records whose handler succeeded |
 | | `recordsSkipped` | Counter | Records skipped by the lifecycle hook |
-| | `recordsFailed` | Counter | Records dropped after retries and DLQ failed |
+| | `recordsDropped` | Counter | Records given up on without reaching a DLQ (none configured, `Fallback.DROP`, or the send failed); the `FinalFailureHandler` saw each one |
 | | `handlerDuration` | Counter | Count and total time of handler attempts (`count()`, `total()`, `mean()`); retries, failed and timed-out attempts included, a batch call counts once |
 | | `pollCount` | Counter | Total `consumer.poll()` calls |
 | | `emptyPollCount` | Counter | Polls that returned zero records |
 | Pressure | `inFlightRecords` | Gauge | Records between poll and ack |
 | | `inFlightBytes` | Gauge | Estimated bytes of in-flight records |
-| | `backpressureStatus` | Gauge | Current backpressure level (OK / THROTTLE / CRITICAL) |
+| | `backpressureStatus` | Gauge | Current backpressure decision (OK / THROTTLE) |
 | | `throttleCount` | Counter | Times backpressure activated |
 | Errors | `retryAttempts` | Counter | Retry attempts across all records |
 | | `processingTimeouts` | Counter | Attempts interrupted by `processingTimeout` |
 | | `dlqSuccesses` | Counter | Records sent to the DLQ |
 | | `dlqFailures` | Counter | Records whose DLQ send failed |
-| | `finalFailures` | Counter | `FinalFailureHandler` calls, one per dropped record |
 | | `commitSuccesses` | Counter | Successful offset commits |
 | | `commitFailures` | Counter | Failed offset commits |
 | Rebalance | `rebalanceCount` | Counter | Consumer group rebalances |
@@ -636,11 +680,11 @@ Records left unfinished by a shutdown or rebalance are in none of them; they are
 
 | Metric | Type | Description |
 |---|---|---|
-| `lag` | Gauge | Records polled but not yet committable |
-| `failures` | Counter | Dropped records on this partition since it was assigned |
+| `uncommittedOffsets` | Gauge | Offsets polled but not committable yet (not Kafka consumer lag) |
+| `dropped` | Counter | Records of this partition dropped since it was assigned |
 | `commitStallMillis` | Gauge | How long the committable offset hasn't moved while records wait; growing means a stuck record at the head |
 | `windowSize` / `windowCapacity` | Gauge | Entries in the partition's offset window, and its limit (`maxWindowSize`) |
-| `windowFill` | Gauge | `windowSize / windowCapacity`; near 0.8 the partition is about to pause — an earlier warning than lag |
+| `windowFill` | Gauge | `windowSize / windowCapacity`; near 0.8 the partition is about to pause — an earlier warning than `uncommittedOffsets` |
 
 #### Exporting metrics
 
@@ -684,8 +728,8 @@ public final class MicrometerExporter implements MetricsExporter {
         // Pull: read on every scrape.
         meters.add(FunctionCounter.builder("kafka.pipeline.records.processed", binding,
                 b -> b.snapshot().recordsProcessed()).tags(tags).register(registry));
-        meters.add(FunctionCounter.builder("kafka.pipeline.records.failed", binding,
-                b -> b.snapshot().recordsFailed()).tags(tags).register(registry));
+        meters.add(FunctionCounter.builder("kafka.pipeline.records.dropped", binding,
+                b -> b.snapshot().recordsDropped()).tags(tags).register(registry));
         meters.add(Gauge.builder("kafka.pipeline.in.flight.records", binding,
                 b -> b.snapshot().inFlightRecords()).tags(tags).register(registry));
 
@@ -727,7 +771,7 @@ Or use it in a health check:
 
 ```java
 app.get("/health", ctx ->
-    ctx.status(pipeline.metrics().backpressureStatus() == BackpressureStatus.CRITICAL ? 503 : 200));
+    ctx.status(pipeline.isRunning() ? 200 : 503));
 ```
 
 #### Diagnostic Quick Reference
@@ -735,11 +779,11 @@ app.get("/health", ctx ->
 | Symptom | Check | Likely Cause |
 |---|---|---|
 | Throughput drops to zero | `backpressureStatus`, `inFlightRecords` | Backpressure triggered — workers slower than poll rate |
-| Consumer lag growing | `partitions()` → `lag`, `retryAttempts` | Retry storms or slow handler |
+| Commits not advancing, records held back | `partitions()` → `uncommittedOffsets`, `retryAttempts` | Retry storms or a slow handler |
 | One partition stops committing | `partitions()` → `commitStallMillis`, `windowFill` | A stuck record at the head of the partition; consider `processingTimeout` |
 | Handlers slow or timing out | `handlerDuration().mean()`, `processingTimeouts` | Slow downstream, or `processingTimeout` too close to normal handler time |
 | Frequent rebalances | `rebalanceCount`, `drainTimeouts` | Pods restarting or scaling without static membership, or `session.timeout.ms` too low (see [Running in Production](#running-in-production)) |
-| Data loss suspected | `recordsFailed`, `dlqFailures` | Records dropped after retries; check the DLQ and the final failure logs |
+| Data loss suspected | `recordsDropped`, `dlqFailures` | Records dropped after retries; check the DLQ and the final failure logs |
 | Memory pressure | `inFlightRecords`, `inFlightBytes` | Backpressure thresholds too high |
 
 ### Async Start
@@ -764,12 +808,14 @@ pipeline.awaitShutdown();
 | `topic` / `topics` | *required* | Topic to subscribe to; one per pipeline is recommended (see [One topic per pipeline](#one-topic-per-pipeline)) |
 | `handler` | *one required* | Your `RecordHandler<K,V>` for per-record mode |
 | `batchHandler` | *one required* | Your `BatchRecordHandler<K,V>` for batch mode |
+| `processor(...).sink(...)` | *one required* | A `RecordProcessor<K,V,O>` and the `RecordSink<O>` its outputs go to; records are acked once written (see [Writing output](#writing-output-processor-and-sink)) |
 | `concurrency(ThreadMode, int)` | *required* | Thread model and worker count |
-| `backpressure` | high=10k, low=6k, critical=50k | Record-count watermarks |
-| `byteBackpressure` | disabled | Byte-level watermarks for memory protection |
-| `heapBackpressure` | disabled | JVM heap usage watermarks (via `MemoryMXBean`) |
+| `recordBackpressure` | high=10,000, low=6,000 | Pause every partition when this many records are in flight |
+| `byteBackpressure` | disabled | Pause every partition when this many serialized bytes are in flight |
+| `heapBackpressure` | disabled | Pause every partition at this heap usage ratio |
 | `addBackpressureSensor` | none | Custom backpressure sensor(s) |
-| `errorStrategy` | `skipOnError()` | Retry + DLQ + fallback chain; the default retries nothing and skips, logging the record's metadata (see [Error Handling](#error-handling)) |
+| `errorStrategy` | `dropOnError()` | Retry + DLQ + fallback chain; the default retries nothing and drops, logging the record's metadata (see [Error Handling](#error-handling)) |
+| `writeOutageTimeout` | 5 minutes | How long a sink or DLQ write may keep failing transiently (destination down) before the pipeline stops; records are never dropped for an outage |
 | `processingTimeout` | 0 (off) | Max duration of one handler attempt before it is interrupted and counted as failed (see [Processing timeout](#processing-timeout)) |
 | `lifecycleHook` | no-op | Before/after/error callbacks (per-record mode only) |
 | `commitInterval` | 5s | How often to commit offsets async |
@@ -806,7 +852,7 @@ KafkaPipeline.<String, String>builder()
     .build();
 ```
 
-When the queue fills up, the poll thread does **not** block. Records that don't fit stay unacknowledged, the consumer seeks back to the first of them and pauses that partition; other partitions keep flowing. The partition resumes once its queue has drained to half capacity, and the skipped records are fetched again — nothing is dropped. You'll see a rate-limited `WARNING` log if this happens:
+When the queue fills up, the poll thread does **not** block. Records that don't fit stay unacknowledged, the consumer seeks back to the first of them and pauses that partition; other partitions keep flowing. The partition resumes once its queue has drained to half capacity, and the records that did not fit are fetched again — nothing is dropped. You'll see a rate-limited `WARNING` log if this happens:
 
 ```
 WARNING: Dispatch queue full for topic-0, pausing the partition until workers catch up
@@ -821,7 +867,7 @@ A full example tying `dispatchQueueCapacity`, `max.poll.records`, and backpressu
 
 ```java
 // max.poll.records = 500 (default)
-// backpressure highWatermark = 2000  (pause after ~4 polls worth in-flight)
+// recordBackpressure highWatermark = 2000  (pause after ~4 polls worth in-flight)
 // dispatchQueueCapacity = 500        (one poll's worth per partition queue)
 
 KafkaPipeline.<String, String>builder()
@@ -829,10 +875,9 @@ KafkaPipeline.<String, String>builder()
     .topic("orders")
     .handler(record -> orderService.process(record))
     .concurrency(ThreadMode.VIRTUAL, 100)
-    .backpressure(BackpressureConfig.builder()
+    .recordBackpressure(RecordBackpressureConfig.builder()
         .highWatermark(2000)
         .lowWatermark(1000)
-        .criticalThreshold(10_000)
         .build())
     .dispatchQueueCapacity(500)
     .build();
@@ -977,7 +1022,7 @@ Integration tests are skipped automatically when Docker is not available.
 
 ## Contributing
 
-Contributions are welcome. Please open an issue to discuss proposed changes before submitting a pull request.
+Contributions are welcome. Please open an issue to discuss proposed changes before submitting a pull request. [CONTRIBUTING.md](CONTRIBUTING.md) covers building, testing, the invariants reviewers check and the naming rules; [ARCHITECTURE.md](ARCHITECTURE.md) is the map of the code.
 
 ## Disclaimer
 

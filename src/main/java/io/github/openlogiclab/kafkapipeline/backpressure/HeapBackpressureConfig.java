@@ -16,69 +16,68 @@
 package io.github.openlogiclab.kafkapipeline.backpressure;
 
 /**
- * Immutable configuration for heap-based backpressure thresholds.
+ * Backpressure on JVM heap usage, to protect against running out of memory whatever uses it
+ * (records in flight, producer buffers, caches).
  *
- * <p>Uses high/low watermark hysteresis (same pattern as {@link BackpressureConfig} and {@link
- * ByteBackpressureConfig}) but based on JVM heap usage ratio (0.0–1.0). This protects against OOM
- * when the application's overall memory usage grows — regardless of whether the pressure comes from
- * in-flight records, producer buffers, or other allocations.
+ * <p>Pauses fetching on every partition when heap usage reaches {@code highWatermark} and resumes
+ * at {@code lowWatermark}. Both are ratios of the maximum heap ({@code -Xmx} or {@code
+ * -XX:MaxRAMPercentage}) between 0 and 1. Usage is the lower of the current heap usage and the heap
+ * occupied right after the most recent GC, so garbage the collector has not reclaimed yet does not
+ * pause fetching, and resuming never has to wait for a GC. Off by default.
  *
- * <p>Heap usage is the ratio of occupied heap to the JVM maximum ({@code -Xmx} or {@code
- * -XX:MaxRAMPercentage}): the lower of the current {@code MemoryMXBean.getHeapMemoryUsage()} and
- * the heap occupied right after the last GC, so garbage that has not been collected yet does not
- * trigger throttling. See {@link HeapSensor}.
- *
- * @param throttleThreshold heap usage ratio at which the consumer pauses polling
- * @param resumeThreshold heap usage ratio at which the consumer resumes polling
- * @param criticalThreshold heap usage ratio at which status escalates to CRITICAL
- * @param enabled whether heap backpressure is active
+ * @param highWatermark heap usage ratio at which fetching pauses, at most 1
+ * @param lowWatermark heap usage ratio at which fetching resumes, above 0 and below {@code
+ *     highWatermark}
+ * @param enabled whether this sensor is active
  */
-public record HeapBackpressureConfig(
-    double throttleThreshold, double resumeThreshold, double criticalThreshold, boolean enabled) {
+public record HeapBackpressureConfig(double highWatermark, double lowWatermark, boolean enabled) {
 
-  /** Validates configuration constraints. */
+  /** Default high watermark: {@value}. */
+  public static final double DEFAULT_HIGH_WATERMARK = 0.7;
+
+  /** Default low watermark: {@value}. */
+  public static final double DEFAULT_LOW_WATERMARK = 0.5;
+
+  /**
+   * Validates the watermarks when enabled.
+   *
+   * @param highWatermark heap usage ratio at which fetching pauses
+   * @param lowWatermark heap usage ratio at which fetching resumes
+   * @param enabled whether this sensor is active
+   */
   public HeapBackpressureConfig {
     if (enabled) {
-      if (resumeThreshold <= 0.0 || resumeThreshold >= 1.0) {
-        throw new IllegalArgumentException(
-            "resumeThreshold must be between 0.0 and 1.0 exclusive, got " + resumeThreshold);
+      if (Double.isNaN(highWatermark) || Double.isNaN(lowWatermark)) {
+        throw new IllegalArgumentException("watermarks must be numbers, got NaN");
       }
-      if (throttleThreshold <= resumeThreshold) {
+      if (lowWatermark <= 0.0 || lowWatermark >= 1.0) {
         throw new IllegalArgumentException(
-            "throttleThreshold ("
-                + throttleThreshold
-                + ") must be > resumeThreshold ("
-                + resumeThreshold
-                + ")");
+            "lowWatermark must be between 0 and 1 exclusive, got " + lowWatermark);
       }
-      if (criticalThreshold <= throttleThreshold) {
+      if (highWatermark <= lowWatermark || highWatermark > 1.0) {
         throw new IllegalArgumentException(
-            "criticalThreshold ("
-                + criticalThreshold
-                + ") must be > throttleThreshold ("
-                + throttleThreshold
-                + ")");
-      }
-      if (criticalThreshold > 1.0) {
-        throw new IllegalArgumentException(
-            "criticalThreshold must be <= 1.0, got " + criticalThreshold);
+            "highWatermark must be > lowWatermark ("
+                + lowWatermark
+                + ") and <= 1, got "
+                + highWatermark);
       }
     }
   }
 
   /**
-   * Returns a disabled configuration.
+   * Heap backpressure off (the default).
    *
-   * @return disabled configuration
+   * @return a disabled configuration
    */
   public static HeapBackpressureConfig disabled() {
-    return new HeapBackpressureConfig(0, 0, 0, false);
+    return new HeapBackpressureConfig(0, 0, false);
   }
 
   /**
-   * Returns a new builder.
+   * Returns a builder starting from {@value #DEFAULT_HIGH_WATERMARK} / {@value
+   * #DEFAULT_LOW_WATERMARK}.
    *
-   * @return new builder instance
+   * @return the builder
    */
   public static Builder builder() {
     return new Builder();
@@ -86,75 +85,40 @@ public record HeapBackpressureConfig(
 
   /** Builder for {@link HeapBackpressureConfig}. */
   public static final class Builder {
-    private double throttleThreshold = 0.7;
-    private double resumeThreshold = 0.5;
-    private double criticalThreshold = 0.9;
-    private boolean enabled = true;
+    private double highWatermark = DEFAULT_HIGH_WATERMARK;
+    private double lowWatermark = DEFAULT_LOW_WATERMARK;
 
     private Builder() {}
 
     /**
-     * Heap usage ratio at which the consumer pauses polling. Must be greater than {@link
-     * #resumeThreshold}.
+     * Heap usage ratio at which fetching pauses. Default: {@value #DEFAULT_HIGH_WATERMARK}.
      *
-     * <p>Default: {@code 0.7} (70% heap usage).
-     *
-     * @param throttleThreshold the throttle threshold (0.0-1.0)
+     * @param highWatermark the high watermark (0–1)
      * @return this builder
      */
-    public Builder throttleThreshold(double throttleThreshold) {
-      this.throttleThreshold = throttleThreshold;
+    public Builder highWatermark(double highWatermark) {
+      this.highWatermark = highWatermark;
       return this;
     }
 
     /**
-     * Heap usage ratio at which the consumer resumes polling after being paused. The gap between
-     * throttle and resume thresholds prevents pause/resume flapping.
+     * Heap usage ratio at which fetching resumes. Default: {@value #DEFAULT_LOW_WATERMARK}.
      *
-     * <p>Default: {@code 0.5} (50% heap usage).
-     *
-     * @param resumeThreshold the resume threshold (0.0-1.0)
+     * @param lowWatermark the low watermark (0–1)
      * @return this builder
      */
-    public Builder resumeThreshold(double resumeThreshold) {
-      this.resumeThreshold = resumeThreshold;
+    public Builder lowWatermark(double lowWatermark) {
+      this.lowWatermark = lowWatermark;
       return this;
     }
 
     /**
-     * Heap usage ratio at which status escalates to {@code CRITICAL}.
-     *
-     * <p>Default: {@code 0.9} (90% heap usage).
-     *
-     * @param criticalThreshold the critical threshold (0.0-1.0)
-     * @return this builder
-     */
-    public Builder criticalThreshold(double criticalThreshold) {
-      this.criticalThreshold = criticalThreshold;
-      return this;
-    }
-
-    /**
-     * Whether heap backpressure is enabled. When using {@link HeapBackpressureConfig#builder()},
-     * defaults to {@code true}. Use {@link HeapBackpressureConfig#disabled()} to explicitly
-     * disable.
-     *
-     * @param enabled whether enabled
-     * @return this builder
-     */
-    public Builder enabled(boolean enabled) {
-      this.enabled = enabled;
-      return this;
-    }
-
-    /**
-     * Builds the configuration.
+     * Builds an enabled configuration.
      *
      * @return the configuration
      */
     public HeapBackpressureConfig build() {
-      return new HeapBackpressureConfig(
-          throttleThreshold, resumeThreshold, criticalThreshold, enabled);
+      return new HeapBackpressureConfig(highWatermark, lowWatermark, true);
     }
   }
 }

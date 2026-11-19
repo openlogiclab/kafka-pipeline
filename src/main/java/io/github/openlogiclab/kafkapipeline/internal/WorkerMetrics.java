@@ -31,7 +31,7 @@ public interface WorkerMetrics {
 
   /**
    * Records records skipped by the lifecycle hook. Not for records dropped after a failure; those
-   * go to {@link RetryMetrics#recordFailed}.
+   * go to {@link RetryMetrics#recordDropped}.
    *
    * @param count number of records skipped
    */

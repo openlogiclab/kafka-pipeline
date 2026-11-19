@@ -19,7 +19,6 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.openlogiclab.kafkapipeline.ProcessingOrder;
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.error.Fallback;
@@ -28,7 +27,8 @@ import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.HandlerAttemptObserver;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
-import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.offset.SlidingWindowOffsetTracker;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -58,14 +58,14 @@ class WorkerRobustnessTest {
   private static final TopicPartition TP0 = new TopicPartition("test", 0);
   private static final TopicPartition TP1 = new TopicPartition("test", 1);
 
-  private UnorderedOffsetTracker tracker;
+  private SlidingWindowOffsetTracker tracker;
   private RecordDispatcher<String, String> dispatcher;
   private InFlightCounter counter;
   private WorkerPool<String, String> pool;
 
   @BeforeEach
   void setUp() {
-    tracker = new UnorderedOffsetTracker();
+    tracker = new SlidingWindowOffsetTracker();
     tracker.initPartition(TP0, 0);
     dispatcher = new RecordDispatcher<>(100);
     dispatcher.addPartition(TP0);
@@ -127,11 +127,11 @@ class WorkerRobustnessTest {
   class HandlerErrors {
 
     @Test
-    void errorFromHandler_isSkippedAndWorkerSurvives() throws Exception {
+    void errorFromHandler_isDroppedAndWorkerSurvives() throws Exception {
       List<Long> processed = new CopyOnWriteArrayList<>();
       pool =
           singlePool(
-              ErrorStrategy.skipOnError(),
+              ErrorStrategy.dropOnError(),
               Duration.ZERO,
               r -> {
                 if (r.offset() == 0) throw new AssertionError("boom");
@@ -153,7 +153,7 @@ class WorkerRobustnessTest {
       AtomicReference<Exception> seen = new AtomicReference<>();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
-              .fallback(Fallback.SKIP)
+              .fallback(Fallback.DROP)
               .onFinalFailure((r, e) -> seen.set(e))
               .build();
       pool =
@@ -176,7 +176,7 @@ class WorkerRobustnessTest {
       AtomicReference<Throwable> fatal = new AtomicReference<>();
       pool =
           singlePool(
-              ErrorStrategy.skipOnError(),
+              ErrorStrategy.dropOnError(),
               Duration.ZERO,
               r -> {
                 throw new OutOfMemoryError("simulated");
@@ -198,7 +198,7 @@ class WorkerRobustnessTest {
       AtomicReference<Exception> seen = new AtomicReference<>();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
-              .fallback(Fallback.SKIP)
+              .fallback(Fallback.DROP)
               .onFinalFailure((r, e) -> seen.set(e))
               .build();
       ProcessingLifecycleHook<String, String> hook =
@@ -234,7 +234,7 @@ class WorkerRobustnessTest {
       List<Long> processed = new CopyOnWriteArrayList<>();
       pool =
           singlePool(
-              ErrorStrategy.skipOnError(),
+              ErrorStrategy.dropOnError(),
               Duration.ZERO,
               r -> {
                 processed.add(r.offset());
@@ -284,7 +284,7 @@ class WorkerRobustnessTest {
       AtomicReference<Exception> seen = new AtomicReference<>();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
-              .fallback(Fallback.SKIP)
+              .fallback(Fallback.DROP)
               .onFinalFailure((r, e) -> seen.set(e))
               .build();
       pool =
@@ -309,7 +309,7 @@ class WorkerRobustnessTest {
     void timeoutDuringShutdown_leavesRecordForRedelivery() {
       RetryExecutor<String, String> executor =
           new RetryExecutor<>(
-              ErrorStrategy.skipOnError(),
+              ErrorStrategy.dropOnError(),
               NoOpMetricsCollector.INSTANCE,
               HandlerAttemptObserver.NONE,
               Duration.ofMillis(20));
@@ -324,7 +324,7 @@ class WorkerRobustnessTest {
                 TP0,
                 "slow",
                 () -> true); // the pipeline is stopping meanwhile
-        assertInstanceOf(InterruptedException.class, result, "a shutdown, not a timeout to skip");
+        assertInstanceOf(InterruptedException.class, result, "a shutdown, not a timeout to drop");
         assertTrue(Thread.interrupted(), "interrupt flag kept for the caller");
       } finally {
         executor.close();
@@ -335,7 +335,7 @@ class WorkerRobustnessTest {
     void attemptAfterClose_runsWithoutTimer() {
       RetryExecutor<String, String> executor =
           new RetryExecutor<>(
-              ErrorStrategy.skipOnError(),
+              ErrorStrategy.dropOnError(),
               NoOpMetricsCollector.INSTANCE,
               HandlerAttemptObserver.NONE,
               Duration.ofMillis(20));
@@ -347,7 +347,7 @@ class WorkerRobustnessTest {
     void fastAttempts_neverSeeAStrayTimeoutInterrupt() throws Exception {
       RetryExecutor<String, String> executor =
           new RetryExecutor<>(
-              ErrorStrategy.skipOnError(),
+              ErrorStrategy.dropOnError(),
               NoOpMetricsCollector.INSTANCE,
               HandlerAttemptObserver.NONE,
               Duration.ofMillis(1));
@@ -380,7 +380,7 @@ class WorkerRobustnessTest {
       dispatcher.addPartition(TP1);
       pool =
           singlePool(
-              ErrorStrategy.skipOnError(), Duration.ZERO, r -> {}, ProcessingLifecycleHook.noOp());
+              ErrorStrategy.dropOnError(), Duration.ZERO, r -> {}, ProcessingLifecycleHook.noOp());
 
       Map<TopicPartition, List<ConsumerRecord<String, String>>> polled = new LinkedHashMap<>();
       polled.put(TP1, List.of(new ConsumerRecord<>("test", 1, 7L, "k", "v")));
@@ -410,7 +410,7 @@ class WorkerRobustnessTest {
               4,
               ThreadMode.PLATFORM,
               (tp, batch) -> release.await(),
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               100,

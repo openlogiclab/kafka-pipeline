@@ -50,29 +50,21 @@ public sealed interface OffsetStats permits OffsetTracker {
   int inProgressCount(TopicPartition tp);
 
   /**
-   * Distance between the highest registered offset and the committable offset. Useful for
-   * monitoring how far behind processing is from polling.
+   * Offsets polled but not committable yet: from the committable offset up to the highest
+   * registered offset. Not Kafka consumer lag.
    *
    * @param tp the topic partition
-   * @return the lag count
+   * @return offsets polled but not committable
    */
-  long lag(TopicPartition tp);
+  long uncommittedOffsets(TopicPartition tp);
 
   /**
-   * Returns true if any unrecoverable failure has occurred on this partition.
+   * Number of records of this partition dropped after their retries (and the DLQ, if any) failed.
    *
    * @param tp the topic partition
-   * @return true if failed
+   * @return records dropped
    */
-  boolean isFailed(TopicPartition tp);
-
-  /**
-   * Number of unrecoverable failures that have occurred on this partition.
-   *
-   * @param tp the topic partition
-   * @return failure count
-   */
-  int failureCount(TopicPartition tp);
+  long droppedCount(TopicPartition tp);
 
   /**
    * Number of entries currently held in the partition's window, including completed offsets that

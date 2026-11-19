@@ -27,11 +27,11 @@ import java.time.Duration;
  *       exponentialBackoff} is true, capped at {@code maxBackoff})
  *   <li>If retries exhausted and {@code dlqHandler} is set, attempt DLQ send
  *   <li>If DLQ succeeds → ack the record (offset advances)
- *   <li>If DLQ fails or is not configured → call {@code finalFailureHandler}, then skip the record
+ *   <li>If DLQ fails or is not configured → call {@code finalFailureHandler}, then drop the record
  * </ol>
  *
  * <p>This is a best-effort strategy: the system never halts. Failed records that cannot be sent to
- * DLQ are skipped after invoking the final failure handler, allowing processing to continue.
+ * DLQ are dropped after invoking the final failure handler, allowing processing to continue.
  *
  * @param <K> record key type
  * @param <V> record value type
@@ -41,7 +41,7 @@ import java.time.Duration;
  * @param maxBackoff maximum delay between retry attempts
  * @param dlqHandler dead letter queue handler, or null if not configured
  * @param fallback action to take after retries and DLQ are exhausted
- * @param finalFailureHandler callback invoked before skipping a failed record
+ * @param finalFailureHandler callback invoked before dropping a failed record
  */
 public record ErrorStrategy<K, V>(
     int maxRetries,
@@ -53,6 +53,9 @@ public record ErrorStrategy<K, V>(
     FinalFailureHandler<K, V> finalFailureHandler) {
 
   private static final System.Logger logger = System.getLogger(ErrorStrategy.class.getName());
+
+  /** Exponential backoff doubles at most this many times: {@value}. */
+  public static final int MAX_BACKOFF_DOUBLINGS = 30;
 
   /** Validates configuration constraints. */
   public ErrorStrategy {
@@ -68,19 +71,19 @@ public record ErrorStrategy<K, V>(
   }
 
   /**
-   * No retries, no DLQ, skip failed records with default logging.
+   * No retries, no DLQ, drop failed records with default logging.
    *
    * @param <K> record key type
    * @param <V> record value type
-   * @return error strategy that skips on error
+   * @return error strategy that drops on error
    */
-  public static <K, V> ErrorStrategy<K, V> skipOnError() {
+  public static <K, V> ErrorStrategy<K, V> dropOnError() {
     return new ErrorStrategy<>(
-        0, Duration.ZERO, false, Duration.ZERO, null, Fallback.SKIP, defaultFinalFailureHandler());
+        0, Duration.ZERO, false, Duration.ZERO, null, Fallback.DROP, defaultFinalFailureHandler());
   }
 
   /**
-   * Best-effort DLQ with retries. If DLQ fails, skip with default logging.
+   * Best-effort DLQ with retries. If DLQ fails, drop with default logging.
    *
    * @param <K> record key type
    * @param <V> record value type
@@ -95,7 +98,7 @@ public record ErrorStrategy<K, V>(
         true,
         Duration.ofMinutes(1),
         dlqHandler,
-        Fallback.DLQ_THEN_SKIP,
+        Fallback.DLQ_THEN_DROP,
         defaultFinalFailureHandler());
   }
 
@@ -123,7 +126,8 @@ public record ErrorStrategy<K, V>(
     if (!exponentialBackoff) {
       return retryBackoff;
     }
-    long millis = retryBackoff.toMillis() * (1L << Math.min(attempt, 30));
+    // The shift is capped so a long retry sequence cannot overflow; maxBackoff applies anyway.
+    long millis = retryBackoff.toMillis() * (1L << Math.min(attempt, MAX_BACKOFF_DOUBLINGS));
     long capped = Math.min(millis, maxBackoff.isZero() ? millis : maxBackoff.toMillis());
     return Duration.ofMillis(capped);
   }
@@ -141,7 +145,7 @@ public record ErrorStrategy<K, V>(
     return (record, error) ->
         logger.log(
             System.Logger.Level.ERROR,
-            "Unrecoverable failure, skipping record: topic={0}, partition={1}, offset={2}, error={3}",
+            "Unrecoverable failure, dropping record: topic={0}, partition={1}, offset={2}, error={3}",
             record.topic(),
             record.partition(),
             record.offset(),
@@ -160,13 +164,13 @@ public record ErrorStrategy<K, V>(
     private boolean exponentialBackoff = false;
     private Duration maxBackoff = Duration.ofMinutes(1);
     private DLQHandler<K, V> dlqHandler;
-    private Fallback fallback = Fallback.DLQ_THEN_SKIP;
+    private Fallback fallback = Fallback.DLQ_THEN_DROP;
     private FinalFailureHandler<K, V> finalFailureHandler;
 
     private Builder() {}
 
     /**
-     * Maximum number of retry attempts before moving to DLQ/skip. Set to {@code 0} to disable
+     * Maximum number of retry attempts before moving to DLQ/drop. Set to {@code 0} to disable
      * retries.
      *
      * <p>Default: {@code 0} (no retries).
@@ -213,7 +217,9 @@ public record ErrorStrategy<K, V>(
     }
 
     /**
-     * Upper bound for exponential backoff. Ignored when exponential backoff is disabled.
+     * Upper bound for exponential backoff. Ignored when exponential backoff is disabled. Zero means
+     * no bound (the backoff still stops doubling after {@value ErrorStrategy#MAX_BACKOFF_DOUBLINGS}
+     * retries).
      *
      * <p>Default: {@code 1 minute}.
      *
@@ -229,7 +235,7 @@ public record ErrorStrategy<K, V>(
      * Optional dead letter queue handler. When set, failed records (after all retries) are sent to
      * the DLQ. If the DLQ send succeeds, the record is acked and the offset advances.
      *
-     * <p>Default: {@code null} (no DLQ, skip directly).
+     * <p>Default: {@code null} (no DLQ, drop directly).
      *
      * @param dlqHandler the DLQ handler
      * @return this builder
@@ -242,7 +248,7 @@ public record ErrorStrategy<K, V>(
     /**
      * What to do after all retries are exhausted and DLQ (if configured) also fails.
      *
-     * <p>Default: {@link Fallback#SKIP}.
+     * <p>Default: {@link Fallback#DLQ_THEN_DROP}.
      *
      * @param fallback the fallback action
      * @return this builder
@@ -276,15 +282,15 @@ public record ErrorStrategy<K, V>(
      * @return the error strategy
      */
     public ErrorStrategy<K, V> build() {
-      if (fallback == Fallback.DLQ_THEN_SKIP && dlqHandler == null) {
+      if (fallback == Fallback.DLQ_THEN_DROP && dlqHandler == null) {
         logger.log(
             System.Logger.Level.WARNING,
-            "Fallback.DLQ_THEN_SKIP configured but no dlqHandler set — will behave like SKIP");
+            "Fallback.DLQ_THEN_DROP configured but no dlqHandler set — will behave like DROP");
       }
-      if (fallback == Fallback.SKIP && dlqHandler != null) {
+      if (fallback == Fallback.DROP && dlqHandler != null) {
         logger.log(
             System.Logger.Level.INFO,
-            "Fallback.SKIP configured with dlqHandler — DLQ will be bypassed");
+            "Fallback.DROP configured with dlqHandler — DLQ will be bypassed");
       }
       FinalFailureHandler<K, V> handler =
           finalFailureHandler != null ? finalFailureHandler : defaultFinalFailureHandler();

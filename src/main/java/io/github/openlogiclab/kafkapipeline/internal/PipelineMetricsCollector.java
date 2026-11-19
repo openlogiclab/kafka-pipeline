@@ -15,8 +15,8 @@
  */
 package io.github.openlogiclab.kafkapipeline.internal;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.BackpressureController;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.metrics.AttemptOutcome;
 import io.github.openlogiclab.kafkapipeline.metrics.PartitionMetrics;
 import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
@@ -35,7 +35,7 @@ import org.apache.kafka.common.TopicPartition;
  * <p>It implements one narrow interface per recording component ({@link PollMetrics}, {@link
  * CommitMetrics}, {@link RebalanceMetrics}, {@link WorkerMetrics}, {@link RetryMetrics}, {@link
  * HandlerAttemptObserver}), and each component depends only on its own. Write methods are called on
- * the hot path (poll loop, worker threads, committer thread) and consist of a single {@code
+ * the hot path (poll thread, worker threads, sink write outcomes) and consist of a single {@code
  * LongAdder} update — cell-striped, no contention, same design as {@link InFlightCounter}.
  *
  * <p>The read method ({@link #snapshot()}) is called on-demand from user code and assembles an
@@ -58,7 +58,7 @@ public final class PipelineMetricsCollector
 
   // ── Throughput counters ────────────────────────────────────────
   private final LongAdder recordsProcessed = new LongAdder();
-  private final LongAdder recordsFailed = new LongAdder();
+  private final LongAdder recordsDropped = new LongAdder();
   private final LongAdder recordsSkipped = new LongAdder();
   private final LongAdder pollCount = new LongAdder();
   private final LongAdder emptyPollCount = new LongAdder();
@@ -72,7 +72,6 @@ public final class PipelineMetricsCollector
   private final LongAdder retryAttempts = new LongAdder();
   private final LongAdder dlqSuccesses = new LongAdder();
   private final LongAdder dlqFailures = new LongAdder();
-  private final LongAdder finalFailures = new LongAdder();
   private final LongAdder commitSuccesses = new LongAdder();
   private final LongAdder commitFailures = new LongAdder();
 
@@ -124,8 +123,8 @@ public final class PipelineMetricsCollector
   }
 
   @Override
-  public void recordFailed(int count) {
-    recordsFailed.add(count);
+  public void recordDropped(int count) {
+    recordsDropped.add(count);
   }
 
   @Override
@@ -161,11 +160,6 @@ public final class PipelineMetricsCollector
   @Override
   public void recordDlqFailure(int count) {
     dlqFailures.add(count);
-  }
-
-  @Override
-  public void recordFinalFailure() {
-    finalFailures.increment();
   }
 
   @Override
@@ -217,8 +211,8 @@ public final class PipelineMetricsCollector
       partitions.put(
           tp,
           new PartitionMetricsSnapshot(
-              offsetTracker.lag(tp),
-              offsetTracker.failureCount(tp),
+              offsetTracker.uncommittedOffsets(tp),
+              offsetTracker.droppedCount(tp),
               offsetTracker.commitStallMillis(tp),
               offsetTracker.windowSize(tp),
               windowCapacity));
@@ -227,7 +221,7 @@ public final class PipelineMetricsCollector
     return new PipelineMetricsSnapshot(
         name,
         recordsProcessed.sum(),
-        recordsFailed.sum(),
+        recordsDropped.sum(),
         recordsSkipped.sum(),
         new DurationStatsSnapshot(handlerAttempts.sum(), handlerNanos.sum()),
         pollCount.sum(),
@@ -239,7 +233,6 @@ public final class PipelineMetricsCollector
         retryAttempts.sum(),
         dlqSuccesses.sum(),
         dlqFailures.sum(),
-        finalFailures.sum(),
         commitSuccesses.sum(),
         commitFailures.sum(),
         processingTimeouts.sum(),

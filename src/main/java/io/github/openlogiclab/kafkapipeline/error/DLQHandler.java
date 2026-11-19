@@ -37,4 +37,19 @@ public interface DLQHandler<K, V> {
    * @throws Exception if sending to DLQ fails
    */
   void send(ConsumerRecord<K, V> record, Exception lastError) throws Exception;
+
+  /**
+   * Classifies a failed {@link #send}: a {@code TRANSIENT} failure is retried until the DLQ
+   * recovers (the record is never dropped because the DLQ is briefly down), a {@code FATAL} one
+   * stops the pipeline with the record unacked, and a {@code RECORD} failure means this record
+   * cannot be dead-lettered, so it is dropped after the {@link FinalFailureHandler}.
+   *
+   * <p>The default, {@link WriteFailure#of(Throwable)}, understands Kafka client errors.
+   *
+   * @param error the send failure
+   * @return its classification
+   */
+  default WriteFailure classify(Throwable error) {
+    return WriteFailure.of(error);
+  }
 }

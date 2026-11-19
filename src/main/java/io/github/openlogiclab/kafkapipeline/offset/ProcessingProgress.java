@@ -19,7 +19,7 @@ import org.apache.kafka.common.TopicPartition;
 
 /**
  * The record lifecycle as workers see it: register a record before dispatch, mark it in progress
- * when a worker starts it, and ack it when it is done (or failed and skipped).
+ * when a worker starts it, and ack it when it is done (or failed and was dropped).
  */
 public sealed interface ProcessingProgress extends PartitionGeneration permits OffsetTracker {
 
@@ -82,7 +82,7 @@ public sealed interface ProcessingProgress extends PartitionGeneration permits O
   int markBatchInProgress(TopicPartition tp, long[] offsets);
 
   /**
-   * Marks an offset as DONE (processing succeeded, sent to DLQ, or skipped). This advances the
+   * Marks an offset as DONE (processing succeeded, sent to DLQ, or dropped). This advances the
    * committable offset if the acked record is contiguous with previously completed records.
    *
    * @param tp the topic partition
@@ -101,11 +101,11 @@ public sealed interface ProcessingProgress extends PartitionGeneration permits O
   int ackBatch(TopicPartition tp, long[] offsets);
 
   /**
-   * Records that an unrecoverable failure occurred on this partition.
+   * Counts a record of this partition dropped after its retries (and the DLQ, if any) failed.
    *
    * @param tp the topic partition
    */
-  void markFailed(TopicPartition tp);
+  void markDropped(TopicPartition tp);
 
   /**
    * Like {@link #markInProgress(TopicPartition, long)}, but only if the partition's window is still

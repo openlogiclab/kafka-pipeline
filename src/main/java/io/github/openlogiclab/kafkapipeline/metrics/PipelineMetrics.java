@@ -46,9 +46,9 @@ import org.apache.kafka.common.TopicPartition;
  * <h2>Record outcomes</h2>
  *
  * <p>Every record the pipeline finishes is counted in exactly one of {@link #recordsProcessed},
- * {@link #recordsSkipped}, {@link #dlqSuccesses} or {@link #recordsFailed}. Records left unfinished
- * by shutdown or rebalance are not counted in any of them; they are redelivered (see {@link
- * #recordsAbandoned}).
+ * {@link #recordsSkipped}, {@link #dlqSuccesses} or {@link #recordsDropped}. Records left
+ * unfinished by shutdown or rebalance are not counted in any of them; they are redelivered (see
+ * {@link #recordsAbandoned}).
  *
  * <h2>Consistency</h2>
  *
@@ -67,8 +67,8 @@ import org.apache.kafka.common.TopicPartition;
  *     <td>Backpressure triggered: workers are slower than the poll rate</td>
  *   </tr>
  *   <tr>
- *     <td>Consumer lag growing</td>
- *     <td>{@code partitions().get(tp).lag()}, {@code retryAttempts}</td>
+ *     <td>Commits not advancing, records held back</td>
+ *     <td>{@code partitions().get(tp).uncommittedOffsets()}, {@code retryAttempts}</td>
  *     <td>Retry storms or a slow handler blocking workers</td>
  *   </tr>
  *   <tr>
@@ -79,11 +79,13 @@ import org.apache.kafka.common.TopicPartition;
  *   <tr>
  *     <td>Frequent rebalances</td>
  *     <td>{@code rebalanceCount}, {@code drainTimeouts}</td>
- *     <td>{@code max.poll.interval.ms} too low, or handler exceeds session timeout</td>
+ *     <td>Pods restarting or scaling without static membership, or {@code session.timeout.ms}
+ *       too low. Handler time does not count against {@code max.poll.interval.ms}: the poll thread
+ *       keeps polling while workers run.</td>
  *   </tr>
  *   <tr>
  *     <td>Data loss suspected</td>
- *     <td>{@code recordsFailed}, {@code dlqFailures}</td>
+ *     <td>{@code recordsDropped}, {@code dlqFailures}</td>
  *     <td>Records dropped after retries; check the DLQ and the final failure logs</td>
  *   </tr>
  *   <tr>
@@ -116,23 +118,24 @@ public sealed interface PipelineMetrics permits PipelineMetricsSnapshot {
   long recordsProcessed();
 
   /**
-   * Total records dropped since pipeline start: all retries failed and the record could not be sent
-   * to the DLQ, either because none is configured or because the send failed. (Counter)
+   * Total records dropped since pipeline start: given up on after the error strategy's retries
+   * without reaching a DLQ, because none is configured, {@code Fallback.DROP} bypasses it, or the
+   * DLQ send failed. (Counter)
    *
    * <p>This is data loss, so it is the counter to alert on. The {@link
-   * io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler} was invoked for each of these
+   * io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler} was called for each of these
    * records.
    *
    * @return records dropped
    */
-  long recordsFailed();
+  long recordsDropped();
 
   /**
    * Total records skipped by the lifecycle hook ({@code beforeProcess} returning {@code false})
    * since pipeline start. (Counter)
    *
    * <p>This is intentional filtering, not a failure. Records dropped after a failure are counted in
-   * {@link #recordsFailed} instead.
+   * {@link #recordsDropped} instead.
    *
    * @return records skipped by the hook
    */
@@ -191,7 +194,7 @@ public sealed interface PipelineMetrics permits PipelineMetricsSnapshot {
   BackpressureStatus backpressureStatus();
 
   /**
-   * Total times backpressure went from OK to THROTTLE or CRITICAL since pipeline start. (Counter)
+   * Total times backpressure went from OK to THROTTLE since pipeline start. (Counter)
    *
    * @return throttle events
    */
@@ -211,7 +214,7 @@ public sealed interface PipelineMetrics permits PipelineMetricsSnapshot {
    * Total records sent to the DLQ since pipeline start. (Counter)
    *
    * <p>When a batch's DLQ send fails partway, the records sent before the failure are counted here
-   * and the rest in {@link #recordsFailed}.
+   * and the rest in {@link #recordsDropped}.
    *
    * @return records sent to the DLQ
    */
@@ -223,14 +226,6 @@ public sealed interface PipelineMetrics permits PipelineMetricsSnapshot {
    * @return failed DLQ sends
    */
   long dlqFailures();
-
-  /**
-   * Total final failure handler invocations since pipeline start; one per record in {@link
-   * #recordsFailed}. (Counter)
-   *
-   * @return final failure handler invocations
-   */
-  long finalFailures();
 
   /**
    * Total successful offset commits (async and sync) since pipeline start. (Counter)

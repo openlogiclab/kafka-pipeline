@@ -15,18 +15,10 @@
  */
 package io.github.openlogiclab.kafkapipeline.backpressure;
 
-/**
- * Backpressure level reported by sensors and the controller. The Poller uses this to decide whether
- * to pause/resume Kafka partitions.
- */
+/** Whether the pipeline should keep fetching records. */
 public enum BackpressureStatus {
-
-  /** System is healthy. Polling can proceed normally. */
+  /** Below the thresholds: fetch normally. */
   OK,
-
-  /** System is under pressure. Poller should pause fetching. */
-  THROTTLE,
-
-  /** System is at critical capacity. Poller must stop immediately. */
-  CRITICAL
+  /** A threshold was reached: pause fetching on every partition until it drops back. */
+  THROTTLE
 }

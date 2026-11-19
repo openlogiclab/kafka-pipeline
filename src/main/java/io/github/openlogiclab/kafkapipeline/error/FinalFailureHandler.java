@@ -21,13 +21,13 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
  * Final preservation handler — the last chance to save a record before it is permanently dropped.
  *
  * <p>Called when all recovery options are exhausted (retries failed AND DLQ failed or not
- * configured). After this handler returns, the record is skipped, the <b>offset is committed</b>,
+ * configured). After this handler returns, the record is dropped, the <b>offset is committed</b>,
  * and the data is <b>permanently lost</b> from the pipeline's perspective.
  *
  * <h2>Trade-off</h2>
  *
  * <p>This library prioritizes <b>throughput over blocking on unprocessable data</b>. Records that
- * cannot be processed (after retries and DLQ) are skipped, and the offset advances immediately so
+ * cannot be processed (after retries and DLQ) are dropped, and the offset advances immediately so
  * the pipeline keeps moving. If this handler doesn't preserve the data, it cannot be recovered.
  * Choose your preservation strategy based on data criticality:
  *
@@ -53,7 +53,7 @@ public interface FinalFailureHandler<K, V> {
    *
    * <p>This is the final opportunity to capture the record before it is dropped. The implementation
    * should be resilient — if this handler throws, the exception is logged but the record is still
-   * skipped.
+   * dropped.
    *
    * @param record the failed record (contains key, value, topic, partition, offset, headers)
    * @param error the final exception (from DLQ failure or last processing attempt)

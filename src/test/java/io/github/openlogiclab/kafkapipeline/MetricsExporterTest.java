@@ -117,6 +117,8 @@ class MetricsExporterTest {
 
     startWithRecords(3);
     assertTrue(await(() -> exporter.attempts.size() == 3));
+    // The attempt event fires when the handler returns, just before the record is counted.
+    assertTrue(await(() -> exporter.binding.snapshot().recordsProcessed() == 3));
 
     assertEquals("orders-consumer", exporter.binding.pipelineName());
     assertEquals(3, exporter.binding.snapshot().recordsProcessed());
@@ -151,7 +153,7 @@ class MetricsExporterTest {
     startWithRecords(5);
 
     assertTrue(await(() -> pipeline.metrics().recordsProcessed() == 5));
-    assertEquals(0, pipeline.metrics().recordsFailed());
+    assertEquals(0, pipeline.metrics().recordsDropped());
     assertEquals(5, calls.get());
     assertTrue(await(() -> healthy.attempts.size() == 5), "later exporters still get events");
     assertTrue(pipeline.isRunning());

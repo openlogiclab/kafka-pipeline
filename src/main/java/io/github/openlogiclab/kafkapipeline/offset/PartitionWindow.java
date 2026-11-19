@@ -67,14 +67,13 @@ final class PartitionWindow {
   private final AtomicInteger pendingCount = new AtomicInteger(0);
   private final AtomicInteger inProgressCount = new AtomicInteger(0);
   private final AtomicInteger completedCount = new AtomicInteger(0);
-  private final AtomicInteger failureCount = new AtomicInteger(0);
-  private volatile boolean failed = false;
+  private final AtomicLong droppedCount = new AtomicLong();
   // When the committable offset last advanced, or the window last went from empty to non-empty.
   private volatile long lastAdvanceNanos = System.nanoTime();
 
   // Crash replay: offsets the previous owner finished beyond its committed offset (relative to
   // baseOffset, read-only after construction), and whether to encode our own finished offsets.
-  private volatile boolean trackCompleted;
+  private volatile boolean skipCompletedOnRestart;
   private final BitSet preDone;
   private final Object commitMonitor = new Object();
   private String committedMetadata; // guarded by commitMonitor
@@ -97,7 +96,8 @@ final class PartitionWindow {
    * @param startOffset first offset this consumer will fetch
    * @param maxWindowSize capacity
    * @param generation rebalance generation
-   * @param trackCompleted whether commit points carry the finished offsets beyond the committed one
+   * @param skipCompletedOnRestart whether commit points carry the finished offsets beyond the
+   *     committed one
    * @param preDone offsets (relative to {@code startOffset}) that a previous owner already
    *     finished; they are registered as DONE and never dispatched
    */
@@ -105,7 +105,7 @@ final class PartitionWindow {
       long startOffset,
       int maxWindowSize,
       long generation,
-      boolean trackCompleted,
+      boolean skipCompletedOnRestart,
       BitSet preDone) {
     if (maxWindowSize <= 0) {
       throw new IllegalArgumentException("maxWindowSize must be positive, got " + maxWindowSize);
@@ -115,14 +115,14 @@ final class PartitionWindow {
     this.committableOffset = new AtomicLong(startOffset);
     this.committedOffset = new AtomicLong(startOffset);
     this.maxWindowSize = maxWindowSize;
-    this.trackCompleted = trackCompleted;
-    this.preDone = trackCompleted ? (BitSet) preDone.clone() : new BitSet();
+    this.skipCompletedOnRestart = skipCompletedOnRestart;
+    this.preDone = skipCompletedOnRestart ? (BitSet) preDone.clone() : new BitSet();
     this.committedMetadata = CompletedOffsetsCodec.encode(startOffset, this.preDone);
   }
 
   /** Stops recording finished offsets in commit points; later points carry no metadata. */
-  void stopTrackingCompleted() {
-    trackCompleted = false;
+  void disableSkipCompletedOnRestart() {
+    skipCompletedOnRestart = false;
     version.incrementAndGet();
   }
 
@@ -439,7 +439,7 @@ final class PartitionWindow {
       // that keeps windowSize (and so the window pause) accurate.
       shrinkWindow();
       long c = committableOffset.get();
-      if (!trackCompleted) {
+      if (!skipCompletedOnRestart) {
         return new CommitPoint(c, "");
       }
       // Read the version before building, so a change made meanwhile forces a rebuild next time.
@@ -537,20 +537,14 @@ final class PartitionWindow {
     return windowSize.get() >= maxWindowSize;
   }
 
-  /** Returns true if any unrecoverable failure has occurred on this partition. */
-  boolean isFailed() {
-    return failed;
+  /** Counts a record dropped after its retries; called after the FinalFailureHandler. */
+  void markDropped() {
+    droppedCount.incrementAndGet();
   }
 
-  /** Records that an unrecoverable failure occurred. Called after FinalFailureHandler. */
-  void markFailed() {
-    failed = true;
-    failureCount.incrementAndGet();
-  }
-
-  /** Number of unrecoverable failures that have occurred on this partition. */
-  int failureCount() {
-    return failureCount.get();
+  /** Number of records dropped after their retries. */
+  long droppedCount() {
+    return droppedCount.get();
   }
 
   /** Milliseconds the committable offset has not moved while records wait; 0 if none wait. */
@@ -559,7 +553,8 @@ final class PartitionWindow {
     return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastAdvanceNanos);
   }
 
-  long lag() {
+  /** Offsets from the committable offset up to the highest registered one. */
+  long uncommittedOffsets() {
     long highest = highestRegistered.get();
     if (highest < 0) return 0;
     return highest + 1 - committableOffset.get();

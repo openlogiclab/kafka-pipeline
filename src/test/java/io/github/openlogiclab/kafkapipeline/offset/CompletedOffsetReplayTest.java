@@ -35,7 +35,7 @@ class CompletedOffsetReplayTest {
 
   /** First owner: offset 100 is stuck, 101..110 finish. Returns what it commits. */
   private static CommitPoint stuckHeadCommit() {
-    OffsetTracker first = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker first = new SlidingWindowOffsetTracker(1000, true);
     first.initPartition(TP, 100, null);
     for (long o = 100; o <= 110; o++) first.register(TP, o);
     for (long o = 101; o <= 110; o++) process(first, o);
@@ -48,7 +48,7 @@ class CompletedOffsetReplayTest {
     assertEquals(100, point.offset());
     assertFalse(point.metadata().isEmpty());
 
-    OffsetTracker second = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker second = new SlidingWindowOffsetTracker(1000, true);
     second.initPartition(TP, 100, point.metadata());
     List<Long> toProcess = new ArrayList<>();
     for (long o = 100; o <= 112; o++) {
@@ -67,14 +67,14 @@ class CompletedOffsetReplayTest {
   @Test
   void metadataForADifferentOffset_isIgnored() {
     CommitPoint point = stuckHeadCommit();
-    OffsetTracker second = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker second = new SlidingWindowOffsetTracker(1000, true);
     second.initPartition(TP, 99, point.metadata());
     for (long o = 99; o <= 110; o++) assertTrue(second.registerUnlessDone(TP, o));
   }
 
   @Test
   void disabled_neitherRecordsNorSkips() {
-    OffsetTracker tracker = new UnorderedOffsetTracker(1000, false);
+    OffsetTracker tracker = new SlidingWindowOffsetTracker(1000, false);
     tracker.initPartition(TP, 0, null);
     tracker.register(TP, 0);
     tracker.register(TP, 1);
@@ -82,14 +82,14 @@ class CompletedOffsetReplayTest {
     assertTrue(tracker.getAllCommitPoints().isEmpty(), "nothing to commit: head still running");
 
     CommitPoint point = stuckHeadCommit();
-    OffsetTracker second = new UnorderedOffsetTracker(1000, false);
+    OffsetTracker second = new SlidingWindowOffsetTracker(1000, false);
     second.initPartition(TP, 100, point.metadata());
     assertTrue(second.registerUnlessDone(TP, 101));
   }
 
   @Test
   void uncommitted_changesWhenFinishedSetChanges_evenIfOffsetDoesNot() {
-    OffsetTracker tracker = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker tracker = new SlidingWindowOffsetTracker(1000, true);
     tracker.initPartition(TP, 0, null);
     for (long o = 0; o < 5; o++) tracker.register(TP, o);
     assertTrue(tracker.getUncommittedCommitPoints().isEmpty());
@@ -115,7 +115,7 @@ class CompletedOffsetReplayTest {
   @Test
   void skippedOffsetsNotFetchedYet_survive_aSecondRestart() {
     CommitPoint point = stuckHeadCommit(); // 100 stuck, 101..110 done
-    OffsetTracker second = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker second = new SlidingWindowOffsetTracker(1000, true);
     second.initPartition(TP, 100, point.metadata());
     // The second owner only fetches 100..103 and finishes 100 before it too goes away.
     for (long o = 100; o <= 103; o++) second.registerUnlessDone(TP, o);
@@ -128,7 +128,7 @@ class CompletedOffsetReplayTest {
   @Test
   void skippedOffsetsBehindAGap_survive_aSecondRestart() {
     CommitPoint point = stuckHeadCommit(); // 100 stuck, 101..110 done
-    OffsetTracker second = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker second = new SlidingWindowOffsetTracker(1000, true);
     second.initPartition(TP, 100, point.metadata());
     for (long o = 100; o <= 103; o++) second.registerUnlessDone(TP, o);
     // 100 is still stuck in the second owner too; 111 (new) finishes.
@@ -136,7 +136,7 @@ class CompletedOffsetReplayTest {
     CommitPoint again = second.getAllCommitPoints().get(TP);
     assertEquals(100, again.offset());
 
-    OffsetTracker third = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker third = new SlidingWindowOffsetTracker(1000, true);
     third.initPartition(TP, 100, again.metadata());
     assertTrue(third.registerUnlessDone(TP, 100));
     for (long o = 101; o <= 110; o++) assertFalse(third.registerUnlessDone(TP, o), "offset " + o);
@@ -146,7 +146,7 @@ class CompletedOffsetReplayTest {
   @Test
   void batchRegistration_leavesOutFinishedOffsets() {
     CommitPoint point = stuckHeadCommit();
-    OffsetTracker second = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker second = new SlidingWindowOffsetTracker(1000, true);
     second.initPartition(TP, 100, point.metadata());
 
     assertArrayEquals(
@@ -164,7 +164,7 @@ class CompletedOffsetReplayTest {
   @Test
   void batchRegistration_rejectsDuplicates() {
     CommitPoint point = stuckHeadCommit();
-    OffsetTracker second = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker second = new SlidingWindowOffsetTracker(1000, true);
     second.initPartition(TP, 100, point.metadata());
     second.registerBatchUnlessDone(TP, new long[] {100, 101});
     assertThrows(
@@ -177,7 +177,7 @@ class CompletedOffsetReplayTest {
   @Test
   void skippedOffsets_countTowardTheWindowLimit() {
     CommitPoint point = stuckHeadCommit();
-    OffsetTracker second = new UnorderedOffsetTracker(3, true);
+    OffsetTracker second = new SlidingWindowOffsetTracker(3, true);
     second.initPartition(TP, 100, point.metadata());
     second.registerUnlessDone(TP, 100);
     second.registerUnlessDone(TP, 101);
@@ -189,7 +189,7 @@ class CompletedOffsetReplayTest {
 
   @Test
   void allCommitPoints_includesPartitionThatOnlyHasFinishedOffsets() {
-    OffsetTracker tracker = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker tracker = new SlidingWindowOffsetTracker(1000, true);
     tracker.initPartition(TP, 0, null);
     tracker.register(TP, 0);
     tracker.register(TP, 1);
@@ -202,7 +202,7 @@ class CompletedOffsetReplayTest {
 
   @Test
   void markCommittedWithOlderPoint_isIgnored() {
-    OffsetTracker tracker = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker tracker = new SlidingWindowOffsetTracker(1000, true);
     tracker.initPartition(TP, 0, null);
     for (long o = 0; o < 3; o++) tracker.register(TP, o);
     for (long o = 0; o < 3; o++) process(tracker, o);
@@ -216,7 +216,7 @@ class CompletedOffsetReplayTest {
   @Test
   void sparseOffsets_doNotAllocateABitmapTheSizeOfTheGap() {
     // A compacted topic: the next live record after the stuck one is a billion offsets later.
-    OffsetTracker tracker = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker tracker = new SlidingWindowOffsetTracker(1000, true);
     tracker.initPartition(TP, 0, null);
     tracker.register(TP, 0);
     tracker.register(TP, 5);
@@ -232,7 +232,7 @@ class CompletedOffsetReplayTest {
     assertTrue(after - before < 16L << 20, "allocated " + ((after - before) >> 20) + " MB");
 
     // The offsets that fit are still recorded; the far one is just processed again.
-    OffsetTracker next = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker next = new SlidingWindowOffsetTracker(1000, true);
     next.initPartition(TP, 0, point.metadata());
     assertTrue(next.registerUnlessDone(TP, 0));
     assertFalse(next.registerUnlessDone(TP, 5));
@@ -241,7 +241,7 @@ class CompletedOffsetReplayTest {
 
   @Test
   void registerBatchUnlessDone_rejectsNull() {
-    OffsetTracker tracker = new UnorderedOffsetTracker(100, true);
+    OffsetTracker tracker = new SlidingWindowOffsetTracker(100, true);
     tracker.initPartition(TP, 0, null);
     assertThrows(IllegalArgumentException.class, () -> tracker.registerBatchUnlessDone(TP, null));
   }
@@ -249,7 +249,7 @@ class CompletedOffsetReplayTest {
   @Test
   void offsetsOutsideThePreviousOwnersRange_areNotSkipped() {
     CommitPoint point = stuckHeadCommit(); // 100 stuck, 101..110 done
-    OffsetTracker next = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker next = new SlidingWindowOffsetTracker(1000, true);
     next.initPartition(TP, 100, point.metadata());
     assertTrue(next.registerUnlessDone(TP, 100), "the start offset is never done");
     assertFalse(next.registerUnlessDone(TP, 101));
@@ -258,7 +258,7 @@ class CompletedOffsetReplayTest {
 
   @Test
   void commitConfirmedAheadOfThisWindow_isNotRecommitted() {
-    OffsetTracker tracker = new UnorderedOffsetTracker(1000, true);
+    OffsetTracker tracker = new SlidingWindowOffsetTracker(1000, true);
     tracker.initPartition(TP, 0, null);
     tracker.register(TP, 0);
     tracker.register(TP, 1);

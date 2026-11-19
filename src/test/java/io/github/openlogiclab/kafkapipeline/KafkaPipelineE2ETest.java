@@ -17,10 +17,10 @@ package io.github.openlogiclab.kafkapipeline;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureSensor;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureStatus;
 import io.github.openlogiclab.kafkapipeline.backpressure.ByteBackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.backpressure.RecordBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
@@ -314,10 +314,10 @@ class KafkaPipelineE2ETest {
   // ── Error Handling: Skip ─────────────────────────────────────
 
   @Nested
-  class SkipFallback {
+  class DropFallback {
 
     @Test
-    void failedRecordSkippedAndOffsetAdvances() throws Exception {
+    void failedRecordDroppedAndOffsetAdvances() throws Exception {
       CopyOnWriteArrayList<String> processed = new CopyOnWriteArrayList<>();
 
       PipelineConfig<String, String> config =
@@ -329,7 +329,7 @@ class KafkaPipelineE2ETest {
                     }
                     processed.add(record.value());
                   })
-              .errorStrategy(ErrorStrategy.skipOnError())
+              .errorStrategy(ErrorStrategy.dropOnError())
               .build();
 
       pipeline = new KafkaPipeline<>(config, mockConsumer);
@@ -349,9 +349,9 @@ class KafkaPipelineE2ETest {
 
       PipelineMetrics m = pipeline.metrics();
       assertEquals(2, m.recordsProcessed(), "Two good records processed");
-      assertEquals(1, m.recordsFailed(), "One poison record dropped");
+      assertEquals(1, m.recordsDropped(), "One poison record dropped");
       assertEquals(0, m.recordsSkipped(), "A dropped record is not a hook skip");
-      assertEquals(1, m.finalFailures(), "Final failure handler ran once");
+      assertEquals(1, m.recordsDropped(), "Final failure handler ran once");
 
       Map<TopicPartition, OffsetAndMetadata> committed = mockConsumer.committed(Set.of(TP0));
       assertNotNull(committed.get(TP0));
@@ -422,7 +422,7 @@ class KafkaPipelineE2ETest {
                   record -> {
                     if (record.offset() == 1L) throw new RuntimeException("fail");
                   })
-              .errorStrategy(ErrorStrategy.skipOnError())
+              .errorStrategy(ErrorStrategy.dropOnError())
               .lifecycleHook(
                   new ProcessingLifecycleHook<>() {
                     @Override
@@ -519,11 +519,10 @@ class KafkaPipelineE2ETest {
       PipelineConfig<String, String> config =
           baseBuilder()
               .concurrency(ThreadMode.PLATFORM, 2)
-              .backpressure(
-                  BackpressureConfig.builder()
+              .recordBackpressure(
+                  RecordBackpressureConfig.builder()
                       .highWatermark(highWatermark)
                       .lowWatermark(5)
-                      .criticalThreshold(20)
                       .build())
               .handler(
                   record -> {
@@ -787,14 +786,14 @@ class KafkaPipelineE2ETest {
     }
 
     @Test
-    void batchModeWithSkipFallback() throws Exception {
+    void batchModeWithDropFallback() throws Exception {
       PipelineConfig<String, String> config =
           baseBuilder()
               .batchHandler(
                   (tp, records) -> {
                     throw new RuntimeException("Always fails");
                   })
-              .errorStrategy(ErrorStrategy.skipOnError())
+              .errorStrategy(ErrorStrategy.dropOnError())
               .build();
 
       pipeline = new KafkaPipeline<>(config, mockConsumer);
@@ -807,7 +806,7 @@ class KafkaPipelineE2ETest {
       pipeline.awaitShutdown();
 
       Map<TopicPartition, OffsetAndMetadata> committed = mockConsumer.committed(Set.of(TP0));
-      assertNotNull(committed.get(TP0), "Skipped batch should still advance offset");
+      assertNotNull(committed.get(TP0), "A dropped batch still advances the offset");
       assertEquals(5L, committed.get(TP0).offset());
     }
 
@@ -878,11 +877,10 @@ class KafkaPipelineE2ETest {
       PipelineConfig<String, String> config =
           baseBuilder()
               .concurrency(ThreadMode.PLATFORM, 2)
-              .backpressure(
-                  BackpressureConfig.builder()
+              .recordBackpressure(
+                  RecordBackpressureConfig.builder()
                       .highWatermark(highWatermark)
                       .lowWatermark(5)
-                      .criticalThreshold(20)
                       .build())
               .batchHandler(
                   (tp, records) -> {
@@ -1002,17 +1000,12 @@ class KafkaPipelineE2ETest {
       PipelineConfig<String, String> config =
           baseBuilder()
               .concurrency(ThreadMode.PLATFORM, 2)
-              .backpressure(
-                  BackpressureConfig.builder()
-                      .highWatermark(100)
-                      .lowWatermark(50)
-                      .criticalThreshold(200)
-                      .build())
+              .recordBackpressure(
+                  RecordBackpressureConfig.builder().highWatermark(100).lowWatermark(50).build())
               .byteBackpressure(
                   ByteBackpressureConfig.builder()
                       .lowWatermarkBytes(50)
                       .highWatermarkBytes(100)
-                      .criticalThresholdBytes(500)
                       .build())
               .handler(
                   record -> {
@@ -1053,7 +1046,6 @@ class KafkaPipelineE2ETest {
                   ByteBackpressureConfig.builder()
                       .lowWatermarkBytes(50)
                       .highWatermarkBytes(100)
-                      .criticalThresholdBytes(500)
                       .build())
               .build();
 
@@ -1086,7 +1078,7 @@ class KafkaPipelineE2ETest {
       BackpressureSensor customSensor =
           new BackpressureSensor() {
             @Override
-            public BackpressureStatus currentStatus() {
+            public BackpressureStatus evaluate() {
               sensorChecks.incrementAndGet();
               return BackpressureStatus.OK;
             }
@@ -1132,7 +1124,7 @@ class KafkaPipelineE2ETest {
       BackpressureSensor throttlingSensor =
           new BackpressureSensor() {
             @Override
-            public BackpressureStatus currentStatus() {
+            public BackpressureStatus evaluate() {
               sensorChecks.incrementAndGet();
               return throttleActive.get() ? BackpressureStatus.THROTTLE : BackpressureStatus.OK;
             }

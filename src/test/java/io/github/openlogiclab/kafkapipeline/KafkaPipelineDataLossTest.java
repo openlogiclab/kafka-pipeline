@@ -17,7 +17,7 @@ package io.github.openlogiclab.kafkapipeline;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.backpressure.RecordBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import java.time.Duration;
 import java.util.List;
@@ -133,12 +133,8 @@ class KafkaPipelineDataLossTest {
     PipelineConfig<String, String> config =
         baseBuilder(5)
             .concurrency(ThreadMode.PLATFORM, 1)
-            .backpressure(
-                BackpressureConfig.builder()
-                    .highWatermark(5)
-                    .lowWatermark(2)
-                    .criticalThreshold(50)
-                    .build())
+            .recordBackpressure(
+                RecordBackpressureConfig.builder().highWatermark(5).lowWatermark(2).build())
             .handler(
                 record -> {
                   blockOnFirstRecord(TP0, record);

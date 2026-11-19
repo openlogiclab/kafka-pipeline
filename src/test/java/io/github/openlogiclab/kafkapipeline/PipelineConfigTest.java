@@ -17,7 +17,7 @@ package io.github.openlogiclab.kafkapipeline;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
+import io.github.openlogiclab.kafkapipeline.backpressure.RecordBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import java.time.Duration;
@@ -272,11 +272,11 @@ class PipelineConfigTest {
     @Test
     void defaultBackpressure() {
       PipelineConfig<String, String> config = minimalBuilder().build();
-      assertEquals(BackpressureConfig.defaults(), config.backpressure());
+      assertEquals(RecordBackpressureConfig.defaults(), config.recordBackpressure());
     }
 
     @Test
-    void defaultErrorStrategy_isSkipOnError() {
+    void defaultErrorStrategy_isDropOnError() {
       PipelineConfig<String, String> config = minimalBuilder().build();
       assertEquals(0, config.errorStrategy().maxRetries());
       assertNotNull(config.errorStrategy().finalFailureHandler());
@@ -338,15 +338,11 @@ class PipelineConfigTest {
 
     @Test
     void customBackpressure() {
-      BackpressureConfig bp =
-          BackpressureConfig.builder()
-              .highWatermark(500)
-              .lowWatermark(300)
-              .criticalThreshold(1000)
-              .build();
+      RecordBackpressureConfig bp =
+          RecordBackpressureConfig.builder().highWatermark(500).lowWatermark(300).build();
 
-      PipelineConfig<String, String> config = minimalBuilder().backpressure(bp).build();
-      assertEquals(500, config.backpressure().highWatermark());
+      PipelineConfig<String, String> config = minimalBuilder().recordBackpressure(bp).build();
+      assertEquals(500, config.recordBackpressure().highWatermark());
     }
 
     @Test

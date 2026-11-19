@@ -32,7 +32,7 @@ import org.apache.kafka.common.TopicPartition;
  *
  * @param name see {@link PipelineMetrics#name()}
  * @param recordsProcessed see {@link PipelineMetrics#recordsProcessed()}
- * @param recordsFailed see {@link PipelineMetrics#recordsFailed()}
+ * @param recordsDropped see {@link PipelineMetrics#recordsDropped()}
  * @param recordsSkipped see {@link PipelineMetrics#recordsSkipped()}
  * @param handlerDuration see {@link PipelineMetrics#handlerDuration()}
  * @param pollCount see {@link PipelineMetrics#pollCount()}
@@ -44,7 +44,6 @@ import org.apache.kafka.common.TopicPartition;
  * @param retryAttempts see {@link PipelineMetrics#retryAttempts()}
  * @param dlqSuccesses see {@link PipelineMetrics#dlqSuccesses()}
  * @param dlqFailures see {@link PipelineMetrics#dlqFailures()}
- * @param finalFailures see {@link PipelineMetrics#finalFailures()}
  * @param commitSuccesses see {@link PipelineMetrics#commitSuccesses()}
  * @param commitFailures see {@link PipelineMetrics#commitFailures()}
  * @param processingTimeouts see {@link PipelineMetrics#processingTimeouts()}
@@ -56,7 +55,7 @@ import org.apache.kafka.common.TopicPartition;
 public record PipelineMetricsSnapshot(
     String name,
     long recordsProcessed,
-    long recordsFailed,
+    long recordsDropped,
     long recordsSkipped,
     DurationStats handlerDuration,
     long pollCount,
@@ -68,7 +67,6 @@ public record PipelineMetricsSnapshot(
     long retryAttempts,
     long dlqSuccesses,
     long dlqFailures,
-    long finalFailures,
     long commitSuccesses,
     long commitFailures,
     long processingTimeouts,

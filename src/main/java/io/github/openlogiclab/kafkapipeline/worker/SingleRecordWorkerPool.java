@@ -18,31 +18,46 @@ package io.github.openlogiclab.kafkapipeline.worker;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingContext;
 import io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook;
 import io.github.openlogiclab.kafkapipeline.handler.RecordHandler;
 import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
+import io.github.openlogiclab.kafkapipeline.internal.ProcessorBinding;
 import io.github.openlogiclab.kafkapipeline.internal.RecordSize;
 import io.github.openlogiclab.kafkapipeline.internal.WorkerMetrics;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.offset.ProcessingProgress;
 import io.github.openlogiclab.kafkapipeline.offset.WindowFullException;
+import io.github.openlogiclab.kafkapipeline.sink.SinkContext;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
 
 /**
- * Per-record processing mode. Worker threads pull from {@link RecordDispatcher} queues and execute:
+ * Per-record processing mode. Worker threads take records from the {@link RecordDispatcher}'s lanes
+ * and run:
  *
  * <pre>
  *   markInProgress → hook.beforeProcess
- *       → handler.handle (with retry)
- *       → success: hook.afterProcess → ack
- *       → failure: DLQ → FinalFailureHandler → skip
+ *       → processor (with retries; a plain handler is a processor with no outputs)
+ *       → no outputs:   hook.afterProcess → ack
+ *       → outputs:      sink.write, the worker moves on   ({@link SinkWrites})
+ *             → durable: hook.afterProcess → ack
+ *             → failed:  retry the write → DLQ → FinalFailureHandler → drop
+ *       → failure: DLQ → FinalFailureHandler → drop
  * </pre>
+ *
+ * <p>The record holds its in-flight slot (global backpressure) and its dispatcher slot (ordering,
+ * per-partition limit) until it is acked or dropped, including while its write is in flight.
  *
  * @param <K> record key type
  * @param <V> record value type
@@ -52,7 +67,15 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private static final System.Logger logger =
       System.getLogger(SingleRecordWorkerPool.class.getName());
 
-  private final RecordHandler<K, V> handler;
+  /**
+   * How long an idle worker waits for a record before checking whether the pool is stopping.
+   * Dispatching wakes a waiting worker at once, so this only bounds the cost of a missed wakeup and
+   * how quickly an idle worker notices shutdown.
+   */
+  private static final long IDLE_WAIT_MILLIS = 100;
+
+  private final ProcessorBinding<K, V, ?> binding;
+  private final SinkWrites writes;
   private final ProcessingLifecycleHook<K, V> hook;
   private final RetryExecutor<K, V> retryExecutor;
   private final ProcessingProgress offsetTracker;
@@ -84,15 +107,54 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
       RecordDispatcher<K, V> dispatcher,
       InFlightCounter counter,
       WorkerMetrics metrics) {
+    this(
+        concurrency,
+        threadMode,
+        ProcessorBinding.forHandler(handler),
+        hook,
+        retryExecutor,
+        offsetTracker,
+        dispatcher,
+        counter,
+        metrics);
+  }
+
+  /**
+   * Creates a worker pool that runs a processor and writes its outputs to a sink. A record is acked
+   * only once its outputs are durable; until then it stays in flight for backpressure, in progress
+   * in its partition window, and holds its key or partition slot in ordered modes.
+   *
+   * @param concurrency number of worker threads
+   * @param threadMode platform or virtual threads
+   * @param binding the processor and its sink (or a handler bound as a processor without outputs)
+   * @param hook the lifecycle hook
+   * @param retryExecutor the retry executor; its error strategy also governs write retries
+   * @param offsetTracker the offset tracker
+   * @param dispatcher the record dispatcher
+   * @param counter the in-flight counter
+   * @param metrics the worker metrics
+   */
+  public SingleRecordWorkerPool(
+      int concurrency,
+      ThreadMode threadMode,
+      ProcessorBinding<K, V, ?> binding,
+      ProcessingLifecycleHook<K, V> hook,
+      RetryExecutor<K, V> retryExecutor,
+      ProcessingProgress offsetTracker,
+      RecordDispatcher<K, V> dispatcher,
+      InFlightCounter counter,
+      WorkerMetrics metrics) {
     super(concurrency, threadMode, "kafka-pipeline-worker-", 0);
-    this.handler = handler;
+    this.binding = binding;
     this.hook = hook;
     this.retryExecutor = retryExecutor;
     this.offsetTracker = offsetTracker;
     this.dispatcher = dispatcher;
     this.counter = counter;
     this.metrics = metrics;
-    this.failures = new FailureResolver<>(retryExecutor, offsetTracker);
+    this.failures =
+        new FailureResolver<>(retryExecutor, offsetTracker, this::stopping, this::escalateFatal);
+    this.writes = new SinkWrites(retryExecutor, this::stopping, this::escalateFatal);
   }
 
   @Override
@@ -147,6 +209,75 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     return rejected;
   }
 
+  /**
+   * Stops the workers, then waits for writes still in flight, within the same timeout: sinks are
+   * flushed for every assigned partition, and records whose writes complete in time are acked, so
+   * the final commit includes them. Writes still pending after that are abandoned; their records
+   * are not acked and are redelivered.
+   *
+   * @param timeoutMs max time to wait in milliseconds
+   */
+  @Override
+  public void stop(long timeoutMs) {
+    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+    super.stop(timeoutMs);
+    try {
+      if (binding.sink() != null) {
+        flushSink(deadline);
+        if (!writes.awaitIdle(deadline)) {
+          logger.log(
+              System.Logger.Level.WARNING,
+              "{0} sink writes still pending at shutdown; their records will be redelivered",
+              writes.pending());
+        }
+      }
+    } finally {
+      writes.close();
+    }
+  }
+
+  private void flushSink(long deadline) {
+    List<CompletableFuture<Void>> flushes = new ArrayList<>();
+    for (TopicPartition tp : dispatcher.partitions()) {
+      try {
+        flushes.add(binding.sink().flush(tp).toCompletableFuture());
+      } catch (Throwable t) {
+        FatalErrors.rethrowIfJvmFatal(t);
+        logger.log(System.Logger.Level.WARNING, "Sink flush failed for " + tp, t);
+      }
+    }
+    if (flushes.isEmpty()) return;
+    try {
+      CompletableFuture.allOf(flushes.toArray(CompletableFuture[]::new))
+          .get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (ExecutionException | java.util.concurrent.TimeoutException e) {
+      logger.log(System.Logger.Level.WARNING, "Sink flush did not finish at shutdown", e);
+    }
+  }
+
+  @Override
+  protected void onStopping() {
+    retryExecutor.beginShutdown(); // ends processor-retry, write-retry and DLQ backoffs at once
+  }
+
+  @Override
+  public void onPartitionsDraining(Collection<TopicPartition> partitions) {
+    writes.draining(partitions);
+  }
+
+  @Override
+  public void onPartitionsDrained(Collection<TopicPartition> partitions) {
+    writes.drained(partitions);
+    retryExecutor.partitionsChanged(); // retries of their records give up at once
+  }
+
+  /** Number of records whose sink write is still in flight (for tests). */
+  int pendingWrites() {
+    return writes.pending();
+  }
+
   @Override
   public boolean canResume(TopicPartition tp) {
     return dispatcher.hasDrained(tp);
@@ -155,12 +286,15 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
   private void workerLoop() {
     while (running.get()) {
       try {
-        RecordDispatcher.PollResult<K, V> result = dispatcher.poll(100, MILLISECONDS);
+        RecordDispatcher.PollResult<K, V> result = dispatcher.poll(IDLE_WAIT_MILLIS, MILLISECONDS);
         if (result != null) {
+          Completion done = new Completion(result);
+          boolean deferred = false;
           try {
-            processRecord(result.partition(), result.record(), result.generation());
+            deferred = process(result, done);
           } finally {
-            dispatcher.release(result);
+            // A record whose write is in flight is finished by the write's outcome instead.
+            if (!deferred) done.finish();
           }
         }
       } catch (Throwable t) {
@@ -182,17 +316,38 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     }
   }
 
-  private void processRecord(TopicPartition tp, ConsumerRecord<K, V> record, long generation) {
-    try {
-      process(tp, record, generation);
-    } finally {
-      // Always release the in-flight slot, even if the partition was revoked mid-processing and
-      // the ack below failed; otherwise backpressure would never drain.
-      counter.completed(1, RecordSize.estimateBytes(record));
+  /**
+   * Releases what a polled record holds, exactly once: its in-flight slot (backpressure) and its
+   * dispatcher slot (per-partition limit, key or partition order). Always runs, even if the
+   * partition was revoked meanwhile and the ack failed; otherwise backpressure would never drain.
+   */
+  private final class Completion {
+    private final RecordDispatcher.PollResult<K, V> result;
+    private final AtomicBoolean finished = new AtomicBoolean();
+
+    Completion(RecordDispatcher.PollResult<K, V> result) {
+      this.result = result;
+    }
+
+    void finish() {
+      if (!finished.compareAndSet(false, true)) return;
+      try {
+        counter.completed(1, RecordSize.estimateBytes(result.record()));
+      } finally {
+        dispatcher.release(result);
+      }
     }
   }
 
-  private void process(TopicPartition tp, ConsumerRecord<K, V> record, long generation) {
+  /**
+   * Processes a record and starts writing its outputs.
+   *
+   * @return true if a write is in flight and its outcome will finish the record
+   */
+  private boolean process(RecordDispatcher.PollResult<K, V> result, Completion done) {
+    TopicPartition tp = result.partition();
+    ConsumerRecord<K, V> record = result.record();
+    long generation = result.generation();
     long offset = record.offset();
     try {
       offsetTracker.markInProgress(tp, offset, generation);
@@ -203,39 +358,112 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
           offset,
           tp,
           e.getMessage());
-      return;
+      return false;
     }
 
     if (skippedByHook(record, new ProcessingContext(tp, offset, 0))) {
       ack(tp, offset, generation);
       metrics.recordSkipped(1);
-      return;
+      return false;
     }
+    return run(binding, tp, record, generation, done);
+  }
 
+  private <O> boolean run(
+      ProcessorBinding<K, V, O> binding,
+      TopicPartition tp,
+      ConsumerRecord<K, V> record,
+      long generation,
+      Completion done) {
+    long offset = record.offset();
     String desc = "offset " + offset;
     int[] lastAttempt = {0};
+    List<O> outputs = new ArrayList<>(1);
     Exception lastError =
         retryExecutor.executeWithRetries(
             attempt -> {
               lastAttempt[0] = attempt;
-              handleOnce(record, new ProcessingContext(tp, offset, attempt));
+              outputs.clear();
+              outputs.addAll(
+                  processOnce(binding, record, new ProcessingContext(tp, offset, attempt)));
             },
             tp,
             desc,
-            this::stopping);
+            this::stopping,
+            () -> owns(offsetTracker, tp, generation));
 
-    if (lastError == null) {
-      // Outside the retry loop: a hook that throws must not re-run a handler that succeeded.
-      notifyAfterProcess(record, new ProcessingContext(tp, offset, lastAttempt[0]));
-      ack(tp, offset, generation);
-      metrics.recordProcessed(1);
-      return;
+    if (lastError != null) {
+      failures.resolve(
+          List.of(record),
+          tp,
+          lastError,
+          desc,
+          () -> ack(tp, offset, generation),
+          () -> owns(offsetTracker, tp, generation));
+      return false;
     }
 
-    failures.resolve(List.of(record), tp, lastError, desc, () -> ack(tp, offset, generation));
+    ProcessingContext ctx = new ProcessingContext(tp, offset, lastAttempt[0]);
+    if (outputs.isEmpty()) {
+      succeeded(record, ctx, generation);
+      return false;
+    }
+
+    writes.write(
+        binding,
+        new SinkContext(tp, offset, record.headers()),
+        List.copyOf(outputs),
+        () -> owns(offsetTracker, tp, generation),
+        new SinkWrites.Outcome() {
+          @Override
+          public void succeeded() {
+            try {
+              SingleRecordWorkerPool.this.succeeded(record, ctx, generation);
+            } finally {
+              done.finish();
+            }
+          }
+
+          @Override
+          public void failed(Exception error) {
+            try {
+              failures.resolve(
+                  List.of(record),
+                  tp,
+                  error,
+                  "sink write of " + desc,
+                  () -> ack(tp, offset, generation),
+                  () -> owns(offsetTracker, tp, generation));
+            } finally {
+              done.finish();
+            }
+          }
+
+          @Override
+          public void abandoned(Exception reason) {
+            try {
+              logger.log(
+                  System.Logger.Level.DEBUG,
+                  "Sink write for {0} {1} abandoned ({2}), not acking; it will be redelivered",
+                  tp,
+                  desc,
+                  reason.toString());
+            } finally {
+              done.finish();
+            }
+          }
+        });
+    return true;
   }
 
-  /** Asks the hook whether to skip the record; a hook that throws does not skip it. */
+  /** The record is done: its processing succeeded and its outputs, if any, are durable. */
+  private void succeeded(ConsumerRecord<K, V> record, ProcessingContext ctx, long generation) {
+    // Outside the retry loop: a hook that throws must not re-run a processor that succeeded.
+    notifyAfterProcess(record, ctx);
+    ack(ctx.partition(), ctx.offset(), generation);
+    metrics.recordProcessed(1);
+  }
+
   private boolean skippedByHook(ConsumerRecord<K, V> record, ProcessingContext ctx) {
     try {
       return !hook.beforeProcess(record, ctx);
@@ -250,9 +478,11 @@ public final class SingleRecordWorkerPool<K, V> extends WorkerPool<K, V> {
     }
   }
 
-  private void handleOnce(ConsumerRecord<K, V> record, ProcessingContext ctx) throws Exception {
+  private <O> List<O> processOnce(
+      ProcessorBinding<K, V, O> binding, ConsumerRecord<K, V> record, ProcessingContext ctx)
+      throws Exception {
     try {
-      handler.handle(record);
+      return binding.process(record);
     } catch (Exception e) {
       notifyError(record, ctx, e);
       throw e;

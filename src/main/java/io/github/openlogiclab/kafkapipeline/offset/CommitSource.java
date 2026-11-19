@@ -53,5 +53,5 @@ public sealed interface CommitSource permits OffsetTracker {
    * when the broker rejects the metadata as too large ({@code offset.metadata.max.bytes}), so
    * commits fall back to plain offsets instead of failing every time.
    */
-  void stopTrackingCompleted();
+  void disableSkipCompletedOnRestart();
 }

@@ -16,6 +16,7 @@
 package io.github.openlogiclab.kafkapipeline.dispatch;
 
 import io.github.openlogiclab.kafkapipeline.ProcessingOrder;
+import io.github.openlogiclab.kafkapipeline.internal.LogRateLimit;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
@@ -31,11 +32,11 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
 
 /**
- * Routes records from the Poller to per-partition queues. Workers pull from these queues for
+ * Routes records from the poll thread to per-partition lanes. Workers pull from these lanes for
  * processing.
  *
- * <p>Thread-safe: the Poller thread dispatches, worker threads poll, and rebalance callbacks
- * add/remove queues.
+ * <p>Thread-safe: the poll thread dispatches, worker threads poll, and rebalance callbacks
+ * add/remove lanes.
  *
  * @param <K> the record key type
  * @param <V> the record value type
@@ -44,7 +45,7 @@ public final class RecordDispatcher<K, V> {
 
   private static final System.Logger logger = System.getLogger(RecordDispatcher.class.getName());
 
-  private final ConcurrentHashMap<TopicPartition, Lane<K, V>> queues = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<TopicPartition, Lane<K, V>> lanes = new ConcurrentHashMap<>();
   // In-flight state that outlives a partition's queue: a record still running from before a revoke
   // keeps counting against the partition (and keeps its key busy) after the partition comes back.
   private final ConcurrentHashMap<TopicPartition, AtomicInteger> activeByPartition =
@@ -68,13 +69,11 @@ public final class RecordDispatcher<K, V> {
   private final Object retainedStateLock = new Object();
 
   // Approximate number of queued records, used to decide whether to wake another worker. It can
-  // briefly lag the queues; the park timeout in poll() bounds the cost of a missed wakeup.
+  // briefly lag the lanes; the park timeout in poll() bounds the cost of a missed wakeup.
   private final AtomicInteger queued = new AtomicInteger();
 
-  // Rate limit for the "queue full" warning: at most one log line per interval.
-  private static final long QUEUE_FULL_LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
-  private final AtomicLong lastQueueFullLogNanos =
-      new AtomicLong(System.nanoTime() - QUEUE_FULL_LOG_INTERVAL_NANOS);
+  // The "queue full" warning is logged at most once per interval, with a count.
+  private final LogRateLimit queueFullLog = new LogRateLimit();
   private final AtomicLong queueFullBlocks = new AtomicLong();
 
   // Cached snapshot of partition entries, rebuilt only on addPartition/removePartition.
@@ -232,7 +231,7 @@ public final class RecordDispatcher<K, V> {
   }
 
   private void addLane(TopicPartition tp, long generation) {
-    queues.computeIfAbsent(
+    lanes.computeIfAbsent(
         tp,
         t -> {
           AtomicInteger active = activeByPartition.computeIfAbsent(t, x -> new AtomicInteger());
@@ -256,7 +255,7 @@ public final class RecordDispatcher<K, V> {
    * @return the drained records
    */
   public List<ConsumerRecord<K, V>> removePartition(TopicPartition tp) {
-    Lane<K, V> lane = queues.remove(tp);
+    Lane<K, V> lane = lanes.remove(tp);
     rebuildSnapshot();
     if (lane == null) return List.of();
     List<ConsumerRecord<K, V>> drained = lane.queue.drain();
@@ -281,7 +280,7 @@ public final class RecordDispatcher<K, V> {
    * revoked while busy and never assigned back does not keep its state forever.
    */
   private void dropRetainedStateIfIdle(TopicPartition tp, Lane<K, V> lane) {
-    if (queues.get(tp) != null) return; // assigned again: the new queue uses this state
+    if (lanes.get(tp) != null) return; // assigned again: the new queue uses this state
     if (lane.active.get() == 0) activeByPartition.remove(tp, lane.active);
     KeyedLaneQueue.KeyGuard guard = keyGuards.get(tp);
     if (guard != null && guard.idle()) keyGuards.remove(tp, guard);
@@ -289,7 +288,7 @@ public final class RecordDispatcher<K, V> {
 
   @SuppressWarnings("unchecked")
   private void rebuildSnapshot() {
-    Lane<K, V>[] snap = queues.values().toArray(new Lane[0]);
+    Lane<K, V>[] snap = lanes.values().toArray(new Lane[0]);
     partitionSnapshot = snap;
     if (order != ProcessingOrder.PARTITION && maxConcurrencyPerPartition > 0) {
       int fairShare = snap.length == 0 ? 0 : (concurrency + snap.length - 1) / snap.length;
@@ -350,10 +349,7 @@ public final class RecordDispatcher<K, V> {
    */
   public void reportFull(TopicPartition tp) {
     long blocks = queueFullBlocks.incrementAndGet();
-    long now = System.nanoTime();
-    long last = lastQueueFullLogNanos.get();
-    if (now - last >= QUEUE_FULL_LOG_INTERVAL_NANOS
-        && lastQueueFullLogNanos.compareAndSet(last, now)) {
+    if (queueFullLog.tryAcquire()) {
       queueFullBlocks.addAndGet(-blocks);
       logger.log(
           System.Logger.Level.WARNING,
@@ -368,7 +364,7 @@ public final class RecordDispatcher<K, V> {
   /**
    * Wakes up to {@code records} waiting workers. Call once after dispatching a batch of records,
    * rather than per record, to avoid redundant syscalls. Waking more workers than there are records
-   * would only make the extra ones scan the queues and park again.
+   * would only make the extra ones scan the lanes and park again.
    *
    * @param records number of records just dispatched
    */
@@ -390,7 +386,7 @@ public final class RecordDispatcher<K, V> {
   }
 
   /**
-   * Polls across all partition queues for the next available record. Returns a {@link PollResult}
+   * Polls across all partition lanes for the next available record. Returns a {@link PollResult}
    * containing both the record and its pre-resolved {@link TopicPartition}, or {@code null} if no
    * record is available within the timeout.
    *
@@ -477,7 +473,7 @@ public final class RecordDispatcher<K, V> {
     // Records of this partition may be waiting only because their key or the partition was busy,
     // so no dispatch will wake a worker for them. Check the partition's current queue: the record
     // may come from one that was replaced after a revoke.
-    Lane<K, V> current = queues.get(lane.tp);
+    Lane<K, V> current = lanes.get(lane.tp);
     if (freed && current != null && current.queue.hasReady()) {
       wakeOneWorker();
     }
@@ -506,7 +502,7 @@ public final class RecordDispatcher<K, V> {
    * @return records in processing
    */
   public int activeRecords(TopicPartition tp) {
-    Lane<K, V> lane = queues.get(tp);
+    Lane<K, V> lane = lanes.get(tp);
     return lane != null ? lane.active.get() : 0;
   }
 
@@ -518,7 +514,7 @@ public final class RecordDispatcher<K, V> {
   }
 
   private LaneQueue<K, V> queueOf(TopicPartition tp) {
-    Lane<K, V> lane = queues.get(tp);
+    Lane<K, V> lane = lanes.get(tp);
     return lane != null ? lane.queue : null;
   }
 
@@ -529,7 +525,7 @@ public final class RecordDispatcher<K, V> {
    */
   public int totalQueuedRecords() {
     int total = 0;
-    for (Lane<K, V> lane : queues.values()) {
+    for (Lane<K, V> lane : lanes.values()) {
       total += lane.queue.size();
     }
     return total;
@@ -552,7 +548,7 @@ public final class RecordDispatcher<K, V> {
    * @return set of partitions
    */
   public Set<TopicPartition> partitions() {
-    return Set.copyOf(queues.keySet());
+    return Set.copyOf(lanes.keySet());
   }
 
   /**

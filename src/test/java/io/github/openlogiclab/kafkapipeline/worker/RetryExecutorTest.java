@@ -17,19 +17,19 @@ package io.github.openlogiclab.kafkapipeline.worker;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureConfig;
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
-import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
+import io.github.openlogiclab.kafkapipeline.backpressure.RecordBackpressureConfig;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.error.Fallback;
 import io.github.openlogiclab.kafkapipeline.internal.HandlerAttemptObserver;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.BackpressureController;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.BuiltInSensors;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.metrics.AttemptOutcome;
 import io.github.openlogiclab.kafkapipeline.metrics.DurationStats;
 import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
-import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
+import io.github.openlogiclab.kafkapipeline.offset.SlidingWindowOffsetTracker;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -165,7 +165,7 @@ class RetryExecutorTest {
     }
 
     @Test
-    void partialDlqFailure_firstRecordSent_thenSkip() {
+    void partialDlqFailure_firstRecordSent_thenDrop() {
       AtomicInteger dlqCalls = new AtomicInteger();
       AtomicInteger finalFailureCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
@@ -183,13 +183,13 @@ class RetryExecutorTest {
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+      assertEquals(RetryExecutor.FailureResolution.DROPPED, result);
       assertEquals(2, dlqCalls.get());
       assertEquals(2, finalFailureCalls.get());
     }
 
     @Test
-    void dlqFailure_allRecordsFail_skipped() {
+    void dlqFailure_allRecordsFail_dropped() {
       AtomicInteger finalFailureCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
@@ -203,7 +203,7 @@ class RetryExecutorTest {
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+      assertEquals(RetryExecutor.FailureResolution.DROPPED, result);
       assertEquals(3, finalFailureCalls.get());
     }
 
@@ -218,7 +218,7 @@ class RetryExecutorTest {
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+      assertEquals(RetryExecutor.FailureResolution.DROPPED, result);
       assertEquals(3, finalFailureCalls.get());
     }
 
@@ -237,35 +237,35 @@ class RetryExecutorTest {
           assertDoesNotThrow(
               () -> executor.handleFailure(records, TP0, new RuntimeException("test"), "batch"));
 
-      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+      assertEquals(RetryExecutor.FailureResolution.DROPPED, result);
     }
 
     @Test
-    void fallbackSkip_skipsDlqEvenWhenConfigured() {
+    void fallbackDrop_bypassesDlqEvenWhenConfigured() {
       AtomicInteger dlqCalls = new AtomicInteger();
       AtomicInteger finalFailureCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
               .dlqHandler((record, error) -> dlqCalls.incrementAndGet())
-              .fallback(Fallback.SKIP) // explicit SKIP should bypass DLQ
+              .fallback(Fallback.DROP) // explicit SKIP should bypass DLQ
               .onFinalFailure((record, error) -> finalFailureCalls.incrementAndGet())
               .build();
       executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
 
       var result = executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
-      assertEquals(RetryExecutor.FailureResolution.SKIPPED, result);
+      assertEquals(RetryExecutor.FailureResolution.DROPPED, result);
       assertEquals(0, dlqCalls.get()); // DLQ should NOT be called
       assertEquals(3, finalFailureCalls.get()); // FinalFailureHandler called for all records
     }
 
     @Test
-    void fallbackDlqThenSkip_usesDlqWhenConfigured() {
+    void fallbackDlqThenDrop_usesDlqWhenConfigured() {
       AtomicInteger dlqCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
               .dlqHandler((record, error) -> dlqCalls.incrementAndGet())
-              .fallback(Fallback.DLQ_THEN_SKIP)
+              .fallback(Fallback.DLQ_THEN_DROP)
               .build();
       executor = new RetryExecutor<>(strategy, NoOpMetricsCollector.INSTANCE);
 
@@ -278,7 +278,7 @@ class RetryExecutorTest {
 
   /**
    * Each failed record lands in exactly one outcome counter: {@code dlqSuccesses} or {@code
-   * recordsFailed}. {@code recordsSkipped} is reserved for hook skips.
+   * recordsDropped}. {@code recordsSkipped} is reserved for hook skips.
    */
   @Nested
   class OutcomeMetrics {
@@ -293,24 +293,25 @@ class RetryExecutorTest {
         records.add(new ConsumerRecord<>("test", 0, offset, "k" + offset, "v" + offset));
       }
       InFlightCounter counter = new InFlightCounter();
-      BackpressureConfig bpConfig = BackpressureConfig.builder().build();
+      RecordBackpressureConfig bpConfig = RecordBackpressureConfig.builder().build();
       collector =
           new PipelineMetricsCollector(
               "test",
               counter,
-              new BackpressureController(bpConfig, new RecordCountSensor(bpConfig, counter)),
-              new UnorderedOffsetTracker());
+              new BackpressureController(
+                  java.util.List.of(BuiltInSensors.records(bpConfig, counter))),
+              new SlidingWindowOffsetTracker());
     }
 
     private void assertOutcomes(long dlq, long failed) {
       PipelineMetrics m = collector.snapshot();
       assertEquals(dlq, m.dlqSuccesses(), "dlqSuccesses");
-      assertEquals(failed, m.recordsFailed(), "recordsFailed");
-      assertEquals(failed, m.finalFailures(), "finalFailures");
+      assertEquals(failed, m.recordsDropped(), "recordsDropped");
+      assertEquals(failed, m.recordsDropped(), "recordsDropped");
       assertEquals(0, m.recordsSkipped(), "recordsSkipped is for hook skips only");
       assertEquals(0, m.recordsProcessed(), "recordsProcessed");
       assertEquals(
-          records.size(), m.dlqSuccesses() + m.recordsFailed(), "each record counted once");
+          records.size(), m.dlqSuccesses() + m.recordsDropped(), "each record counted once");
     }
 
     @Test
@@ -325,7 +326,7 @@ class RetryExecutorTest {
     }
 
     @Test
-    void partialDlqFailure_splitsBetweenDlqAndFailed() {
+    void partialDlqFailure_splitsBetweenDlqAndDropped() {
       AtomicInteger dlqCalls = new AtomicInteger();
       ErrorStrategy<String, String> strategy =
           ErrorStrategy.<String, String>builder()
@@ -344,7 +345,7 @@ class RetryExecutorTest {
 
     @Test
     void noDlq_countsAllAsFailed() {
-      executor = new RetryExecutor<>(ErrorStrategy.skipOnError(), collector);
+      executor = new RetryExecutor<>(ErrorStrategy.dropOnError(), collector);
 
       executor.handleFailure(records, TP0, new RuntimeException("test"), "batch");
 
@@ -360,13 +361,14 @@ class RetryExecutorTest {
     @BeforeEach
     void setUp() {
       InFlightCounter counter = new InFlightCounter();
-      BackpressureConfig bpConfig = BackpressureConfig.builder().build();
+      RecordBackpressureConfig bpConfig = RecordBackpressureConfig.builder().build();
       collector =
           new PipelineMetricsCollector(
               "test",
               counter,
-              new BackpressureController(bpConfig, new RecordCountSensor(bpConfig, counter)),
-              new UnorderedOffsetTracker());
+              new BackpressureController(
+                  java.util.List.of(BuiltInSensors.records(bpConfig, counter))),
+              new SlidingWindowOffsetTracker());
     }
 
     @Test
@@ -425,7 +427,7 @@ class RetryExecutorTest {
     void attemptPastProcessingTimeoutIsTimeout() {
       executor =
           new RetryExecutor<>(
-              ErrorStrategy.skipOnError(),
+              ErrorStrategy.dropOnError(),
               NoOpMetricsCollector.INSTANCE,
               observer,
               Duration.ofMillis(50));

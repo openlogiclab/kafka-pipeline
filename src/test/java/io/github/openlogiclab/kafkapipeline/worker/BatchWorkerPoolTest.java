@@ -18,10 +18,10 @@ package io.github.openlogiclab.kafkapipeline.worker;
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.openlogiclab.kafkapipeline.ThreadMode;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.error.ErrorStrategy;
 import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
-import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
+import io.github.openlogiclab.kafkapipeline.offset.SlidingWindowOffsetTracker;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
@@ -42,12 +42,12 @@ class BatchWorkerPoolTest {
 
   private static final TopicPartition TP0 = new TopicPartition("test", 0);
 
-  private UnorderedOffsetTracker tracker;
+  private SlidingWindowOffsetTracker tracker;
   private InFlightCounter counter;
 
   @BeforeEach
   void setUp() {
-    tracker = new UnorderedOffsetTracker();
+    tracker = new SlidingWindowOffsetTracker();
     tracker.initPartition(TP0, 0);
     counter = new InFlightCounter();
   }
@@ -88,7 +88,7 @@ class BatchWorkerPoolTest {
                 }
                 completedBatches.incrementAndGet();
               },
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               1,
@@ -123,7 +123,7 @@ class BatchWorkerPoolTest {
     @Test
     void recordsFinishedByThePreviousOwner_areLeftOutOfTheBatch() throws Exception {
       // Previous owner: 0 stuck, 1, 2 and 4 finished.
-      UnorderedOffsetTracker previous = new UnorderedOffsetTracker(100, true);
+      SlidingWindowOffsetTracker previous = new SlidingWindowOffsetTracker(100, true);
       TopicPartition tp = new TopicPartition("test", 9);
       previous.initPartition(tp, 0, null);
       previous.registerBatch(tp, new long[] {0, 1, 2, 3, 4, 5, 6, 7});
@@ -131,7 +131,7 @@ class BatchWorkerPoolTest {
       previous.ackBatch(tp, new long[] {1, 2, 4, 7});
       String metadata = previous.getAllCommitPoints().get(tp).metadata();
 
-      tracker = new UnorderedOffsetTracker(100, true);
+      tracker = new SlidingWindowOffsetTracker(100, true);
       tracker.initPartition(tp, 0, metadata);
       List<Long> handled = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
       CountDownLatch done = new CountDownLatch(1);
@@ -143,7 +143,7 @@ class BatchWorkerPoolTest {
                 records.forEach(r -> handled.add(r.offset()));
                 done.countDown();
               },
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               10,
@@ -183,7 +183,7 @@ class BatchWorkerPoolTest {
               2,
               ThreadMode.PLATFORM,
               (tp, records) -> {},
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               100,
@@ -217,7 +217,7 @@ class BatchWorkerPoolTest {
                 for (var r : records) processed.add(r.value());
                 done.countDown();
               },
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               100,
@@ -242,7 +242,7 @@ class BatchWorkerPoolTest {
               (tp, records) -> {
                 throw new RuntimeException("always fails");
               },
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               100,
@@ -253,11 +253,11 @@ class BatchWorkerPoolTest {
 
       assertTrue(
           awaitCondition(() -> counter.records() == 0, Duration.ofSeconds(3)),
-          "Counter should be decremented after skip");
+          "Counter should be decremented after the drop");
     }
 
     @Test
-    void skipFallbackAcksBatch() throws Exception {
+    void dropFallbackAcksBatch() throws Exception {
       pool =
           new BatchWorkerPool<>(
               2,
@@ -265,7 +265,7 @@ class BatchWorkerPoolTest {
               (tp, records) -> {
                 throw new RuntimeException("always fails");
               },
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               100,
@@ -281,7 +281,7 @@ class BatchWorkerPoolTest {
       assertTrue(
           awaitCondition(
               () -> tracker.getCommittableOffset(TP0).isPresent(), Duration.ofSeconds(3)),
-          "Offset should advance after skip");
+          "Offset should advance after the drop");
       assertEquals(3L, tracker.getCommittableOffset(TP0).getAsLong());
     }
 
@@ -343,7 +343,7 @@ class BatchWorkerPoolTest {
     void dispatch_rejectsWholeBatchPerFullPartition_andReportsBatchStart() {
       TopicPartition tp1 = new TopicPartition("test", 1);
       TopicPartition tp2 = new TopicPartition("test", 2);
-      tracker = new UnorderedOffsetTracker(3);
+      tracker = new SlidingWindowOffsetTracker(3);
       tracker.initPartition(TP0, 0);
       tracker.initPartition(tp1, 0);
       tracker.initPartition(tp2, 0);
@@ -354,7 +354,7 @@ class BatchWorkerPoolTest {
               1,
               ThreadMode.PLATFORM,
               (tp, records) -> handled.addAndGet(records.size()),
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               0,
@@ -396,7 +396,7 @@ class BatchWorkerPoolTest {
                 running.decrementAndGet();
                 done.incrementAndGet();
               },
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               0,
@@ -433,7 +433,7 @@ class BatchWorkerPoolTest {
                 handled.incrementAndGet();
                 block.await(10, TimeUnit.SECONDS);
               },
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               0,
@@ -464,7 +464,7 @@ class BatchWorkerPoolTest {
           1,
           mode,
           handler,
-          new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+          new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
           tracker,
           counter,
           10,
@@ -482,7 +482,7 @@ class BatchWorkerPoolTest {
               2,
               ThreadMode.PLATFORM,
               (tp, records) -> release.await(5, TimeUnit.SECONDS),
-              new RetryExecutor<>(ErrorStrategy.skipOnError(), NoOpMetricsCollector.INSTANCE),
+              new RetryExecutor<>(ErrorStrategy.dropOnError(), NoOpMetricsCollector.INSTANCE),
               tracker,
               counter,
               10,

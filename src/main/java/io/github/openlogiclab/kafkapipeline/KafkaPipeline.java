@@ -15,28 +15,35 @@
  */
 package io.github.openlogiclab.kafkapipeline;
 
-import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureController;
 import io.github.openlogiclab.kafkapipeline.backpressure.BackpressureSensor;
-import io.github.openlogiclab.kafkapipeline.backpressure.ByteSizeSensor;
-import io.github.openlogiclab.kafkapipeline.backpressure.HeapSensor;
-import io.github.openlogiclab.kafkapipeline.backpressure.InFlightCounter;
-import io.github.openlogiclab.kafkapipeline.backpressure.RecordCountSensor;
-import io.github.openlogiclab.kafkapipeline.dispatch.PartitionPauseController;
-import io.github.openlogiclab.kafkapipeline.dispatch.PeriodicCommitter;
-import io.github.openlogiclab.kafkapipeline.dispatch.PipelineRebalanceListener;
+import io.github.openlogiclab.kafkapipeline.commit.CommitStrategy;
+import io.github.openlogiclab.kafkapipeline.commit.PeriodicCommitter;
+import io.github.openlogiclab.kafkapipeline.consumer.PartitionDrainListener;
+import io.github.openlogiclab.kafkapipeline.consumer.PartitionPauseController;
+import io.github.openlogiclab.kafkapipeline.consumer.PipelineRebalanceListener;
+import io.github.openlogiclab.kafkapipeline.consumer.PollLoop;
 import io.github.openlogiclab.kafkapipeline.dispatch.RecordDispatcher;
 import io.github.openlogiclab.kafkapipeline.internal.AttemptPublisher;
 import io.github.openlogiclab.kafkapipeline.internal.ExporterBinding;
+import io.github.openlogiclab.kafkapipeline.internal.FatalErrors;
 import io.github.openlogiclab.kafkapipeline.internal.MetricsExporters;
 import io.github.openlogiclab.kafkapipeline.internal.PipelineMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.internal.ProcessorBinding;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.BackpressureController;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.BuiltInSensors;
+import io.github.openlogiclab.kafkapipeline.internal.backpressure.InFlightCounter;
 import io.github.openlogiclab.kafkapipeline.metrics.PipelineMetrics;
 import io.github.openlogiclab.kafkapipeline.offset.OffsetTracker;
-import io.github.openlogiclab.kafkapipeline.offset.UnorderedOffsetTracker;
+import io.github.openlogiclab.kafkapipeline.offset.SlidingWindowOffsetTracker;
+import io.github.openlogiclab.kafkapipeline.sink.RecordSink;
+import io.github.openlogiclab.kafkapipeline.sink.kafka.KafkaDLQHandler;
 import io.github.openlogiclab.kafkapipeline.worker.BatchWorkerPool;
 import io.github.openlogiclab.kafkapipeline.worker.RetryExecutor;
 import io.github.openlogiclab.kafkapipeline.worker.SingleRecordWorkerPool;
 import io.github.openlogiclab.kafkapipeline.worker.WorkerPool;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -46,6 +53,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 
 /**
@@ -57,17 +65,21 @@ import org.apache.kafka.common.errors.WakeupException;
  * <h2>Architecture</h2>
  *
  * <pre>
- *   KafkaConsumer.poll()              (single-threaded poll loop)
- *         │
- *         ▼
- *   RecordDispatcher                  (per-partition queues)
- *         │
- *   ┌─────┼─────┐
- *   ▼     ▼     ▼
- *  Worker Worker Worker ...           (platform or virtual threads)
- *         │
- *         ▼
- *   OffsetTracker → PeriodicCommitter (sliding-window offset tracking)
+ *   poll thread (consumer.PollLoop)          commits, pauses, polls; one thread owns the consumer
+ *     │  global backpressure decides whether to fetch; per-partition holds can pause one partition
+ *     ▼
+ *   per-record mode                          batch mode
+ *   RecordDispatcher: one lane per           BatchWorkerPool: one task per partition per poll
+ *   partition (FIFO or per-key order)
+ *     │                                        │
+ *     ▼                                        ▼
+ *   workers: processor or handler            workers: batch handler
+ *     │  outputs → RecordSink (async)
+ *     ▼                                        ▼
+ *   offset.SlidingWindowOffsetTracker: per-partition window, acks in any order
+ *     │
+ *     ▼
+ *   commit.PeriodicCommitter (on the poll thread)
  * </pre>
  *
  * <h2>Features</h2>
@@ -79,9 +91,9 @@ import org.apache.kafka.common.errors.WakeupException;
  *   <li><b>Backpressure</b> — record-count hysteresis (high/low watermark) pauses the consumer when
  *       workers fall behind
  *   <li><b>Error handling</b> — retry with exponential backoff, optional DLQ, then {@link
- *       io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler} and skip
- *   <li><b>Offset management</b> — unordered sliding-window tracker with monotonic commit
- *       guarantees and periodic async commits
+ *       io.github.openlogiclab.kafkapipeline.error.FinalFailureHandler} and drop
+ *   <li><b>Offset management</b> — a per-partition sliding window that accepts acks in any order
+ *       and only commits past records that are done, with periodic async commits
  *   <li><b>Lifecycle hooks</b> — {@link
  *       io.github.openlogiclab.kafkapipeline.handler.ProcessingLifecycleHook} for deduplication,
  *       metrics, tracing, or audit logging
@@ -154,7 +166,7 @@ public final class KafkaPipeline<K, V> {
   private final MetricsExporters exporters;
 
   private volatile Consumer<K, V> consumer;
-  private PeriodicCommitter committer;
+  private CommitStrategy committer;
   private PartitionPauseController pauseController;
   private PipelineRebalanceListener rebalanceListener;
   private Thread shutdownHook;
@@ -188,7 +200,7 @@ public final class KafkaPipeline<K, V> {
     this.ownsConsumer = ownsConsumer;
 
     this.offsetTracker =
-        new UnorderedOffsetTracker(config.maxWindowSize(), config.skipCompletedOnRestart());
+        new SlidingWindowOffsetTracker(config.maxWindowSize(), config.skipCompletedOnRestart());
     this.counter = new InFlightCounter();
     this.backpressure = buildBackpressureController(config, counter);
     this.metricsCollector =
@@ -199,7 +211,8 @@ public final class KafkaPipeline<K, V> {
             config.errorStrategy(),
             metricsCollector,
             metricsCollector.andThen(attemptPublisher),
-            config.processingTimeout());
+            config.processingTimeout(),
+            config.writeOutageTimeout());
     this.dispatcher =
         new RecordDispatcher<>(
             config.dispatchQueueCapacity(),
@@ -278,8 +291,11 @@ public final class KafkaPipeline<K, V> {
       fail(t);
     } finally {
       running.set(false);
-      shutdown();
-      shutdownLatch.countDown();
+      try {
+        shutdown();
+      } finally {
+        shutdownLatch.countDown();
+      }
     }
 
     Throwable cause = failure;
@@ -392,15 +408,20 @@ public final class KafkaPipeline<K, V> {
   private static <K, V> BackpressureController buildBackpressureController(
       PipelineConfig<K, V> config, InFlightCounter counter) {
     List<BackpressureSensor> sensors = new ArrayList<>();
-    sensors.add(new RecordCountSensor(config.backpressure(), counter));
+    if (config.recordBackpressure().enabled()) {
+      sensors.add(BuiltInSensors.records(config.recordBackpressure(), counter));
+    }
     if (config.byteBackpressure().enabled()) {
-      sensors.add(new ByteSizeSensor(config.byteBackpressure(), counter));
+      sensors.add(BuiltInSensors.bytes(config.byteBackpressure(), counter));
     }
     if (config.heapBackpressure().enabled()) {
-      sensors.add(new HeapSensor(config.heapBackpressure()));
+      sensors.add(BuiltInSensors.heap(config.heapBackpressure()));
     }
     sensors.addAll(config.customSensors());
-    return new BackpressureController(config.backpressure(), sensors);
+    // Downstream pressure from the sink (for example unsent producer records) throttles globally.
+    ProcessorBinding<K, V, ?> binding = config.processorBinding();
+    if (binding != null) binding.sink().sensor().ifPresent(sensors::add);
+    return new BackpressureController(sensors);
   }
 
   private static <K, V> WorkerPool<K, V> buildWorkerPool(
@@ -429,13 +450,19 @@ public final class KafkaPipeline<K, V> {
     return new SingleRecordWorkerPool<>(
         config.concurrency(),
         config.threadMode(),
-        config.handler(),
+        processingStep(config),
         config.lifecycleHook(),
         retryExecutor,
         offsetTracker,
         dispatcher,
         counter,
         metricsCollector);
+  }
+
+  /** The processor and sink, or the handler bound as a processor that writes nothing. */
+  private static <K, V> ProcessorBinding<K, V, ?> processingStep(PipelineConfig<K, V> config) {
+    ProcessorBinding<K, V, ?> binding = config.processorBinding();
+    return binding != null ? binding : ProcessorBinding.forHandler(config.handler());
   }
 
   private void initConsumer() {
@@ -455,58 +482,105 @@ public final class KafkaPipeline<K, V> {
         new PipelineRebalanceListener(
             offsetTracker,
             dispatcher,
-            committer::commitSync,
+            committer::commitNow,
             counter,
             consumer,
             config.drainTimeout(),
             metricsCollector,
             config.skipCompletedOnRestart());
 
+    RecordSink<?> sink =
+        config.processorBinding() != null ? config.processorBinding().sink() : null;
+    rebalanceListener.addDrainListener(
+        new PartitionDrainListener() {
+          @Override
+          public void draining(Collection<TopicPartition> partitions, Duration budget) {
+            // Writes of these partitions are flushed at once from now on, then the sink may push
+            // out what it buffers for them, within the drain budget.
+            workerPool.onPartitionsDraining(partitions);
+            if (sink == null) return;
+            long deadline = System.nanoTime() + budget.toNanos();
+            for (TopicPartition tp : partitions) {
+              Duration left = Duration.ofNanos(Math.max(0, deadline - System.nanoTime()));
+              try {
+                sink.onPartitionRevoked(tp, left);
+              } catch (Throwable t) {
+                FatalErrors.rethrowIfJvmFatal(t);
+                logger.log(System.Logger.Level.WARNING, "Sink failed on revoke of " + tp, t);
+              }
+            }
+          }
+
+          @Override
+          public void drained(Collection<TopicPartition> partitions) {
+            workerPool.onPartitionsDrained(partitions);
+          }
+        });
     pauseController.addHold(rebalanceListener::isPendingInit);
     pauseController.addHold(workerPool::holdsPartition);
     consumer.subscribe(config.topics(), rebalanceListener);
   }
 
+  /**
+   * Shuts down in order. Every step runs even if an earlier one fails, including with an {@link
+   * Error} from user code (a sink's {@code close()}), so the consumer is always closed and {@link
+   * #awaitShutdown()} always returns.
+   */
   private void shutdown() {
     logger.log(System.Logger.Level.INFO, "Pipeline shutting down...");
 
-    try {
-      workerPool.stop(config.shutdownTimeout().toMillis());
-    } catch (Exception e) {
-      logger.log(System.Logger.Level.WARNING, "Error stopping workers", e);
-    }
-    retryExecutor.close();
-
+    step("stopping workers", () -> workerPool.stop(config.shutdownTimeout().toMillis()));
+    step("stopping the processing timeout", retryExecutor::close);
     if (committer != null) {
-      try {
-        committer.commitSync();
-        committer.stop();
-      } catch (Exception e) {
-        logger.log(System.Logger.Level.WARNING, "Error during final commit", e);
-      }
+      step("final commit", committer::commitNow);
+      step("stopping the committer", committer::stop);
     }
 
+    // After the final commit: nothing is processed or written any more.
+    ProcessorBinding<K, V, ?> binding = config.processorBinding();
+    if (binding != null) {
+      step("closing the processor", binding.processorCloseable()::close);
+      step("closing the sink", binding.sink()::close);
+    }
+    // Only the library's own DLQ handler is closed; a user's DLQHandler keeps its own lifecycle.
+    if (config.errorStrategy().dlqHandler() instanceof KafkaDLQHandler<?, ?> dlq) {
+      step("closing the DLQ handler", dlq::close);
+    }
     if (rebalanceListener != null) {
-      try {
-        rebalanceListener.shutdown();
-      } catch (Exception e) {
-        logger.log(System.Logger.Level.WARNING, "Error shutting down rebalance listener", e);
-      }
+      step("shutting down the rebalance listener", rebalanceListener::shutdown);
     }
-
     if (ownsConsumer && consumer != null) {
-      try {
-        consumer.close(
-            org.apache.kafka.clients.consumer.CloseOptions.timeout(config.shutdownTimeout()));
-      } catch (Exception e) {
-        logger.log(System.Logger.Level.WARNING, "Error closing consumer", e);
-      }
+      step(
+          "closing the consumer",
+          () ->
+              consumer.close(
+                  org.apache.kafka.clients.consumer.CloseOptions.timeout(
+                      config.shutdownTimeout())));
     }
-
-    removeShutdownHook();
-    exporters.closeAll(); // last, so exporters see the final commit's counters
+    step("removing the shutdown hook", this::removeShutdownHook);
+    step("closing metrics exporters", exporters::closeAll); // last: sees the final counters
 
     logger.log(System.Logger.Level.INFO, "Pipeline shut down complete");
+  }
+
+  /** A shutdown step; may throw anything. */
+  @FunctionalInterface
+  private interface Step {
+    void run() throws Exception;
+  }
+
+  /** Runs one shutdown step; a failure is logged, and a JVM error is kept as the failure. */
+  private void step(String what, Step step) {
+    try {
+      step.run();
+    } catch (Throwable t) {
+      logger.log(System.Logger.Level.WARNING, "Error " + what + " during shutdown", t);
+      if (FatalErrors.isJvmFatal(t)) {
+        synchronized (this) {
+          if (failure == null) failure = t;
+        }
+      }
+    }
   }
 
   private void registerShutdownHook() {

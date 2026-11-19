@@ -28,6 +28,6 @@ public interface PollMetrics {
   /** Records a poll that returned no records. */
   void recordEmptyPoll();
 
-  /** Records backpressure going from OK to THROTTLE or CRITICAL. */
+  /** Records backpressure going from OK to THROTTLE. */
   void recordThrottle();
 }

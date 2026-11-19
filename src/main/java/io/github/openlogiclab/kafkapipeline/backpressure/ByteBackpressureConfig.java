@@ -16,27 +16,36 @@
 package io.github.openlogiclab.kafkapipeline.backpressure;
 
 /**
- * Immutable configuration for byte-level backpressure thresholds.
+ * Backpressure on the bytes of records in flight, to protect memory when records are large.
  *
- * <p>Uses high/low watermark hysteresis (same pattern as {@link BackpressureConfig}) but based on
- * total in-flight payload bytes instead of record count. This protects against memory pressure when
- * individual records are large (e.g. 10 MB file payloads).
+ * <p>Pauses fetching on every partition when the in-flight bytes reach {@code highWatermarkBytes}
+ * and resumes at {@code lowWatermarkBytes}. Sizes are the serialized key and value sizes ({@code
+ * ConsumerRecord.serializedKeySize() + serializedValueSize()}), the size on the wire. Deserialized
+ * objects are often 2–10× larger on the heap (JSON trees, Avro records, UTF-16 strings), so set the
+ * watermarks with that factor in mind, or combine this with {@link HeapBackpressureConfig}. Off by
+ * default.
  *
- * <p>Size estimation uses {@code ConsumerRecord.serializedKeySize() +
- * ConsumerRecord.serializedValueSize()} — the wire payload size, not Java heap overhead.
- * Deserialized keys and values are often 2–10× larger on the heap (JSON trees, Avro records, UTF-16
- * strings), so set the watermarks with that factor in mind, or combine this with {@link
- * HeapBackpressureConfig}.
- *
- * @param highWatermarkBytes total in-flight bytes at which the consumer pauses polling
- * @param lowWatermarkBytes total in-flight bytes at which the consumer resumes polling
- * @param criticalThresholdBytes hard ceiling for total in-flight bytes
- * @param enabled whether byte-level backpressure is active
+ * @param highWatermarkBytes in-flight bytes at which fetching pauses
+ * @param lowWatermarkBytes in-flight bytes at which fetching resumes; less than {@code
+ *     highWatermarkBytes}
+ * @param enabled whether this sensor is active
  */
 public record ByteBackpressureConfig(
-    long highWatermarkBytes, long lowWatermarkBytes, long criticalThresholdBytes, boolean enabled) {
+    long highWatermarkBytes, long lowWatermarkBytes, boolean enabled) {
 
-  /** Validates configuration constraints. */
+  /** Default high watermark: 256 MiB. */
+  public static final long DEFAULT_HIGH_WATERMARK_BYTES = 256L * 1024 * 1024;
+
+  /** Default low watermark: 128 MiB. */
+  public static final long DEFAULT_LOW_WATERMARK_BYTES = 128L * 1024 * 1024;
+
+  /**
+   * Validates the watermarks when enabled.
+   *
+   * @param highWatermarkBytes in-flight bytes at which fetching pauses
+   * @param lowWatermarkBytes in-flight bytes at which fetching resumes
+   * @param enabled whether this sensor is active
+   */
   public ByteBackpressureConfig {
     if (enabled) {
       if (lowWatermarkBytes <= 0) {
@@ -51,30 +60,22 @@ public record ByteBackpressureConfig(
                 + lowWatermarkBytes
                 + ")");
       }
-      if (criticalThresholdBytes <= highWatermarkBytes) {
-        throw new IllegalArgumentException(
-            "criticalThresholdBytes ("
-                + criticalThresholdBytes
-                + ") must be > highWatermarkBytes ("
-                + highWatermarkBytes
-                + ")");
-      }
     }
   }
 
   /**
-   * Returns a disabled configuration.
+   * Byte backpressure off (the default).
    *
-   * @return disabled configuration
+   * @return a disabled configuration
    */
   public static ByteBackpressureConfig disabled() {
-    return new ByteBackpressureConfig(0, 0, 0, false);
+    return new ByteBackpressureConfig(0, 0, false);
   }
 
   /**
-   * Returns a new builder.
+   * Returns a builder starting from 256 MiB / 128 MiB.
    *
-   * @return new builder instance
+   * @return the builder
    */
   public static Builder builder() {
     return new Builder();
@@ -82,20 +83,15 @@ public record ByteBackpressureConfig(
 
   /** Builder for {@link ByteBackpressureConfig}. */
   public static final class Builder {
-    private long highWatermarkBytes = 256L * 1024 * 1024;
-    private long lowWatermarkBytes = 128L * 1024 * 1024;
-    private long criticalThresholdBytes = 512L * 1024 * 1024;
-    private boolean enabled = true;
+    private long highWatermarkBytes = DEFAULT_HIGH_WATERMARK_BYTES;
+    private long lowWatermarkBytes = DEFAULT_LOW_WATERMARK_BYTES;
 
     private Builder() {}
 
     /**
-     * Total in-flight bytes at which the consumer pauses polling. Must be greater than {@link
-     * #lowWatermarkBytes}.
+     * In-flight bytes at which fetching pauses. Default: 256 MiB.
      *
-     * <p>Default: {@code 256 MB}.
-     *
-     * @param highWatermarkBytes the high watermark in bytes
+     * @param highWatermarkBytes the high watermark
      * @return this builder
      */
     public Builder highWatermarkBytes(long highWatermarkBytes) {
@@ -104,12 +100,9 @@ public record ByteBackpressureConfig(
     }
 
     /**
-     * Total in-flight bytes at which the consumer resumes polling after being paused. The gap
-     * between high and low watermarks prevents pause/resume flapping.
+     * In-flight bytes at which fetching resumes. Default: 128 MiB.
      *
-     * <p>Default: {@code 128 MB}.
-     *
-     * @param lowWatermarkBytes the low watermark in bytes
+     * @param lowWatermarkBytes the low watermark
      * @return this builder
      */
     public Builder lowWatermarkBytes(long lowWatermarkBytes) {
@@ -118,39 +111,12 @@ public record ByteBackpressureConfig(
     }
 
     /**
-     * Hard ceiling for total in-flight bytes. When reached, status escalates to {@code CRITICAL}.
-     *
-     * <p>Default: {@code 512 MB}.
-     *
-     * @param criticalThresholdBytes the critical threshold in bytes
-     * @return this builder
-     */
-    public Builder criticalThresholdBytes(long criticalThresholdBytes) {
-      this.criticalThresholdBytes = criticalThresholdBytes;
-      return this;
-    }
-
-    /**
-     * Whether byte-level backpressure is enabled. When using {@link
-     * ByteBackpressureConfig#builder()}, defaults to {@code true}. Use {@link
-     * ByteBackpressureConfig#disabled()} to explicitly disable.
-     *
-     * @param enabled whether enabled
-     * @return this builder
-     */
-    public Builder enabled(boolean enabled) {
-      this.enabled = enabled;
-      return this;
-    }
-
-    /**
-     * Builds the configuration.
+     * Builds an enabled configuration.
      *
      * @return the configuration
      */
     public ByteBackpressureConfig build() {
-      return new ByteBackpressureConfig(
-          highWatermarkBytes, lowWatermarkBytes, criticalThresholdBytes, enabled);
+      return new ByteBackpressureConfig(highWatermarkBytes, lowWatermarkBytes, true);
     }
   }
 }
