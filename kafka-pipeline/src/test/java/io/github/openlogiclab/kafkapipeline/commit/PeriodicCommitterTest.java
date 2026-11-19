@@ -1,0 +1,580 @@
+/*
+ * Copyright 2026 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.github.openlogiclab.kafkapipeline.commit;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import io.github.openlogiclab.kafkapipeline.internal.NoOpMetricsCollector;
+import io.github.openlogiclab.kafkapipeline.offset.SlidingWindowOffsetTracker;
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.MockConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetCommitCallback;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.WakeupException;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+class PeriodicCommitterTest {
+
+  private static final TopicPartition TP0 = new TopicPartition("test", 0);
+  private static final TopicPartition TP1 = new TopicPartition("test", 1);
+
+  private SlidingWindowOffsetTracker tracker;
+
+  @BeforeEach
+  void setUp() {
+    tracker = new SlidingWindowOffsetTracker();
+  }
+
+  private void completeRecord(TopicPartition tp, long offset) {
+    tracker.register(tp, offset);
+    tracker.markInProgress(tp, offset);
+    tracker.ack(tp, offset);
+  }
+
+  @Nested
+  class CommitSync {
+
+    @Test
+    void retriesOnceWhenAPendingWakeupFiresDuringTheCommit() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
+      AtomicInteger attempts = new AtomicInteger();
+      Consumer<String, String> consumer =
+          new SpyConsumer(captured, null) {
+            @Override
+            public void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+              if (attempts.incrementAndGet() == 1) throw new WakeupException();
+              super.commitSync(offsets);
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, consumer, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.commitNow();
+
+      assertEquals(2, attempts.get());
+      assertEquals(1L, captured.get().get(TP0).offset());
+      assertTrue(
+          tracker.getUncommittedCommitPoints().isEmpty(), "offset should be marked committed");
+    }
+
+    @Test
+    void commitsOffsetsForCompletedRecords() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
+      Consumer<String, String> spy = new SpyConsumer(captured, null);
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.commitNow();
+
+      assertNotNull(captured.get());
+      assertEquals(1L, captured.get().get(TP0).offset());
+    }
+
+    @Test
+    void emptyOffsetsDoesNotCallConsumer() {
+      AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
+      Consumer<String, String> spy = new SpyConsumer(captured, null);
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.commitNow();
+
+      assertNull(captured.get(), "Should not call commitSync when no offsets to commit");
+    }
+
+    @Test
+    void multiPartitionCommit() {
+      tracker.initPartition(TP0, 0);
+      tracker.initPartition(TP1, 10);
+      completeRecord(TP0, 0);
+      completeRecord(TP1, 10);
+
+      AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
+      Consumer<String, String> spy = new SpyConsumer(captured, null);
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.commitNow();
+
+      assertEquals(1L, captured.get().get(TP0).offset());
+      assertEquals(11L, captured.get().get(TP1).offset());
+    }
+
+    @Test
+    void exceptionIsCaughtAndLogged() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      Consumer<String, String> broken =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+              throw new RuntimeException("Broker unavailable");
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, broken, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      assertDoesNotThrow(c::commitNow);
+    }
+  }
+
+  @Nested
+  class CommitAsync {
+
+    @Test
+    void commitsOffsetsAsynchronously() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
+      Consumer<String, String> spy = new SpyConsumer(null, captured);
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      c.commitAsync();
+      c.stop();
+
+      assertNotNull(captured.get());
+      assertEquals(1L, captured.get().get(TP0).offset());
+    }
+
+    @Test
+    void emptyOffsetsSkipsCommit() {
+      AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
+      Consumer<String, String> spy = new SpyConsumer(null, captured);
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      c.commitAsync();
+      c.stop();
+
+      assertNull(captured.get(), "Should not call commitAsync when no offsets");
+    }
+
+    @Test
+    void notRunningSkipsCommit() {
+      AtomicReference<Map<TopicPartition, OffsetAndMetadata>> captured = new AtomicReference<>();
+      Consumer<String, String> spy = new SpyConsumer(null, captured);
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.commitAsync();
+
+      assertNull(captured.get(), "commitAsync should skip when not running");
+    }
+
+    @Test
+    void callbackHandlesException() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      Consumer<String, String> spy =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              callback.onComplete(offsets, new RuntimeException("Callback error"));
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      assertDoesNotThrow(c::commitAsync);
+      c.stop();
+    }
+
+    @Test
+    void exceptionInCommitAsyncIsCaught() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      Consumer<String, String> broken =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              throw new RuntimeException("Commit async explosion");
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, broken, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      assertDoesNotThrow(c::commitAsync);
+      c.stop();
+    }
+  }
+
+  @Nested
+  class Lifecycle {
+
+    @Test
+    void doubleStartThrows() {
+      MockConsumer<String, String> mc = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      assertThrows(IllegalStateException.class, c::start);
+      c.stop();
+    }
+
+    @Test
+    void stopWithoutStart() {
+      MockConsumer<String, String> mc = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      assertDoesNotThrow(c::stop);
+    }
+
+    @Test
+    void stopCompletesEvenIfSchedulerIsSlow() {
+      MockConsumer<String, String> mc = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, mc, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      // stop() should complete without hanging even if scheduler is slow
+      assertDoesNotThrow(c::stop);
+    }
+  }
+
+  @Nested
+  class MaybeCommitAsync {
+
+    @Test
+    void maybeCommitCommitsWhenFlagIsSet() throws Exception {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicInteger asyncCalls = new AtomicInteger();
+      Consumer<String, String> spy =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              asyncCalls.incrementAndGet();
+              if (callback != null) callback.onComplete(offsets, null);
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, spy, Duration.ofMillis(50), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      // Wait for the scheduler to signal commit due
+      Thread.sleep(100);
+
+      // Poll loop calls maybeCommit, which should trigger the commit
+      c.maybeCommit();
+      c.stop();
+
+      assertEquals(1, asyncCalls.get(), "Expected exactly 1 commit from maybeCommit");
+    }
+
+    @Test
+    void maybeCommitDoesNothingWhenFlagNotSet() {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicInteger asyncCalls = new AtomicInteger();
+      Consumer<String, String> spy =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              asyncCalls.incrementAndGet();
+              if (callback != null) callback.onComplete(offsets, null);
+            }
+          };
+
+      // Use a very long interval so the flag won't be set
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofMinutes(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      // Immediately call maybeCommit before scheduler has a chance to set flag
+      c.maybeCommit();
+      c.stop();
+
+      assertEquals(0, asyncCalls.get(), "Expected no commits when flag not set");
+    }
+
+    @Test
+    void maybeCommitClearsFlag() throws Exception {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicInteger asyncCalls = new AtomicInteger();
+      Consumer<String, String> spy =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              asyncCalls.incrementAndGet();
+              if (callback != null) callback.onComplete(offsets, null);
+            }
+          };
+
+      // Use 500ms interval - long enough to avoid race between our two calls,
+      // but short enough for reasonable test speed
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, spy, Duration.ofMillis(500), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      // Wait for first scheduler fire
+      Thread.sleep(600);
+
+      // First call consumes the flag
+      c.maybeCommit();
+      int firstCount = asyncCalls.get();
+
+      // Second immediate call should not commit (flag cleared, next scheduler fire is ~400ms away)
+      c.maybeCommit();
+      int secondCount = asyncCalls.get();
+
+      c.stop();
+
+      assertEquals(1, firstCount, "First maybeCommit should commit");
+      assertEquals(1, secondCount, "Second maybeCommit should not commit (flag cleared)");
+    }
+
+    @Test
+    void schedulerSetsCommitDueFlagButDoesNotCallConsumer() throws Exception {
+      tracker.initPartition(TP0, 0);
+      completeRecord(TP0, 0);
+
+      AtomicInteger asyncCalls = new AtomicInteger();
+      Consumer<String, String> spy =
+          new SpyConsumer(null, null) {
+            @Override
+            public void commitAsync(
+                Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+              asyncCalls.incrementAndGet();
+              if (callback != null) callback.onComplete(offsets, null);
+            }
+          };
+
+      PeriodicCommitter c =
+          new PeriodicCommitter(tracker, spy, Duration.ofMillis(30), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      // Let the scheduler fire multiple times
+      Thread.sleep(150);
+
+      // Without calling maybeCommit, no commits should have happened
+      assertEquals(0, asyncCalls.get(), "Scheduler should only set flag, not call consumer");
+
+      // Now poll loop calls maybeCommit
+      c.maybeCommit();
+      c.stop();
+
+      // Should have exactly 1 commit (flag set multiple times but only 1 actual commit)
+      assertEquals(
+          1, asyncCalls.get(), "Only 1 commit should occur when poll loop calls maybeCommit");
+    }
+  }
+
+  @Nested
+  class Stop {
+
+    @Test
+    void stop_setsRunningToFalse() throws Exception {
+      tracker.initPartition(TP0, 0);
+      MockConsumer<String, String> consumer = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, consumer, Duration.ofMinutes(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      c.stop();
+
+      // Calling stop again should be a no-op
+      assertDoesNotThrow(() -> c.stop());
+    }
+
+    @Test
+    void stop_interruptHandling() throws Exception {
+      tracker.initPartition(TP0, 0);
+      MockConsumer<String, String> consumer = new MockConsumer<>("earliest");
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, consumer, Duration.ofMinutes(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+
+      Thread.currentThread().interrupt();
+      c.stop();
+
+      assertTrue(Thread.currentThread().isInterrupted());
+      Thread.interrupted();
+    }
+  }
+
+  @Nested
+  class MetadataTooLarge {
+
+    /** A broker whose offset.metadata.max.bytes is smaller than any metadata we write. */
+    private class TinyMetadataBroker extends MockConsumer<String, String> {
+      final java.util.List<Map<TopicPartition, OffsetAndMetadata>> accepted =
+          new java.util.ArrayList<>();
+
+      TinyMetadataBroker() {
+        super("earliest");
+      }
+
+      private boolean tooLarge(Map<TopicPartition, OffsetAndMetadata> offsets) {
+        return offsets.values().stream().anyMatch(om -> !om.metadata().isEmpty());
+      }
+
+      @Override
+      public void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+        if (tooLarge(offsets)) {
+          throw new org.apache.kafka.common.errors.OffsetMetadataTooLarge("too large");
+        }
+        accepted.add(new HashMap<>(offsets));
+      }
+
+      @Override
+      public void commitAsync(
+          Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+        if (tooLarge(offsets)) {
+          callback.onComplete(
+              offsets, new org.apache.kafka.common.errors.OffsetMetadataTooLarge("too large"));
+          return;
+        }
+        accepted.add(new HashMap<>(offsets));
+        callback.onComplete(offsets, null);
+      }
+    }
+
+    private void stuckHeadWithFinishedRecordsBehindIt() {
+      tracker = new SlidingWindowOffsetTracker(100, true);
+      tracker.initPartition(TP0, 0);
+      tracker.register(TP0, 0); // stuck
+      completeRecord(TP0, 1);
+      tracker.initPartition(TP1, 0);
+      tracker.register(TP1, 0);
+      completeRecord(TP1, 1);
+      tracker.markInProgress(TP1, 0);
+      tracker.ack(TP1, 0);
+    }
+
+    @Test
+    void asyncCommit_fallsBackToPlainOffsets() {
+      stuckHeadWithFinishedRecordsBehindIt();
+      TinyMetadataBroker broker = new TinyMetadataBroker();
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, broker, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.start();
+      try {
+        c.commitAsync(); // rejected; turns metadata off
+        assertTrue(broker.accepted.isEmpty());
+        c.commitAsync();
+        assertEquals(1, broker.accepted.size());
+        assertEquals(2L, broker.accepted.get(0).get(TP1).offset());
+        assertEquals("", broker.accepted.get(0).get(TP1).metadata());
+        assertFalse(broker.accepted.get(0).containsKey(TP0), "nothing to commit while stuck");
+        assertTrue(tracker.getUncommittedCommitPoints().isEmpty());
+      } finally {
+        c.stop();
+      }
+    }
+
+    @Test
+    void syncCommit_givesUpAfterOneRetry() {
+      stuckHeadWithFinishedRecordsBehindIt();
+      AtomicInteger attempts = new AtomicInteger();
+      MockConsumer<String, String> alwaysRejects =
+          new MockConsumer<>("earliest") {
+            @Override
+            public void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+              attempts.incrementAndGet();
+              throw new org.apache.kafka.common.errors.OffsetMetadataTooLarge("too large");
+            }
+          };
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, alwaysRejects, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      assertDoesNotThrow(c::commitNow);
+      assertEquals(2, attempts.get());
+    }
+
+    @Test
+    void syncCommit_retriesWithoutMetadataSoTheFinalCommitLands() {
+      stuckHeadWithFinishedRecordsBehindIt();
+      TinyMetadataBroker broker = new TinyMetadataBroker();
+      PeriodicCommitter c =
+          new PeriodicCommitter(
+              tracker, broker, Duration.ofSeconds(60), NoOpMetricsCollector.INSTANCE);
+      c.commitNow();
+      assertEquals(1, broker.accepted.size());
+      assertEquals(new OffsetAndMetadata(2L, ""), broker.accepted.get(0).get(TP1));
+    }
+  }
+
+  private static class SpyConsumer extends MockConsumer<String, String> {
+    private final AtomicReference<Map<TopicPartition, OffsetAndMetadata>> syncCapture;
+    private final AtomicReference<Map<TopicPartition, OffsetAndMetadata>> asyncCapture;
+
+    SpyConsumer(
+        AtomicReference<Map<TopicPartition, OffsetAndMetadata>> syncCapture,
+        AtomicReference<Map<TopicPartition, OffsetAndMetadata>> asyncCapture) {
+      super("earliest");
+      this.syncCapture = syncCapture;
+      this.asyncCapture = asyncCapture;
+    }
+
+    @Override
+    public void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+      if (syncCapture != null) syncCapture.set(new HashMap<>(offsets));
+    }
+
+    @Override
+    public void commitAsync(
+        Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+      if (asyncCapture != null) asyncCapture.set(new HashMap<>(offsets));
+      if (callback != null) callback.onComplete(offsets, null);
+    }
+  }
+}

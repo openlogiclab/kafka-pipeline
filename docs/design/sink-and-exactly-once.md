@@ -1,8 +1,8 @@
 # Design: sink SPI and exactly-once output
 
-Status: phase 1 (sink SPI, at-least-once) implemented in 0.3.0; phase 2 (exactly-once) is design only, targeting 0.4.0
+Status: phase 1 (sink SPI, at-least-once) implemented in 0.4.0 (0.3.0 was never published); phase 2 (exactly-once) is design only
 
-> **Implemented API differs from the first draft in these points:** `SinkContext` has no `generation` (it stays internal); `.sink(...)` accepts `RecordSink<? super O>`; the DLQ is configured with the existing `dlqHandler(...)` using `KafkaDLQHandler` (no new `dlqSink(...)` method, so `ErrorStrategy` is unchanged); `BackpressureSensor.watermark(name, supplier, high, low)` takes a name; write outcomes run on virtual threads owned by the pipeline, never on the sink's I/O thread; the pipeline closes the processor, the sink and a `KafkaDLQHandler`, but not a user's own `DLQHandler`; header names live in `KafkaHeaders` (`kp-source` and the `kp-dlq-*` headers). Not yet implemented: a write timeout (a sink must complete every stage), batch-mode sinks, sink metrics in `PipelineMetrics`, and subtracting a buffering sink's flush interval from `PartitionMetrics.commitStallMillis`. After `onPartitionRevoked`, a buffering sink must write that partition's later outputs at once instead of buffering them (the pipeline also calls `flush(tp)` after every write of a partition that is being drained, so batching sinks such as `KafkaRecordSink` do not hold those writes back).
+> **Implemented API differs from the first draft in these points:** `SinkContext` has no `generation` (it stays internal); `.sink(...)` accepts `RecordSink<? super O>`; the DLQ is configured with the existing `dlqHandler(...)` using `KafkaDLQHandler` (no new `dlqSink(...)` method, so `ErrorStrategy` is unchanged); `BackpressureSensor.watermark(name, supplier, high, low)` takes a name; write outcomes run on virtual threads owned by the pipeline, never on the sink's I/O thread; the pipeline closes the processor and the sink, but not the DLQ handler, which belongs to the `ErrorStrategy` and may be shared (its owner closes it); header names live in `KafkaHeaders` (`kp-source` and the `kp-dlq-*` headers). In 0.4.0 the processor returns `Optional<O>` instead of `List<O>`, `RecordSink.write` takes one output, and several outputs per record are written with `RecordSink.forEach(sink)` over a processor returning `Optional<List<E>>`. Everything Kafka is in the `kafka-pipeline` artifact: the SPI, `KafkaRecordSink` (package `sink.kafka`, built only on the public API) and `KafkaDLQHandler` (package `error`). Sinks for other destinations, which bring their own dependencies, will be separate modules. Not yet implemented: a write timeout (a sink must complete every stage), batch-mode sinks, sink metrics in `PipelineMetrics`, and subtracting a buffering sink's flush interval from `PartitionMetrics.commitStallMillis`. After `onPartitionRevoked`, a buffering sink must write that partition's later outputs at once instead of buffering them (the pipeline also calls `flush(tp)` after every write of a partition that is being drained, so batching sinks such as `KafkaRecordSink` do not hold those writes back).
 
 ## 1. Motivation
 
@@ -26,7 +26,7 @@ It means the same as in Streams: **a record may be processed more than once, but
 Goals:
 
 1. A public `RecordSink` SPI that any downstream can implement, so Kafka, JDBC, S3 and HTTP are all just implementations.
-2. A record is acked only when every one of its outputs is durable.
+2. A record is acked only when its output is durable.
 3. Pending writes count against global backpressure. A sink can also expose its own pressure. Nothing pauses a single partition to relieve pressure.
 4. Ordering (`KEY`, `PARTITION`) holds until the write completes, not just until the handler returns.
 5. Write failures are classified: fatal client errors stop the pipeline, transient ones are retried until the destination recovers, and record-specific ones go through retry → DLQ → drop. A retry repeats only the write.
@@ -42,36 +42,36 @@ Non-goals:
 
 ### 3.1 Processor and sink
 
-The pipeline splits the work into two steps. The **processor** is the business logic: it runs on the worker pool, may do blocking I/O (database lookups, HTTP calls, enrichment; this is where the library's concurrency pays off), and returns what should be written. The **sink** writes those outputs. Keeping the write out of the processor is what lets the library ack a record only after its output is durable, and lets exactly-once mode put the write in a transaction.
+The pipeline splits the work into two steps. The **processor** is the business logic: it runs on the worker pool, may do blocking I/O (database lookups, HTTP calls, enrichment; this is where the library's concurrency pays off), and returns what should be written. The **sink** writes that output. Keeping the write out of the processor is what lets the library ack a record only after its output is durable, and lets exactly-once mode put the write in a transaction.
 
 ```java
 package io.github.openlogiclab.kafkapipeline.sink;
 
 /**
- * Processes one input record and returns 0..n outputs for the sink (an empty list means "nothing
- * to write"; the record is still acked). Runs concurrently on the worker pool and may block on
- * I/O. It may run more than once for the same record (retries, redelivery), so external side
+ * Processes one input record and returns the output for the sink, or Optional.empty() for
+ * "nothing to write" (the record is still acked; returning null fails the attempt). Runs
+ * concurrently on the worker pool and may block on I/O. It may run more than once for the same record (retries, redelivery), so external side
  * effects in it should be idempotent; the write to the sink is what the library makes exactly-once.
  */
 @FunctionalInterface
 public interface RecordProcessor<K, V, O> extends AutoCloseable {
-  List<O> process(ConsumerRecord<K, V> record) throws Exception;
+  Optional<O> process(ConsumerRecord<K, V> record) throws Exception;
 
   /** Called once when the pipeline shuts down, after the last record finished. */
   @Override
   default void close() throws Exception {}
 }
 
-/** Writes outputs downstream. Thread-safe: called concurrently by many workers. */
+/** Writes output downstream. Thread-safe: called concurrently by many workers. */
 @FunctionalInterface
 public interface RecordSink<O> extends AutoCloseable {
 
   /**
-   * Accepts the outputs of one input record. The returned stage completes when they are
-   * durable downstream, and completes exceptionally if they cannot be written. Must not block
+   * Accepts the output of one input record. The returned stage completes when it is
+   * durable downstream, and completes exceptionally if it cannot be written. Must not block
    * for long: use an async client or hand off to your own executor.
    */
-  CompletionStage<Void> write(SinkContext ctx, List<O> outputs);
+  CompletionStage<Void> write(SinkContext ctx, O output);
 
   /** Pushes buffered data out for one partition (revoke, shutdown, size/time trigger). */
   default CompletionStage<Void> flush(TopicPartition tp) { return CompletableFuture.completedFuture(null); }
@@ -93,9 +93,9 @@ public interface RecordSink<O> extends AutoCloseable {
    * platform threads it ties up a worker per write in progress.
    */
   static <O> RecordSink<O> blocking(BlockingWriter<O> writer) {
-    return (ctx, outputs) -> {
+    return (ctx, output) -> {
       try {
-        writer.write(ctx, outputs);
+        writer.write(ctx, output);
         return CompletableFuture.completedFuture(null);
       } catch (Exception e) {
         return CompletableFuture.failedFuture(e);
@@ -105,14 +105,20 @@ public interface RecordSink<O> extends AutoCloseable {
 
   @FunctionalInterface
   interface BlockingWriter<O> {
-    void write(SinkContext ctx, List<O> outputs) throws Exception;
+    void write(SinkContext ctx, O output) throws Exception;
   }
+
+  /** Several outputs per record: writes each element with `sink`; acked when all are durable. */
+  static <E> RecordSink<List<E>> forEach(RecordSink<E> sink) { ... }
 }
 
-/** Stable identity of the input record, for idempotent writes. */
-public record SinkContext(TopicPartition partition, long offset, Headers headers) {
-  /** "topic-partition-offset": a natural idempotency / upsert key. */
+/** Stable identity of the output: its input record and its index among that record's outputs. */
+public record SinkContext(TopicPartition partition, long offset, Headers headers, int outputIndex) {
+  /** "topic-partition-offset": identifies the input record. */
   public String recordId() { ... }
+
+  /** "topic-partition-offset-index": a natural idempotency / upsert key for this output. */
+  public String outputId() { ... }
 }
 ```
 
@@ -120,12 +126,12 @@ public record SinkContext(TopicPartition partition, long offset, Headers headers
 
 ```java
 // 1. Lambda over an async client: the stage completes when the client's future does
-.sink((ctx, outputs) -> httpClient
-    .sendAsync(toRequest(outputs, ctx.recordId()), BodyHandlers.discarding())  // idempotency key
+.sink((ctx, output) -> httpClient
+    .sendAsync(toRequest(output, ctx.recordId()), BodyHandlers.discarding())  // idempotency key
     .thenAccept(r -> { if (r.statusCode() >= 300) throw new SinkWriteException(r.statusCode()); }))
 
 // 2. Method reference to blocking code, wrapped with RecordSink.blocking(...)
-//    void upsert(SinkContext ctx, List<EnrichedOrder> rows) throws SQLException
+//    void upsert(SinkContext ctx, EnrichedOrder row) throws SQLException
 .sink(RecordSink.blocking(orderRepository::upsert))
 
 // 3. Class: owns its client, buffers, flushes, reports pressure; the form for real sinks
@@ -134,8 +140,8 @@ public final class OrderIndexSink implements RecordSink<EnrichedOrder> {
   OrderIndexSink(SearchClient client) { this.client = client; }
 
   @Override
-  public CompletionStage<Void> write(SinkContext ctx, List<EnrichedOrder> outputs) {
-    return client.bulkIndexAsync(outputs, ctx.recordId());   // doc id = recordId → idempotent
+  public CompletionStage<Void> write(SinkContext ctx, EnrichedOrder output) {
+    return client.indexAsync(output, ctx.recordId());        // doc id = recordId → idempotent
   }
 
   @Override
@@ -154,19 +160,19 @@ public final class OrderIndexSink implements RecordSink<EnrichedOrder> {
 Rules for every form:
 
 - **`write` is called concurrently** by many workers on one instance, so the sink must be thread-safe.
-- **The returned stage defines done.** Complete it only when the outputs are durable. Failing it retries the write (see §4.4) and, for a record-specific failure, ends in the DLQ or a drop. Never complete it early.
+- **The returned stage defines done.** Complete it only when the output is durable. Failing it retries the write (see §4.4) and, for a record-specific failure, ends in the DLQ or a drop. Never complete it early.
 - **Never block inside a lambda that returns an incomplete stage** (form 1). If the code blocks, use `RecordSink.blocking(...)` (form 2), which makes the blocking explicit and keeps it on the worker thread.
-- **Buffering, flushing, `onPartitionRevoked` and pressure sensors** need overriding defaults, so those sinks (Kafka, S3, bulk JDBC) are always classes (form 3). The first-party sinks (`KafkaRecordSink`, `KafkaDLQHandler`, the JDBC and S3 modules) are classes built with builders.
+- **Buffering, flushing, `onPartitionRevoked` and pressure sensors** need overriding defaults, so those sinks (Kafka, S3, bulk JDBC) are always classes (form 3). The first-party sinks (`KafkaRecordSink`, and later JDBC and S3 modules) and `KafkaDLQHandler` are classes built with builders.
 - **Exactly-once mode** only accepts `KafkaRecordSink`, because the write must be part of the transaction (§3.2).
 
 Because `RecordProcessor` has a single abstract method, `.processor(...)` accepts any of the three usual forms:
 
 ```java
 // 1. Lambda: short logic inline
-.processor(record -> List.of(enrich(record.value())))
+.processor(record -> Optional.of(enrich(record.value())))
 
 // 2. Method reference: logic in an existing method with a matching signature
-//    List<EnrichedOrder> enrich(ConsumerRecord<String, Order> record) throws Exception
+//    Optional<EnrichedOrder> enrich(ConsumerRecord<String, Order> record) throws Exception
 .processor(orderService::enrich)
 
 // 3. Class: logic with its own dependencies, state and cleanup
@@ -182,10 +188,10 @@ public final class OrderEnrichmentProcessor
   }
 
   @Override
-  public List<EnrichedOrder> process(ConsumerRecord<String, Order> record) throws Exception {
+  public Optional<EnrichedOrder> process(ConsumerRecord<String, Order> record) throws Exception {
     Order order = record.value();
     Customer customer = customers.get(order.customerId());
-    return List.of(new EnrichedOrder(order, customer, pricing.priceFor(order.sku(), customer.tier())));
+    return Optional.of(new EnrichedOrder(order, customer, pricing.priceFor(order.sku(), customer.tier())));
   }
 
   @Override
@@ -208,9 +214,9 @@ The sink is optional: it is required only when there is output to write. The bui
 | `.processor(...).sink(...)` | Processing produces output the library should write and track | Required | When the output is durable |
 | `.batchHandler(...)` / `.batchProcessor(...).sink(...)` | Same, in batch mode | Same rules | Same rules |
 
-Invalid combinations fail fast: `.processor(...)` without `.sink(...)` (outputs would have nowhere to go), `.handler(...)` with `.sink(...)` (the handler returns nothing to write), and `.exactlyOnce(...)` without a `KafkaRecordSink`. Existing pipelines need no change.
+Invalid combinations fail fast: `.processor(...)` without `.sink(...)` (the output would have nowhere to go), `.handler(...)` with `.sink(...)` (the handler returns nothing to write), and `.exactlyOnce(...)` without a `KafkaRecordSink`. Existing pipelines need no change.
 
-Internally there is one code path: a handler is run as a processor that returns no outputs, with a no-op sink that completes immediately. So retries, DLQ, ordering and backpressure behave the same in both shapes. The only difference is when the record counts as done. With a handler, the handler must finish its own writes before returning (for example, wait for `producer.send(...).get()`), because the library cannot see them.
+Internally there is one code path: a handler is run as a processor that returns no output, with a no-op sink that completes immediately. So retries, DLQ, ordering and backpressure behave the same in both shapes. The only difference is when the record counts as done. With a handler, the handler must finish its own writes before returning (for example, wait for `producer.send(...).get()`), because the library cannot see them.
 
 Full example: an order-enrichment service. It consumes `orders`, calls a customer service over HTTP and a pricing database for each order (two blocking calls of about 20 ms), and publishes the enriched order to `orders-enriched`. Orders that keep failing go to `orders-dlq`. Methods that do not exist yet are marked `// new`; everything else is today's API.
 
@@ -253,12 +259,12 @@ public final class OrderEnricher {
             .keyFrom(EnrichedOrder::orderId)
             .keySerializer(new StringSerializer())
             .valueSerializer(new EnrichedOrderSerializer())
-            .sourceHeader(true)                         // adds kp-source=topic-partition-offset
+            .sourceHeader(true)                         // adds kp-source and kp-output-index
             .build();
 
     KafkaDLQHandler<String, Order> dlq =                                         // new
         KafkaDLQHandler.<String, Order>builder()
-            .sharing(output)                            // same producer as the output sink
+            .producer(output.producer())                // same producer as the output sink
             .topic("orders-dlq")
             .keySerializer(new StringSerializer())
             .valueSerializer(new OrderSerializer())
@@ -280,11 +286,11 @@ public final class OrderEnricher {
             .processor(record -> {                                            // new
               Order order = record.value();
               if (order.isTest()) {
-                return List.of();                       // nothing to publish; record is acked
+                return Optional.empty();                // nothing to publish; record is acked
               }
               Customer customer = customers.get(order.customerId());          // blocking HTTP
               Price price = pricing.priceFor(order.sku(), customer.tier());   // blocking JDBC
-              return List.of(new EnrichedOrder(order, customer, price));
+              return Optional.of(new EnrichedOrder(order, customer, price));
             })
             .processingTimeout(Duration.ofSeconds(10))  // a hung attempt counts as failed
 
@@ -340,7 +346,7 @@ public final class OrderEnricher {
 }
 ```
 
-What happens to one record: a worker runs `processor` (retried with backoff if it throws). The outputs go to `sink.write`. The worker is then free for the next record while the send is in flight. When the send completes, the record is acked in its partition window, its key slot is released, and the in-flight count drops. If the processor or the write keeps failing, the record goes to `orders-dlq` and is acked, so it never blocks the partition.
+What happens to one record: a worker runs `processor` (retried with backoff if it throws). The output goes to `sink.write`. The worker is then free for the next record while the send is in flight. When the send completes, the record is acked in its partition window, its key slot is released, and the in-flight count drops. If the processor or the write keeps failing, the record goes to `orders-dlq` and is acked, so it never blocks the partition.
 
 The same pipeline with exactly-once output only adds `.exactlyOnce(...)` (§3.2). The processor, the sink and the DLQ do not change; the DLQ sharing the output's producer is what lets a bad record land in the DLQ inside the same transaction as its offset. Downstream consumers of `orders-enriched` then read with `isolation.level=read_committed`.
 
@@ -375,7 +381,7 @@ Kafka lives in core because exactly-once needs the core commit path (§5) and ad
 
 ```
 poll → register (window: REGISTERED) → dispatch → worker:
-   markInProgress → processor.process → sink.write(ctx, outputs) ──► stage
+   markInProgress → processor.process → sink.write(ctx, output) ──► stage
                                                                  │ completes
    ack (window: DONE) ◄── release key/partition slot ◄── counter.completed
 ```
@@ -401,8 +407,8 @@ For the Kafka sink with `UNORDERED`, the idempotent producer keeps send order pe
 ### 4.4 Failures and idempotency
 
 - **Synchronous failures** (the processor throws, serialization fails) take the existing retry → DLQ → drop path.
-- **A failed write stage** is retried by re-running only `write` with the same outputs; the processor is not re-run, so its I/O is not repeated. The backoff is waited out on a pipeline virtual thread, never on the sink's I/O thread. What happens next depends on the failure:
-  The sink classifies the failure (`RecordSink.classify` returns a `WriteFailure`; the default `WriteFailure.of` understands Kafka errors, and `KafkaRecordSink` adds "closed producer is fatal"):
+- **A failed write stage** is retried by re-running only `write` with the same output; the processor is not re-run, so its I/O is not repeated. The backoff is waited out on a pipeline virtual thread, never on the sink's I/O thread. What happens next depends on the failure:
+  The sink classifies the failure (`RecordSink.classify` returns a `WriteFailure`; the default `WriteFailure.of` understands Kafka errors, including a closed producer, which is fatal):
   - **`FATAL`** (authentication, authorization such as a missing ACL on the output topic, unsupported version, a closed producer; always for JVM errors): every record would fail the same way, so the pipeline stops and the record stays unacked. Dropping it would commit input whose output was never written.
   - **`TRANSIENT`** (by default Kafka's `RetriableException`, which includes producer timeouts): the destination is down for now. The write is retried (backoff between 100 ms and 30 s) while the pipeline runs and owns the partition, without using the record's retry budget. The record keeps its slot, so an outage becomes backpressure, not drops. If the same write keeps failing transiently for longer than `writeOutageTimeout` (default 5 minutes), the destination is treated as gone and the pipeline stops, still without dropping the record; a misspelled output topic shows up this way instead of stalling forever.
   - **`RECORD`** (anything else, e.g. a record too large): up to `maxRetries`, then the DLQ or a drop with `FinalFailureHandler`. The record is acked either way, so a bad record never blocks the partition.
@@ -412,7 +418,7 @@ For the Kafka sink with `UNORDERED`, the idempotent producer keeps send order pe
 
 | Sink | Idempotency mechanism |
 |---|---|
-| Kafka (at-least-once) | Output key or header `kp-source = topic-partition-offset`; consumers dedup, or use a compacted topic |
+| Kafka (at-least-once) | Output key, or headers `kp-source = topic-partition-offset` and `kp-output-index`; consumers dedup on both, or use a compacted topic |
 | JDBC | `INSERT … ON CONFLICT (source_id) DO UPDATE` |
 | S3 | Object key `prefix/topic/partition/{firstOffset}-{lastOffset}`, so a re-upload overwrites the same object |
 | HTTP | `Idempotency-Key: recordId` |
@@ -581,9 +587,9 @@ Global backpressure, per-key ordering (the key slot is released on ack, inside t
 
 | Phase | Scope | Release |
 |---|---|---|
-| 1 | Sink SPI, `RecordProcessor`, async completion, `KafkaRecordSink` (at-least-once), Kafka DLQ sink, `CommitStrategy` refactor (no behavior change) | 0.3.0 |
-| 2 | `exactlyOnce()`: transactional strategy, barrier, strict metadata, span pause, abort/reset | 0.4.0 |
-| 3 | `kafka-pipeline-sink-jdbc`, `kafka-pipeline-sink-s3` | 0.4.x |
+| 1 | Sink SPI, `RecordProcessor`, async completion, `KafkaRecordSink` (at-least-once), Kafka DLQ sink, `CommitStrategy` refactor (no behavior change) | 0.4.0 |
+| 2 | `exactlyOnce()`: transactional strategy, barrier, strict metadata, span pause, abort/reset | not scheduled |
+| 3 | Sinks for other destinations in their own modules (`kafka-pipeline-jdbc`, `kafka-pipeline-s3`) | not scheduled |
 
 Phase 1 is additive: existing `handler(...)` users see no change.
 
